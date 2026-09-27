@@ -3,7 +3,7 @@ import requests
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-BYBIT_URL = "https://api.bybit.com/v5/market/kline"
+KRAKEN_URL = "https://api.kraken.com/0/public/OHLC"
 
 
 def send_message(chat_id, text):
@@ -22,14 +22,12 @@ def send_message(chat_id, text):
 def get_btc_data():
 
     params = {
-        "category": "linear",
-        "symbol": "BTCUSDT",
-        "interval": "15",
-        "limit": "100"
+        "pair": "XBTUSD",
+        "interval": "15"
     }
 
     response = requests.get(
-        BYBIT_URL,
+        KRAKEN_URL,
         params=params,
         timeout=15
     )
@@ -38,24 +36,24 @@ def get_btc_data():
 
     data = response.json()
 
-    if data.get("retCode") != 0:
-        error_message = data.get(
-            "retMsg",
-            "Unknown Bybit error"
+    if data.get("error"):
+        raise Exception(
+            str(data.get("error"))
         )
-
-        raise Exception(error_message)
 
     result = data.get("result", {})
 
-    candles = result.get("list", [])
+    candles = None
+
+    for key in result:
+        if key != "last":
+            candles = result[key]
+            break
 
     if not candles:
         raise Exception(
-            "Bybit returned empty data"
+            "Kraken returned empty BTC data"
         )
-
-    candles.reverse()
 
     return candles
 
@@ -74,17 +72,36 @@ def analyze_smc():
     lows = []
 
     for candle in candles:
-        closes.append(float(candle[4]))
-        highs.append(float(candle[2]))
-        lows.append(float(candle[3]))
+
+        closes.append(
+            float(candle[4])
+        )
+
+        highs.append(
+            float(candle[2])
+        )
+
+        lows.append(
+            float(candle[3])
+        )
 
     current_price = closes[-1]
 
-    recent_high = max(highs[-21:-1])
-    recent_low = min(lows[-21:-1])
+    recent_high = max(
+        highs[-21:-1]
+    )
 
-    previous_high = max(highs[-41:-21])
-    previous_low = min(lows[-41:-21])
+    recent_low = min(
+        lows[-21:-1]
+    )
+
+    previous_high = max(
+        highs[-41:-21]
+    )
+
+    previous_low = min(
+        lows[-41:-21]
+    )
 
     signal = "WAIT"
     structure = "RANGE"
@@ -143,8 +160,8 @@ def analyze_smc():
 
     if signal == "WAIT":
 
-        message = (
-            "BTC/USDT - SMC ANALYSIS\n\n"
+        return (
+            "BTC/USD - SMC ANALYSIS\n\n"
             + "Price: $"
             + format(current_price, ",.2f")
             + "\n"
@@ -156,10 +173,8 @@ def analyze_smc():
             + "Timeframe: 15m"
         )
 
-        return message
-
-    message = (
-        "BTC/USDT - SMC SIGNAL\n\n"
+    return (
+        "BTC/USD - SMC SIGNAL\n\n"
         + "Signal: "
         + signal
         + "\n"
@@ -183,8 +198,6 @@ def analyze_smc():
         + "Educational signal - not financial advice."
     )
 
-    return message
-
 
 def main():
 
@@ -206,7 +219,10 @@ def main():
     if not data.get("ok"):
         return
 
-    updates = data.get("result", [])
+    updates = data.get(
+        "result",
+        []
+    )
 
     for update in updates:
 
