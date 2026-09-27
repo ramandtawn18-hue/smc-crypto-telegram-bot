@@ -239,4 +239,4 @@ def analyze_smc():
 
         f"🎯 TP1: ${tp1:,.2f}\n"
 
-        f"🎯 TP2
+        f"🎯 TP2: ${tp2:,.2f}\n\n"
