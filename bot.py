@@ -195,13 +195,12 @@ def main():
                     result
                 )
 
-            except Exception:
-                send_message(
-                    chat_id,
-                    "❌ کێشەیەک ڕوویدا لە "
-                    "وەرگرتنی داتای BTC.\n\n"
-                    "تکایە دووبارە هەوڵ بدە."
-                )
+            except Exception as e:
+    send_message(
+        chat_id,
+        "❌ هەڵەی ڕاستەقینە:\n\n"
+        f"{type(e).__name__}: {e}"
+    ) 
 
 
 if __name__ == "__main__":
