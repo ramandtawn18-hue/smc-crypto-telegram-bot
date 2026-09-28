@@ -67,20 +67,40 @@ def aliases(pair: str):
 
 
 def find_csv(z: zipfile.ZipFile, pair: str) -> Optional[str]:
+    """Find the pair's 15-minute CSV regardless of archive folder layout.
+
+    Kraken archives can store CSVs inside directories, so matching only the
+    basename (e.g. ``15.csv``) can miss the pair name. We therefore inspect
+    the full archive member path and accept common 15-minute filename forms.
+    """
     wanted = aliases(pair)
     candidates = []
+
     for name in z.namelist():
-        base = norm(Path(name).name)
-        if not base.endswith("15CSV"):
+        full = norm(name)
+        if not full.endswith("CSV"):
             continue
-        stem = base[:-6]
-        if any(a in stem for a in wanted):
+
+        # Accept forms such as: ETHUSDT_15.csv, ETHUSDT-15.csv,
+        # ETHUSDT/15.csv, ETHUSDT_15m.csv, ...
+        is_15m = (
+            full.endswith("15CSV")
+            or full.endswith("15MCSV")
+            or full.endswith("15MINCSV")
+        )
+        if not is_15m:
+            continue
+
+        if any(a in full for a in wanted):
             candidates.append(name)
 
+    # Prefer a direct pair+15 filename when available.
     for name in candidates:
-        base = norm(Path(name).name)
-        if any(base == a + "15CSV" for a in wanted):
+        full = norm(name)
+        if any(full.endswith(a + "15CSV") or full.endswith(a + "15MCSV")
+               or full.endswith(a + "15MINCSV") for a in wanted):
             return name
+
     return candidates[0] if candidates else None
 
 
