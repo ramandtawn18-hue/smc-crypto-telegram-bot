@@ -410,39 +410,157 @@ def analyze(symbol, rows15):
     }
 
 def make_chart(sig):
+    """TradingView-inspired signal chart: candles + structure + RR zones + labels."""
     rows = sig["rows"]
-    fig, ax = plt.subplots(figsize=(12, 7), dpi=140)
-    width = 0.62
+    n = len(rows)
+    fig, ax = plt.subplots(figsize=(12.8, 7.6), dpi=150)
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("#fbfcfd")
+
+    # Candles
+    width = 0.58
+    up_color = "#16a085"
+    down_color = "#e74c3c"
+    wick_color = "#4d5966"
     for i, r in enumerate(rows):
-        up = r["close"] >= r["open"]
-        ax.vlines(i, r["low"], r["high"], linewidth=1)
+        color = up_color if r["close"] >= r["open"] else down_color
+        ax.vlines(i, r["low"], r["high"], color=wick_color, linewidth=0.75, zorder=2)
         body_low = min(r["open"], r["close"])
-        body_h = max(abs(r["close"] - r["open"]), 1e-12)
-        rect = Rectangle((i-width/2, body_low), width, body_h, fill=True, alpha=0.78)
+        body_h = max(abs(r["close"] - r["open"]), max(r["close"] * 1e-5, 1e-12))
+        rect = Rectangle(
+            (i - width / 2, body_low), width, body_h,
+            facecolor=color, edgecolor=color, linewidth=0.45, alpha=0.92, zorder=3
+        )
         ax.add_patch(rect)
 
-    ax.axhline(sig["entry"], linestyle="--", linewidth=1.2, label="Entry")
-    ax.axhline(sig["sl"], linestyle="--", linewidth=1.2, label="SL")
-    ax.axhline(sig["tp1"], linestyle=":", linewidth=1.0, label="TP1")
-    ax.axhline(sig["tp2"], linestyle=":", linewidth=1.0, label="TP2")
-    ax.axhline(sig["tp3"], linestyle=":", linewidth=1.0, label="TP3")
-    if sig.get("trendline") is not None:
-        x0 = max(0, len(rows)-25)
-        x1 = len(rows)-1
-        # Visual trendline approximation ending at the trigger.
-        y1 = sig["trendline"]
-        slope = (rows[-1]["close"] - y1) / max(1, len(rows)-x0)
-        y0 = y1 - slope * (x1-x0)
-        ax.plot([x0, x1], [y0, y1], linewidth=1.5, label="Trendline")
-
+    closes = [r["close"] for r in rows]
+    atr_now = atr(rows, 14) or (max(closes) - min(closes)) * 0.02
     direction = sig["direction"]
-    ax.set_title(f"Bitget USDT Perpetual • {sig['symbol']} • 15m • {direction} • Trend + RSI + Volatility")
-    ax.set_xlim(-1, len(rows))
-    ax.grid(alpha=0.15)
-    ax.legend(loc="upper left", fontsize=8)
-    fig.tight_layout()
+    entry = sig["entry"]
+    sl = sig["sl"]
+    tp1, tp2, tp3 = sig["tp1"], sig["tp2"], sig["tp3"]
+    entry_low = min(entry * 0.998, entry * 1.002)
+    entry_high = max(entry * 0.998, entry * 1.002)
+
+    # A small projected area on the right gives the chart the same visual language
+    # as TradingView's long/short-position drawing tool.
+    pad = max(8, int(n * 0.12))
+    x_right = n + pad
+    x_zone0 = max(n - 5, int(n * 0.84))
+    x_zone1 = x_right - 1
+
+    if direction == "LONG":
+        risk_y0, risk_y1 = entry, sl
+        reward_y0, reward_y1 = entry, tp3
+        stop_fill = "#f4b6b6"
+        profit_fill = "#b9dfd5"
+        bias_text = "LONG favored by the stronger combined trend, RSI, and volatility."
+    else:
+        risk_y0, risk_y1 = entry, sl
+        reward_y0, reward_y1 = tp3, entry
+        stop_fill = "#f4b6b6"
+        profit_fill = "#b9dfd5"
+        bias_text = "SHORT bias from the stronger combined trend, RSI, and volatility."
+
+    # Entry zone
+    ax.axhspan(entry_low, entry_high, xmin=0.0, xmax=min(0.92, (n + 1) / (x_right + 1)),
+               facecolor="#dcefe9", alpha=0.55, zorder=0)
+    ax.plot([0, x_right], [entry, entry], color="#159a8c", linestyle="--", linewidth=1.0, alpha=0.85)
+
+    # Long/short position box
+    ax.add_patch(Rectangle((x_zone0, min(risk_y0, risk_y1)), x_zone1 - x_zone0,
+                           abs(risk_y1 - risk_y0), facecolor=stop_fill,
+                           edgecolor="#d96b6b", linewidth=0.8, alpha=0.58, zorder=1))
+    ax.add_patch(Rectangle((x_zone0, min(reward_y0, reward_y1)), x_zone1 - x_zone0,
+                           abs(reward_y1 - reward_y0), facecolor=profit_fill,
+                           edgecolor="#159a8c", linewidth=0.8, alpha=0.58, zorder=1))
+
+    # Price levels
+    levels = [
+        (entry, "Entry", "#4d5966", "--", 1.0),
+        (sl, "SL", "#d64545", "-", 1.25),
+        (tp1, "TP1", "#159a8c", ":", 1.0),
+        (tp2, "TP2", "#159a8c", ":", 1.0),
+        (tp3, "TP3", "#159a8c", "-", 1.15),
+    ]
+    for y, label, color, style, lw in levels:
+        ax.axhline(y, color=color, linestyle=style, linewidth=lw, alpha=0.9, zorder=1)
+        ax.text(x_right + 0.25, y, f"{label}  {fmt_price(y)}", va="center", ha="left",
+                fontsize=8.5, color=color, fontweight="bold", clip_on=False)
+
+    # Real structure trendline from the same swing logic used by the signal gate.
+    try:
+        highs, lows = swing_points(rows[-90:], left=2, right=2)
+        if direction == "LONG" and len(highs) >= 2 and highs[-1][1] < highs[-2][1]:
+            p1, p2 = highs[-2], highs[-1]
+            offset = n - min(90, n)
+            x1, x2 = p1[0] + offset, p2[0] + offset
+            y1, y2 = p1[1], p2[1]
+            extend_x = x_right
+            extend_y = line_value((x1, y1), (x2, y2), extend_x)
+            ax.plot([x1, extend_x], [y1, extend_y], color="#166b73", linewidth=2.0, zorder=4)
+        elif direction == "SHORT" and len(lows) >= 2 and lows[-1][1] > lows[-2][1]:
+            p1, p2 = lows[-2], lows[-1]
+            offset = n - min(90, n)
+            x1, x2 = p1[0] + offset, p2[0] + offset
+            y1, y2 = p1[1], p2[1]
+            extend_x = x_right
+            extend_y = line_value((x1, y1), (x2, y2), extend_x)
+            ax.plot([x1, extend_x], [y1, extend_y], color="#166b73", linewidth=2.0, zorder=4)
+    except Exception:
+        pass
+
+    # Bias headline + compact analysis block.
+    title = f"{sig['symbol']} / USDT PERPETUAL • 15m • Bitget"
+    ax.set_title(title, loc="left", fontsize=14, fontweight="bold", color="#17202a", pad=12)
+    ax.text(0.02, 0.955, bias_text, transform=ax.transAxes, fontsize=10.5,
+            color="#176b73", fontweight="bold", va="top")
+
+    analysis = (
+        f"Trend: {sig['trend15']}   •   RSI: {sig['rsi']:.1f}   •   "
+        f"Volatility: {sig['volatility']}   •   Volume: {sig['volume_ratio']:.2f}x\n"
+        f"Structure: {sig['structure']}   •   Score: {sig['score']}/{sig['max_score']}   •   "
+        f"Confidence: {sig['confidence']}%"
+    )
+    ax.text(0.02, 0.035, analysis, transform=ax.transAxes, fontsize=8.8,
+            color="#4d5966", va="bottom")
+
+    # Small direction marker at the trigger area.
+    if direction == "LONG":
+        ax.annotate("LONG", xy=(n - 1, entry), xytext=(n - 10, entry + 1.7 * atr_now),
+                    arrowprops=dict(arrowstyle="->", color="#159a8c", lw=1.5),
+                    fontsize=9, color="#159a8c", fontweight="bold")
+    else:
+        ax.annotate("SHORT", xy=(n - 1, entry), xytext=(n - 10, entry - 1.7 * atr_now),
+                    arrowprops=dict(arrowstyle="->", color="#d64545", lw=1.5),
+                    fontsize=9, color="#d64545", fontweight="bold")
+
+    # Risk/reward text inside the projected position box.
+    rr_text = "TP1 1.5R  •  TP2 2.5R  •  TP3 4R"
+    ax.text(x_zone0 + 0.4, (tp3 + entry) / 2 if direction == "SHORT" else (entry + tp3) / 2,
+            rr_text, fontsize=8.2, color="#176b73", fontweight="bold", rotation=90,
+            ha="center", va="center", alpha=0.85)
+
+    # Clean TradingView-like frame.
+    ax.set_xlim(-1, x_right + 5)
+    ymin = min(min(r["low"] for r in rows), sl, tp3)
+    ymax = max(max(r["high"] for r in rows), sl, tp3)
+    span = max(ymax - ymin, atr_now * 8)
+    ax.set_ylim(ymin - span * 0.07, ymax + span * 0.13)
+    ax.grid(axis="y", alpha=0.16, linewidth=0.7)
+    ax.grid(axis="x", alpha=0.06, linewidth=0.6)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color("#d7dde3")
+    ax.spines["bottom"].set_color("#d7dde3")
+    ax.tick_params(axis="both", labelsize=8, colors="#59636e")
+    ax.set_xticks(range(0, n, max(1, n // 7)))
+    ax.set_xticklabels([str(i) for i in range(0, n, max(1, n // 7))])
+    ax.set_ylabel("Price", fontsize=8.5, color="#59636e")
+    fig.subplots_adjust(left=0.055, right=0.83, top=0.90, bottom=0.12)
+
     path = f"/tmp/chart_{sig['symbol'].replace('/', '_')}_{sig['time']}.png"
-    fig.savefig(path, bbox_inches="tight")
+    fig.savefig(path, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
     return path
 
