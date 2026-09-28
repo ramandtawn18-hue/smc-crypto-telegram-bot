@@ -1,5 +1,4 @@
 import os
-import json
 import time
 import threading
 
@@ -91,7 +90,7 @@ def send_photo(chat_id, photo_path, caption, reply_markup=None):
     with open(photo_path, "rb") as photo:
         data = {"chat_id": chat_id, "caption": caption}
         if reply_markup is not None:
-            data["reply_markup"] = json.dumps(reply_markup)
+            data["reply_markup"] = reply_markup
 
         r = requests.post(
             telegram_url("sendPhoto"),
