@@ -23,14 +23,12 @@ exchange = ccxt.bitget({
 TIMEFRAME = '1m'
 CANDLE_LIMIT = 260
 
-# کۆگای دۆخی سکانەر و سیگناڵەکان
 active_signals = {}
 last_signal_time = {}
 scanner_stats = {
-    "last_scan_time": "هێشتا دەستی پێنەکردووە",
-    "scanned_count": 0,
-    "total_symbols": 0,
-    "is_running": True
+    "last_scan_time": "دەستی پێنەکردووە",
+    "hot_coins_count": 0,
+    "last_hot_coins": []
 }
 
 def calculate_leverage(entry_price, stop_loss):
@@ -42,15 +40,23 @@ def calculate_leverage(entry_price, stop_loss):
     else:
         return "3x - 5x"
 
-def get_all_futures_symbols():
+def get_top_moving_symbols():
+    """ڕاستەوخۆ دەرهێنانی ئەو دراوانەی گەورەترین بەرزبوونەوە یان دابەزین و قەبارەیان هەیە"""
     try:
-        markets = exchange.load_markets()
-        return [
-            s for s, m in markets.items()
-            if m.get('quote') == 'USDT' and m.get('active', True) and m.get('swap', True)
+        tickers = exchange.fetch_tickers()
+        futures_tickers = [
+            t for s, t in tickers.items()
+            if s.endswith(':USDT') and t.get('percentage') is not None and t.get('baseVolume', 0) > 10000
         ]
+        
+        # ڕیزبەندی بەپێی بەرزترین گۆڕانکاری (چ پۆزەتیڤ چ نێگەتیڤ)
+        sorted_by_change = sorted(futures_tickers, key=lambda x: abs(float(x.get('percentage', 0))), reverse=True)
+        
+        # دەرهێنانی 25 دراوی هەرە گەرم و خاوەن جووڵەی بازاڕ
+        top_symbols = [t['symbol'] for t in sorted_by_change[:25]]
+        return top_symbols
     except Exception as e:
-        print(f"Market error: {e}")
+        print(f"Error fetching top movers: {e}")
         return []
 
 def plot_and_save_chart(df, symbol, entry, sl, tp1, tp2, tp3, signal_type):
@@ -86,7 +92,7 @@ def plot_and_save_chart(df, symbol, entry, sl, tp1, tp2, tp3, signal_type):
 
     clean_symbol = symbol.replace('/', '').replace(':USDT', '') + 'PERP'
     last_price = plot_df['close'].iloc[-1]
-    title_text = f"{clean_symbol} · 15m · Bitget  ({last_price})"
+    title_text = f"{clean_symbol} · {TIMEFRAME} · Bitget  ({last_price})"
 
     h_lines = dict(
         hlines=[tp3, tp2, tp1, entry, sl],
@@ -133,7 +139,7 @@ def check_signal(symbol, force_send=False, chat_id=None):
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
         if not ohlcv or len(ohlcv) < 220:
             if force_send:
-                bot.send_message(target_chat, "⚠️ داتای پێویست لە Bitget وەرنەگیرا.")
+                bot.send_message(target_chat, "⚠️ داتای پێویست وەرنەگیرا.")
             return
 
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -163,8 +169,9 @@ def check_signal(symbol, force_send=False, chat_id=None):
         coin_base = display_name.replace('/', '').replace('USDT', '')
         tv_link = f"https://www.tradingview.com/chart/?symbol=BITGET%3A{coin_base}USDT.P"
 
-        is_long = (close > ema_200) and (rsi < 48) and (last['RSI'] > prev['RSI'])
-        is_short = (close < ema_200) and (rsi > 52) and (last['RSI'] < prev['RSI'])
+        # مەرجی زیرەک و خێرا بۆ دیاریکردنی شەپۆلی کڕین و فرۆشتن
+        is_long = (close > ema_200) and (rsi < 55) and (last['RSI'] > prev['RSI'])
+        is_short = (close < ema_200) and (rsi > 45) and (last['RSI'] < prev['RSI'])
 
         if force_send:
             is_long = True
@@ -180,21 +187,20 @@ def check_signal(symbol, force_send=False, chat_id=None):
             caption = (
                 f"🟢 *سیگناڵی کڕین (LONG)*\n\n"
                 f"🪙 *دراو:* `{display_name}` (Bitget Futures)\n"
-                f"⏱ *تایم‌فرەیم:* `15m`\n"
+                f"⏱ *تایم‌فرەیم:* `{TIMEFRAME}`\n"
                 f"📍 *نرخی چوونەژوور:* `{close}`\n"
                 f"🎯 *تارگێتی یەکەم (TP1):* `{tp1}`\n"
                 f"🎯 *تارگێتی دووەم (TP2):* `{tp2}`\n"
                 f"🎯 *تارگێتی سێیەم (TP3):* `{tp3}`\n"
                 f"🛑 *ستۆپ لۆس (SL):* `{sl}`\n"
                 f"⚡️ *لیڤەرەیج:* `{leverage}`\n\n"
-                f"📊 *شیکاری:*\n"
-                f"• ترێند: `Bullish Trend`\n"
-                f"• خاڵی RSI: `{round(rsi, 1)}`\n\n"
-                f"📈 [بینینی تەواوی چارت لە TradingView]({tv_link})"
+                f"📊 *شیکاری زیرەک:*\n"
+                f"• شێوازی بازاڕ: `Top Moving Coin`\n"
+                f"• پێوەری بەهێزی RSI: `{round(rsi, 1)}`\n\n"
+                f"📈 [کردنەوە لە TradingView]({tv_link})"
             )
             with open(chart_path, 'rb') as photo:
                 msg = bot.send_photo(target_chat, photo, caption=caption, parse_mode="Markdown")
-            
             if os.path.exists(chart_path):
                 os.remove(chart_path)
             
@@ -218,21 +224,20 @@ def check_signal(symbol, force_send=False, chat_id=None):
             caption = (
                 f"🔴 *سیگناڵی فرۆشتن (SHORT)*\n\n"
                 f"🪙 *دراو:* `{display_name}` (Bitget Futures)\n"
-                f"⏱ *تایم‌فرەیم:* `15m`\n"
+                f"⏱ *تایم‌فرەیم:* `{TIMEFRAME}`\n"
                 f"📍 *نرخی چوونەژوور:* `{close}`\n"
                 f"🎯 *تارگێتی یەکەم (TP1):* `{tp1}`\n"
                 f"🎯 *تارگێتی دووەم (TP2):* `{tp2}`\n"
                 f"🎯 *تارگێتی سێیەم (TP3):* `{tp3}`\n"
                 f"🛑 *ستۆپ لۆس (SL):* `{sl}`\n"
                 f"⚡️ *لیڤەرەیج:* `{leverage}`\n\n"
-                f"📊 *شیکاری:*\n"
-                f"• ترێند: `Bearish Trend`\n"
-                f"• خاڵی RSI: `{round(rsi, 1)}`\n\n"
-                f"📈 [بینینی تەواوی چارت لە TradingView]({tv_link})"
+                f"📊 *شیکاری زیرەک:*\n"
+                f"• شێوازی بازاڕ: `Top Moving Coin`\n"
+                f"• پێوەری بەهێزی RSI: `{round(rsi, 1)}`\n\n"
+                f"📈 [کردنەوە لە TradingView]({tv_link})"
             )
             with open(chart_path, 'rb') as photo:
                 msg = bot.send_photo(target_chat, photo, caption=caption, parse_mode="Markdown")
-            
             if os.path.exists(chart_path):
                 os.remove(chart_path)
 
@@ -247,7 +252,7 @@ def check_signal(symbol, force_send=False, chat_id=None):
 
     except Exception as e:
         if force_send:
-            bot.send_message(target_chat, f"❌ هەڵە: `{str(e)}`", parse_mode="Markdown")
+            bot.send_message(target_chat, f"❌ کێشە: `{str(e)}`", parse_mode="Markdown")
 
 def tp_monitoring_loop():
     while True:
@@ -267,8 +272,8 @@ def tp_monitoring_loop():
                         hit_msg = (
                             f"🎯 *TP1 HIT! ✅*\n\n"
                             f"🪙 دراو: `{data['name']}`\n"
-                            f"💵 نرخی پێکراو: `{data['tp1']}`\n"
-                            f"✨ قازانجی تارگێتی یەکەم بە سەرکەوتوویی مسۆگەر کرا!"
+                            f"💵 ئاستی پێکراو: `{data['tp1']}`\n"
+                            f"✨ قازانجی تارگێتی یەکەم دەستەبەر کرا!"
                         )
                         bot.send_message(
                             data['chat_id'],
@@ -284,65 +289,55 @@ def tp_monitoring_loop():
         except Exception:
             time.sleep(10)
 
-def scanner_loop():
+def smart_scanner_loop():
     global scanner_stats
     while True:
         try:
-            symbols = get_all_futures_symbols()
-            scanner_stats["total_symbols"] = len(symbols)
-            scanned = 0
-            
-            for symbol in symbols:
-                if symbol in last_signal_time and (time.time() - last_signal_time[symbol]) < 2400:
+            # دۆزینەوەی ئەو دراوانەی ئێستا بەرزبوونەوە یان دابەزینی بەهێزیان هەیە
+            hot_symbols = get_top_moving_symbols()
+            scanner_stats["hot_coins_count"] = len(hot_symbols)
+            scanner_stats["last_hot_coins"] = [s.split(':')[0] for s in hot_symbols[:6]]
+            scanner_stats["last_scan_time"] = time.strftime('%H:%M:%S')
+
+            for symbol in hot_symbols:
+                if symbol in last_signal_time and (time.time() - last_signal_time[symbol]) < 1800:
                     continue
                 check_signal(symbol)
-                scanned += 1
-                scanner_stats["scanned_count"] = scanned
-                scanner_stats["last_scan_time"] = time.strftime('%H:%M:%S')
-                time.sleep(0.15)
-                
-            time.sleep(60)
-        except Exception as e:
-            time.sleep(20)
+                time.sleep(0.2)
 
-# --- فەرمانەکانی تەلەگرام ---
+            time.sleep(15)
+        except Exception as e:
+            print(f"Loop error: {e}")
+            time.sleep(10)
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(
-        message, 
-        "🚀 *بۆتی سیگناڵی Bitget بە تەواوی ئامادەیە!*\n\n"
-        "• بۆ بینینی دۆخی پشکنین فەرمانی `/status` یان `/scan` بنێرە.\n"
-        "• بۆ تاقیکردنەوەی چارت بە ڕێژەی 16:9 فەرمانی `/test` بنێرە.", 
-        parse_mode="Markdown"
-    )
+    bot.reply_to(message, "🚀 *بۆتی زیرەکی Top Movers چالاکە!*\nبۆ بینینی دۆخی دراوە گەرمەکان فەرمانی `/scan` بنێرە.", parse_mode="Markdown")
 
 @bot.message_handler(commands=['scan', 'status'])
 def send_status(message):
+    coins_preview = ", ".join(scanner_stats["last_hot_coins"]) if scanner_stats["last_hot_coins"] else "لە دیاریکردندایە..."
     status_text = (
-        "📊 *ڕاپۆرتی دۆخی بۆت (Live Status)*\n\n"
-        f"🟢 دۆخی سێرڤەر: `Online & Active`\n"
-        f"⏱ تایم‌فرەیم: `15m`\n"
-        f"🪙 کۆی گشتی دراوەکانی Bitget: `{scanner_stats['total_symbols']}`\n"
-        f"🔍 دراوە پشکنراوەکانی ئەم خولە: `{scanner_stats['scanned_count']}`\n"
+        "⚡️ *سیستەمی سکانەری زیرەک (Smart Top Movers)*\n\n"
+        f"🟢 دۆخ: `Active & Scanning Hot Coins`\n"
+        f"⏱ تایم‌فرەیم: `{TIMEFRAME}`\n"
+        f"🔥 ژمارەی دراوە پڕجووڵەکان: `{scanner_stats['hot_coins_count']}`\n"
+        f"🪙 نموونەی گەرمترین دراوەکان:\n`{coins_preview}`\n"
         f"🕒 دوایین پشکنین: `{scanner_stats['last_scan_time']}`\n"
-        f"🎯 سیگناڵە چالاکەکان بۆ چاودێری TP1: `{len(active_signals)}`\n\n"
-        "⚡️ _سکانەر لە پاشبنەما بەردەوامە و هەرکات مەرجەکان پڕبوونەوە سیگناڵ دەنێرێت._"
+        f"🎯 سیگناڵە چالاکەکان بۆ TP1: `{len(active_signals)}`\n\n"
+        "💡 _بۆتەکە تەنها چاودێریی ئەو دراوانە دەکات کە ئێستا بازاڕەکەیان گەرمە و جووڵەی گەورە دروست دەکەن._"
     )
     bot.reply_to(message, status_text, parse_mode="Markdown")
 
 @bot.message_handler(commands=['test'])
 def test_signal(message):
-    bot.reply_to(message, "⏳ خەریکی ئامادەکردنی وێنەی چارت بە دیزاینی 16:9م...")
     threading.Thread(target=check_signal, args=('BTC/USDT:USDT', True, message.chat.id)).start()
 
 if __name__ == "__main__":
-    t_scan = threading.Thread(target=scanner_loop, daemon=True)
+    t_scan = threading.Thread(target=smart_scanner_loop, daemon=True)
     t_scan.start()
 
     t_tp = threading.Thread(target=tp_monitoring_loop, daemon=True)
     t_tp.start()
 
     bot.infinity_polling(timeout=10, long_polling_timeout=5)
-
-
