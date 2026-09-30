@@ -32,6 +32,8 @@ MIN_SCORE = 5
 
 # SAIWAN AI Market Radar / risk-aware leverage (informational only)
 RADAR_MIN_SCORE = 72
+# Diagnostic radar: explains why near-miss setups are rejected; it never sends them.
+DIAG_TOP_N = 8
 MAX_SUGGESTED_LEVERAGE = 5
 MIN_SUGGESTED_LEVERAGE = 2
 
@@ -52,6 +54,10 @@ seen_order = []
 next_send_at = 0
 offset = None
 active_signals = {}  # key -> tracked signal state for TP/SL notifications
+# Per-scan diagnostic state (thread-safe because symbol analysis runs in workers).
+diag_lock = threading.Lock()
+diag_rejects = {}
+diag_near_misses = []
 monitor_thread = None
 
 session = requests.Session()
@@ -416,6 +422,28 @@ def suggested_leverage(radar, volatility, risk_pct):
         return 4
     return 3
 
+def _diag_reset():
+    global diag_rejects, diag_near_misses
+    with diag_lock:
+        diag_rejects = {}
+        diag_near_misses = []
+
+def _diag_add(reason, count=1):
+    with diag_lock:
+        diag_rejects[reason] = diag_rejects.get(reason, 0) + count
+
+def _diag_near(symbol, direction, passed, total, radar_hint, failed):
+    item = {"symbol": symbol, "direction": direction, "passed": passed,
+            "total": total, "radar": radar_hint, "failed": failed[:4]}
+    with diag_lock:
+        diag_near_misses.append(item)
+        diag_near_misses.sort(key=lambda x: (x["passed"], x["radar"]), reverse=True)
+        del diag_near_misses[DIAG_TOP_N:]
+
+def _diag_snapshot():
+    with diag_lock:
+        return dict(diag_rejects), list(diag_near_misses)
+
 def analyze(symbol, rows15):
     """15m-only SAIWAN structure/zone engine.
 
@@ -512,7 +540,33 @@ def analyze(symbol, rows15):
         and (momentum_short or short_rejection) and volume_ok and not_extended_short
         and vol_score >= 4.5 and short_zone_ok
     )
+
+    # Diagnostic only: rank the two directions by how many A++ gates they pass.
+    # This does NOT relax the gate and never creates an alert. It tells us which
+    # condition is actually preventing a signal across the live market.
+    long_gates = [
+        ("trend", trend == "BULLISH"), ("rsi", long_rsi),
+        ("structure", long_structure), ("break_close", long_break_confirm),
+        ("momentum_rejection", momentum_long or long_rejection),
+        ("volume", volume_ok), ("extension", not_extended_long),
+        ("volatility", vol_score >= 4.5), ("zone", long_zone_ok)
+    ]
+    short_gates = [
+        ("trend", trend == "BEARISH"), ("rsi", short_rsi),
+        ("structure", short_structure), ("break_close", short_break_confirm),
+        ("momentum_rejection", momentum_short or short_rejection),
+        ("volume", volume_ok), ("extension", not_extended_short),
+        ("volatility", vol_score >= 4.5), ("zone", short_zone_ok)
+    ]
+    best_dir, best_gates = ("LONG", long_gates) if sum(x[1] for x in long_gates) >= sum(x[1] for x in short_gates) else ("SHORT", short_gates)
+    passed = sum(ok for _, ok in best_gates)
+    failed = [name for name, ok in best_gates if not ok]
+    _diag_near(symbol, best_dir, passed, len(best_gates), int(passed / len(best_gates) * 100), failed)
+    for name in failed:
+        _diag_add(name)
+
     if long_ready == short_ready:
+        _diag_add("direction_gate")
         return None
     direction = "LONG" if long_ready else "SHORT"
 
@@ -553,6 +607,7 @@ def analyze(symbol, rows15):
                         breakout_ok, trendline_ok, momentum_ok, extension_ok,
                         zone_ok, retest_ok, rejection_ok)
     if radar < RADAR_MIN_SCORE:
+        _diag_add("radar_threshold")
         return None
 
     entry = cur["close"]
@@ -563,6 +618,7 @@ def analyze(symbol, rows15):
         sl = min(min(recent_lows), zone["low"] - 0.12*a)
         risk = entry - sl
         if risk <= 0 or risk > 3.2*a:
+            _diag_add("risk_geometry")
             return None
         # First target is the nearest meaningful resistance; farther targets
         # fall back to R multiples only when no clean level exists.
@@ -576,6 +632,7 @@ def analyze(symbol, rows15):
         sl = max(max(recent_highs), zone["high"] + 0.12*a)
         risk = sl - entry
         if risk <= 0 or risk > 3.2*a:
+            _diag_add("risk_geometry")
             return None
         supports = sorted(set(round(x[1], 12) for x in swing_points(r15[-100:],2,2)[1] if x[1] < entry), reverse=True)
         tp1 = supports[0] if supports and supports[0] < entry - 0.8*risk else entry - 1.5*risk
@@ -902,6 +959,7 @@ def _error_bucket(exc):
 
 def scan_once():
     global pending_signals
+    _diag_reset()
     contracts = get_contracts()
     tickers = get_tickers()
     tv = {x.get("symbol"): x for x in tickers}
@@ -961,6 +1019,13 @@ def scan_once():
     total_errors = sum(error_buckets.values())
     summary = ", ".join(f"{name}={count}" for name, count in sorted(error_buckets.items(), key=lambda kv: kv[1], reverse=True)[:4])
     print(f"Bitget 15m scan: universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
+    diag, near = _diag_snapshot()
+    if diag:
+        top = ", ".join(f"{k}={v}" for k, v in sorted(diag.items(), key=lambda kv: kv[1], reverse=True)[:9])
+        print(f"A++ diagnostic rejects: {top}")
+    if near:
+        preview = " | ".join(f"{x['symbol']} {x['direction']} {x['passed']}/{x['total']} fail={','.join(x['failed'])}" for x in near[:5])
+        print(f"A++ near-miss top: {preview}")
     if not contracts:
         print("Bitget warning: no contracts returned from /api/v2/mix/market/contracts")
     elif not tickers:
