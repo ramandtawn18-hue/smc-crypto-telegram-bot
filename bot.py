@@ -9,20 +9,18 @@ import matplotlib
 matplotlib.use('Agg')
 import mplfinance as mpf
 
-# --- زانیارییەکان لە Railway Variables وەردەگیرێن ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
-# بەستنەوە بە بازاڕی فیووچەرزی Bitget (USDT-M Perpetual)
 exchange = ccxt.bitget({
     'enableRateLimit': True,
     'options': {'defaultType': 'swap'}
 })
 
 TIMEFRAME = '15m'
-CANDLE_LIMIT = 100
+CANDLE_LIMIT = 260
 last_signal_time = {}
 
 def calculate_leverage(entry_price, stop_loss):
@@ -47,22 +45,25 @@ def get_all_futures_symbols():
 
 def plot_and_save_chart(df, symbol, entry, sl, tp, signal_type):
     filename = f"chart_{int(time.time()*1000)}.png"
-    plot_df = df.tail(45).copy()
+    
+    # بەکارهێنانی دوایین 50 مۆم
+    plot_df = df.tail(50).copy()
     plot_df['timestamp'] = pd.to_datetime(plot_df['timestamp'], unit='ms')
     plot_df.set_index('timestamp', inplace=True)
     
+    # دڵنیابوونەوە لەوەی هیچ بەهایەکی None لە EMAکاندا نییە
     apds = [
-        mpf.make_addplot(plot_df['EMA_50'], color='cyan', width=1.0),
-        mpf.make_addplot(plot_df['EMA_200'], color='orange', width=1.2),
+        mpf.make_addplot(plot_df['EMA_50'].astype(float), color='cyan', width=1.0),
+        mpf.make_addplot(plot_df['EMA_200'].astype(float), color='orange', width=1.2),
     ]
 
-    # چاککردنی هەڵەکە: بەکارهێنانی linewidths لەبری widths
     h_lines = dict(
-        hlines=[entry, sl, tp], 
+        hlines=[float(entry), float(sl), float(tp)], 
         colors=['#2196F3', '#F44336', '#4CAF50'], 
         linestyle='--', 
         linewidths=1.2
     )
+    
     custom_style = mpf.make_mpf_style(base_mpf_style='nightclouds', rc={'font.size': 8})
 
     mpf.plot(
@@ -81,24 +82,34 @@ def check_signal(symbol, force_send=False, chat_id=None):
     target_chat = chat_id if chat_id else TELEGRAM_CHAT_ID
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
-        if not ohlcv or len(ohlcv) < 60:
+        if not ohlcv or len(ohlcv) < 220:
             if force_send:
-                bot.send_message(target_chat, "⚠️ نەتوانرا داتای پێویست لە Bitget وەربگیرێت.")
+                bot.send_message(target_chat, "⚠️ داتای پێویست لە Bitget وەرنەگیرا (مۆمی کەم).")
             return
 
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['close'] = df['close'].astype(float)
+        df['high'] = df['high'].astype(float)
+        df['low'] = df['low'].astype(float)
+        df['volume'] = df['volume'].astype(float)
+
         df['EMA_50'] = ta.ema(df['close'], length=50)
         df['EMA_200'] = ta.ema(df['close'], length=200)
         df['RSI'] = ta.rsi(df['close'], length=14)
         df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
 
+        # پاککردنەوەی هەموو ئەو مۆمانەی لە سەرەتادا ژمارەیان لەبەردەستدا نییە
+        df.dropna(inplace=True)
+        if len(df) < 50:
+            return
+
         last = df.iloc[-2]
         prev = df.iloc[-3]
 
         close = float(last['close'])
-        ema_200 = float(last['EMA_200']) if not pd.isna(last['EMA_200']) else close
+        ema_200 = float(last['EMA_200'])
         rsi = float(last['RSI'])
-        atr = float(last['ATR']) if not pd.isna(last['ATR']) else (close * 0.01)
+        atr = float(last['ATR'])
 
         display_name = symbol.split(':')[0]
 
@@ -175,7 +186,7 @@ def scanner_loop():
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "🚀 *بۆتی سیگناڵ چالاکە!*\nبۆ وەرگرتنی وێنەی چارت و تێست فەرمانی `/test` بنێرە.", parse_mode="Markdown")
+    bot.reply_to(message, "🚀 *بۆتی سیگناڵ چالاکە!*\nبۆ پشکنینی ڕاستەوخۆ فەرمانی `/test` بنێرە.", parse_mode="Markdown")
 
 @bot.message_handler(commands=['test'])
 def test_signal(message):
