@@ -22,6 +22,10 @@ exchange = ccxt.bitget({
 
 TIMEFRAME = '15m'
 CANDLE_LIMIT = 260
+
+# کۆگای سیگناڵە چالاکەکان بۆ چاودێریکردنی گەیشتن بە TP1
+# شێواز: {symbol: {'type': 'LONG'/'SHORT', 'tp1': float, 'message_id': int, 'chat_id': str}}
+active_signals = {}
 last_signal_time = {}
 
 def calculate_leverage(entry_price, stop_loss):
@@ -44,15 +48,14 @@ def get_all_futures_symbols():
         print(f"Market error: {e}")
         return []
 
-def plot_and_save_chart(df, symbol, entry, sl, tp, signal_type):
-    """دروستکردنی چارت بە ستایلی تەواو ڕەسەنی TradingView Light"""
+def plot_and_save_chart(df, symbol, entry, sl, tp1, tp2, tp3, signal_type):
+    """دروستکردنی چارت بە ڕێژەی 16:9 و کێشانی تەواوی ئاستەکان بە ناوی ڕوون"""
     filename = f"tv_chart_{int(time.time()*1000)}.png"
     
-    plot_df = df.tail(65).copy()
+    plot_df = df.tail(60).copy()
     plot_df['timestamp'] = pd.to_datetime(plot_df['timestamp'], unit='ms')
     plot_df.set_index('timestamp', inplace=True)
     
-    # ڕەنگەکانی TradingView (سەوزی نەعنایی و سووری کز)
     marketcolors = mpf.make_marketcolors(
         up='#089981',
         down='#F23645',
@@ -60,48 +63,66 @@ def plot_and_save_chart(df, symbol, entry, sl, tp, signal_type):
         wick={'up': '#089981', 'down': '#F23645'}
     )
     
-    tv_light_style = mpf.make_mpf_style(
+    tv_style = mpf.make_mpf_style(
         marketcolors=marketcolors,
-        facecolor='#FFFFFF',      # پاشبنەمای سپی خاوێن
+        facecolor='#FFFFFF',
         edgecolor='#E0E3EB',
         figcolor='#FFFFFF',
-        gridcolor='#F0F3FA',      # هێڵی تۆڕی زۆر کاڵ
-        gridstyle='-',
-        gridaxis='both',
+        gridcolor='#F0F3FA',
+        gridstyle='--',
         rc={
             'text.color': '#131722',
             'axes.labelcolor': '#787B86',
             'xtick.color': '#787B86',
             'ytick.color': '#787B86',
             'font.family': 'sans-serif',
-            'font.size': 9
+            'font.size': 10
         }
     )
 
     clean_symbol = symbol.replace('/', '').replace(':USDT', '') + 'PERP'
     last_price = plot_df['close'].iloc[-1]
-    
-    title_text = f"{clean_symbol} PERPETUAL CONTRACT · 15 · Bitget  {last_price}"
+    title_text = f"{clean_symbol} · 15m · Bitget  ({last_price})"
 
-    # هێڵەکانی TP و Entry و SL بە ڕەنگی نەرم
+    # هێڵە ئاسۆییەکان
     h_lines = dict(
-        hlines=[float(tp), float(entry), float(sl)],
-        colors=['#089981', '#2962FF', '#F23645'],
+        hlines=[tp3, tp2, tp1, entry, sl],
+        colors=['#056656', '#089981', '#26a69a', '#2962FF', '#F23645'],
         linestyle='--',
-        linewidths=1.2
+        linewidths=1.3
     )
 
+    # سایزی 16:9
     fig, axlist = mpf.plot(
         plot_df,
         type='candle',
         volume=False,
         hlines=h_lines,
-        style=tv_light_style,
-        title=f"\n{title_text}\n(Green: TP | Blue: Entry | Red: SL)",
+        style=tv_style,
+        title=f"\n{title_text}\nSignal: {signal_type}",
         returnfig=True,
-        figsize=(10, 5.5),
-        savefig=dict(fname=filename, dpi=160, bbox_inches='tight')
+        figsize=(16, 9),
+        savefig=dict(fname=filename, dpi=140, bbox_inches='tight')
     )
+
+    # زیادکردنی نووسینی ئاستەکان ڕاستەوخۆ لەسەر تەوەری چارتەکە
+    ax = axlist[0]
+    xmin, xmax = ax.get_xlim()
+    text_x = xmin + (xmax - xmin) * 0.015
+
+    levels = [
+        (tp3, f"TP3: {tp3}", '#056656'),
+        (tp2, f"TP2: {tp2}", '#089981'),
+        (tp1, f"TP1: {tp1}", '#26a69a'),
+        (entry, f"Entry: {entry}", '#2962FF'),
+        (sl, f"SL: {sl}", '#F23645')
+    ]
+
+    for price_val, label, col in levels:
+        ax.text(text_x, price_val, f"  {label}  ", color='white',
+                fontsize=9, weight='bold', verticalalignment='center',
+                bbox=dict(boxstyle='round,pad=0.25', facecolor=col, edgecolor='none', alpha=0.9))
+
     plt.close(fig)
     return filename
 
@@ -149,17 +170,21 @@ def check_signal(symbol, force_send=False, chat_id=None):
 
         if is_long:
             sl = round(close - (atr * 1.5), 4)
-            tp = round(close + (atr * 2.5), 4)
+            tp1 = round(close + (atr * 1.5), 4)
+            tp2 = round(close + (atr * 2.5), 4)
+            tp3 = round(close + (atr * 4.0), 4)
             leverage = calculate_leverage(close, sl)
 
-            chart_path = plot_and_save_chart(df, display_name, close, sl, tp, "LONG")
+            chart_path = plot_and_save_chart(df, display_name, close, sl, tp1, tp2, tp3, "LONG")
             caption = (
                 f"🟢 *سیگناڵی کڕین (LONG)*\n\n"
                 f"🪙 *دراو:* `{display_name}` (Bitget Futures)\n"
                 f"⏱ *تایم‌فرەیم:* `15m`\n"
                 f"📍 *نرخی چوونەژوور:* `{close}`\n"
-                f"🎯 *تارگێت:* `{tp}`\n"
-                f"🛑 *ستۆپ لۆس:* `{sl}`\n"
+                f"🎯 *تارگێتی یەکەم (TP1):* `{tp1}`\n"
+                f"🎯 *تارگێتی دووەم (TP2):* `{tp2}`\n"
+                f"🎯 *تارگێتی سێیەم (TP3):* `{tp3}`\n"
+                f"🛑 *ستۆپ لۆس (SL):* `{sl}`\n"
                 f"⚡️ *لیڤەرەیج:* `{leverage}`\n\n"
                 f"📊 *شیکاری:*\n"
                 f"• ترێند: `Bullish Trend`\n"
@@ -167,24 +192,38 @@ def check_signal(symbol, force_send=False, chat_id=None):
                 f"📈 [بینینی تەواوی چارت لە TradingView]({tv_link})"
             )
             with open(chart_path, 'rb') as photo:
-                bot.send_photo(target_chat, photo, caption=caption, parse_mode="Markdown")
+                msg = bot.send_photo(target_chat, photo, caption=caption, parse_mode="Markdown")
+            
             if os.path.exists(chart_path):
                 os.remove(chart_path)
+            
+            # هەڵگرتنی سیگناڵەکە بۆ چاودێریکردنی TP1
+            active_signals[symbol] = {
+                'type': 'LONG',
+                'tp1': tp1,
+                'message_id': msg.message_id,
+                'chat_id': target_chat,
+                'name': display_name
+            }
             last_signal_time[symbol] = time.time()
 
         elif is_short:
             sl = round(close + (atr * 1.5), 4)
-            tp = round(close - (atr * 2.5), 4)
+            tp1 = round(close - (atr * 1.5), 4)
+            tp2 = round(close - (atr * 2.5), 4)
+            tp3 = round(close - (atr * 4.0), 4)
             leverage = calculate_leverage(close, sl)
 
-            chart_path = plot_and_save_chart(df, display_name, close, sl, tp, "SHORT")
+            chart_path = plot_and_save_chart(df, display_name, close, sl, tp1, tp2, tp3, "SHORT")
             caption = (
                 f"🔴 *سیگناڵی فرۆشتن (SHORT)*\n\n"
                 f"🪙 *دراو:* `{display_name}` (Bitget Futures)\n"
                 f"⏱ *تایم‌فرەیم:* `15m`\n"
                 f"📍 *نرخی چوونەژوور:* `{close}`\n"
-                f"🎯 *تارگێت:* `{tp}`\n"
-                f"🛑 *ستۆپ لۆس:* `{sl}`\n"
+                f"🎯 *تارگێتی یەکەم (TP1):* `{tp1}`\n"
+                f"🎯 *تارگێتی دووەم (TP2):* `{tp2}`\n"
+                f"🎯 *تارگێتی سێیەم (TP3):* `{tp3}`\n"
+                f"🛑 *ستۆپ لۆس (SL):* `{sl}`\n"
                 f"⚡️ *لیڤەرەیج:* `{leverage}`\n\n"
                 f"📊 *شیکاری:*\n"
                 f"• ترێند: `Bearish Trend`\n"
@@ -192,14 +231,60 @@ def check_signal(symbol, force_send=False, chat_id=None):
                 f"📈 [بینینی تەواوی چارت لە TradingView]({tv_link})"
             )
             with open(chart_path, 'rb') as photo:
-                bot.send_photo(target_chat, photo, caption=caption, parse_mode="Markdown")
+                msg = bot.send_photo(target_chat, photo, caption=caption, parse_mode="Markdown")
+            
             if os.path.exists(chart_path):
                 os.remove(chart_path)
+
+            active_signals[symbol] = {
+                'type': 'SHORT',
+                'tp1': tp1,
+                'message_id': msg.message_id,
+                'chat_id': target_chat,
+                'name': display_name
+            }
             last_signal_time[symbol] = time.time()
 
     except Exception as e:
         if force_send:
             bot.send_message(target_chat, f"❌ هەڵە: `{str(e)}`", parse_mode="Markdown")
+
+def tp_monitoring_loop():
+    """بەردەوام چاودێریی نرخی بازاڕ دەکات بۆ سیگناڵە چالاکەکان تا بزانێت دەگەنە TP1"""
+    while True:
+        try:
+            if active_signals:
+                for symbol, data in list(active_signals.items()):
+                    ticker = exchange.fetch_ticker(symbol)
+                    current_price = float(ticker['last'])
+
+                    hit = False
+                    if data['type'] == 'LONG' and current_price >= data['tp1']:
+                        hit = True
+                    elif data['type'] == 'SHORT' and current_price <= data['tp1']:
+                        hit = True
+
+                    if hit:
+                        hit_msg = (
+                            f"🎯 *TP1 HIT! ✅*\n\n"
+                            f"🪙 دراو: `{data['name']}`\n"
+                            f"💵 ئاستی پێکراو: `{data['tp1']}`\n"
+                            f"✨ قازانجی بەشی یەکەم دەستەبەر کرا!"
+                        )
+                        # ڕیپلایکردنەوەی ڕاستەوخۆ لەسەر هەمان وێنەی سیگناڵەکە
+                        bot.send_message(
+                            data['chat_id'],
+                            hit_msg,
+                            reply_to_message_id=data['message_id'],
+                            parse_mode="Markdown"
+                        )
+                        del active_signals[symbol]
+
+                    time.sleep(0.5)
+
+            time.sleep(10)
+        except Exception as e:
+            time.sleep(10)
 
 def scanner_loop():
     while True:
@@ -211,18 +296,25 @@ def scanner_loop():
                 check_signal(symbol)
                 time.sleep(0.15)
             time.sleep(60)
-        except Exception as e:
+        except Exception:
             time.sleep(20)
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "🚀 *بۆتی سیگناڵ ئامادەیە!*\nبۆ وەرگرتنی وێنەی چارت فەرمانی `/test` بنێرە.", parse_mode="Markdown")
+    bot.reply_to(message, "🚀 *بۆتی سیگناڵ ئامادەیە!*\nبۆ تێستکردنی چارت بە سایزی 16:9 و تەواوی ئاستەکان فەرمانی `/test` بنێرە.", parse_mode="Markdown")
 
 @bot.message_handler(commands=['test'])
 def test_signal(message):
     threading.Thread(target=check_signal, args=('BTC/USDT:USDT', True, message.chat.id)).start()
 
 if __name__ == "__main__":
-    t = threading.Thread(target=scanner_loop, daemon=True)
-    t.start()
+    # دەستپێکردنی سکانەری بازاڕ
+    t_scan = threading.Thread(target=scanner_loop, daemon=True)
+    t_scan.start()
+
+    # دەستپێکردنی چاودێریی نرخ بۆ لێدانی TP1
+    t_tp = threading.Thread(target=tp_monitoring_loop, daemon=True)
+    t_tp.start()
+
     bot.infinity_polling(timeout=10, long_polling_timeout=5)
+
