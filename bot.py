@@ -5,31 +5,29 @@ import telebot
 import ccxt
 import pandas as pd
 import pandas_ta as ta
-import mplfinance as mpf
 import matplotlib
 matplotlib.use('Agg')
+import mplfinance as mpf
 
-# --- هێنانی زانیارییەکان لە ژینگەی کارکردن ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
-# ئاڵوگۆڕی Bitget بۆ بازاڕی فیووچەرز
 exchange = ccxt.bitget({
     'enableRateLimit': True,
     'options': {'defaultType': 'swap'}
 })
 
 TIMEFRAME = '15m'
-CANDLE_LIMIT = 100
+CANDLE_LIMIT = 120
 last_signal_time = {}
 
 def calculate_leverage(entry_price, stop_loss):
     risk_pct = abs(entry_price - stop_loss) / entry_price * 100
-    if risk_pct <= 1.2:
-        return "10x - 12x"
-    elif risk_pct <= 2.5:
+    if risk_pct <= 1.5:
+        return "10x - 15x"
+    elif risk_pct <= 3.0:
         return "5x - 7x"
     else:
         return "3x - 5x"
@@ -46,18 +44,17 @@ def get_all_futures_symbols():
         return []
 
 def plot_and_save_chart(df, symbol, entry, sl, tp, signal_type):
-    filename = f"chart_{symbol.replace('/', '_').replace(':', '_')}_{int(time.time())}.png"
-    plot_df = df.tail(60).copy()
+    filename = f"chart_{int(time.time()*1000)}.png"
+    plot_df = df.tail(50).copy()
     plot_df['timestamp'] = pd.to_datetime(plot_df['timestamp'], unit='ms')
     plot_df.set_index('timestamp', inplace=True)
     
     apds = [
-        mpf.make_addplot(plot_df['EMA_50'], color='cyan', width=1.2),
-        mpf.make_addplot(plot_df['EMA_200'], color='orange', width=1.5),
+        mpf.make_addplot(plot_df['EMA_50'], color='cyan', width=1.0),
+        mpf.make_addplot(plot_df['EMA_200'], color='orange', width=1.2),
     ]
 
-    h_lines = dict(hlines=[entry, sl, tp], colors=['blue', 'red', 'green'], linestyle='--', widths=1.2)
-
+    h_lines = dict(hlines=[entry, sl, tp], colors=['#2196F3', '#F44336', '#4CAF50'], linestyle='--', widths=1.2)
     custom_style = mpf.make_mpf_style(base_mpf_style='nightclouds', rc={'font.size': 8})
 
     mpf.plot(
@@ -72,7 +69,7 @@ def plot_and_save_chart(df, symbol, entry, sl, tp, signal_type):
     )
     return filename
 
-def analyze_symbol(symbol):
+def check_signal(symbol, force_send=False):
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
         if not ohlcv or len(ohlcv) < 80:
@@ -99,8 +96,14 @@ def analyze_symbol(symbol):
         display_name = symbol.split(':')[0]
         current_time = time.time()
 
-        # مەرجی LONG
-        if close > ema_50 > ema_200 and rsi < 42 and last['RSI'] > prev['RSI'] and vol > vol_ma:
+        is_long = (close > ema_200) and (rsi < 48) and (last['RSI'] > prev['RSI']) and (vol >= vol_ma * 0.8)
+        is_short = (close < ema_200) and (rsi > 52) and (last['RSI'] < prev['RSI']) and (vol >= vol_ma * 0.8)
+
+        # ئەگەر تێست بوو، ڕاستەوخۆ بەپێی نزیکترین مەرج سیگناڵ دەنێرێت
+        if force_send:
+            is_long = True
+
+        if is_long:
             sl = round(close - (atr * 1.5), 5)
             tp1 = round(close + (atr * 2.5), 5)
             tp2 = round(close + (atr * 4.0), 5)
@@ -117,16 +120,17 @@ def analyze_symbol(symbol):
                 f"🛑 *ستۆپ لۆس:* `{sl}`\n"
                 f"⚡️ *لیڤەرەیج:* `{leverage}`\n\n"
                 f"📊 *شیکاری:*\n"
-                f"• ترێند: `Bullish Trend`\n"
-                f"• دۆخی RSI: `{round(rsi, 1)}`"
+                f"• ترێند: `Bullish Pullback`\n"
+                f"• ئاستی RSI: `{round(rsi, 1)}`"
             )
             with open(chart_path, 'rb') as photo:
                 bot.send_photo(TELEGRAM_CHAT_ID, photo, caption=caption, parse_mode="Markdown")
-            os.remove(chart_path)
+            if os.path.exists(chart_path):
+                os.remove(chart_path)
             last_signal_time[symbol] = current_time
+            print(f"Signal sent: {display_name} LONG")
 
-        # مەرجی SHORT
-        elif close < ema_50 < ema_200 and rsi > 58 and last['RSI'] < prev['RSI'] and vol > vol_ma:
+        elif is_short:
             sl = round(close + (atr * 1.5), 5)
             tp1 = round(close - (atr * 2.5), 5)
             tp2 = round(close - (atr * 4.0), 5)
@@ -143,51 +147,43 @@ def analyze_symbol(symbol):
                 f"🛑 *ستۆپ لۆس:* `{sl}`\n"
                 f"⚡️ *لیڤەرەیج:* `{leverage}`\n\n"
                 f"📊 *شیکاری:*\n"
-                f"• ترێند: `Bearish Trend`\n"
-                f"• دۆخی RSI: `{round(rsi, 1)}`"
+                f"• ترێند: `Bearish Pullback`\n"
+                f"• ئاستی RSI: `{round(rsi, 1)}`"
             )
             with open(chart_path, 'rb') as photo:
                 bot.send_photo(TELEGRAM_CHAT_ID, photo, caption=caption, parse_mode="Markdown")
-            os.remove(chart_path)
+            if os.path.exists(chart_path):
+                os.remove(chart_path)
             last_signal_time[symbol] = current_time
+            print(f"Signal sent: {display_name} SHORT")
 
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Error analyzing {symbol}: {e}")
 
 def scanner_loop():
-    """لووپی سکانکردنی بازاڕ لە پاشبنەما (Background)"""
     while True:
         try:
             symbols = get_all_futures_symbols()
             for symbol in symbols:
-                if symbol in last_signal_time and (time.time() - last_signal_time[symbol]) < 3600:
+                if symbol in last_signal_time and (time.time() - last_signal_time[symbol]) < 2400:
                     continue
-                analyze_symbol(symbol)
-                time.sleep(0.15)
-            time.sleep(120)
+                check_signal(symbol)
+                time.sleep(0.12)
+            time.sleep(60)
         except Exception as e:
-            print(f"Scanner error: {e}")
-            time.sleep(30)
-
-# --- فەرمانەکانی تەلەگرام ---
+            print(f"Loop error: {e}")
+            time.sleep(20)
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    reply = (
-        "🚀 *بۆتی سیگناڵی کریپتۆ (Bitget Futures) بەسەرکەوتوویی کاردەکات!*\n\n"
-        "📊 *تایم‌فرەیم:* `15m`\n"
-        "🔍 بۆتەکە بە بەردەوامی بازاڕ دەپشکنێت و کاتێک مەرجەکانی ستراتیجی پڕبوونەوە سیگناڵەکە بە وێنەی چارتەوە دەنێرێت."
-    )
-    bot.reply_to(message, reply, parse_mode="Markdown")
+    bot.reply_to(message, "🚀 *بۆتی سیگناڵ چالاکە!*\nبۆ پشکنینی وێنە فەرمانی `/test` لێبدە.", parse_mode="Markdown")
 
-@bot.message_handler(commands=['scan', 'status'])
-def send_status(message):
-    bot.reply_to(message, "⚡️ سکانەرەکە لە پاشبنەما بەردەوامە لە فەحسکردنی هەموو مارکێتی فیووچەرزی Bitget...")
+@bot.message_handler(commands=['test'])
+def test_signal(message):
+    bot.reply_to(message, "⏳ خەریکی کێشانی وێنەی چارت و تێستکردنی سیگناڵم...")
+    check_signal('BTC/USDT:USDT', force_send=True)
 
 if __name__ == "__main__":
-    # چالاککردنی سکانەرەکە لە Threadێکی جیاواز بۆ ئەوەی ڕێگری لە وەڵامدانەوەی نامەکان نەکات
-    scanner_thread = threading.Thread(target=scanner_loop, daemon=True)
-    scanner_thread.start()
-
-    print("بۆتەکە ئامادەیە و بەردەوامە لە گوێگرتن لە نامەکان...")
+    t = threading.Thread(target=scanner_loop, daemon=True)
+    t.start()
     bot.infinity_polling(timeout=10, long_polling_timeout=5)
