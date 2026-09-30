@@ -9,11 +9,13 @@ import matplotlib
 matplotlib.use('Agg')
 import mplfinance as mpf
 
+# --- زانیارییەکان لە Railway Variables وەردەگیرێن ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
+# بەستنەوە بە بازاڕی فیووچەرزی Bitget (USDT-M Perpetual)
 exchange = ccxt.bitget({
     'enableRateLimit': True,
     'options': {'defaultType': 'swap'}
@@ -54,7 +56,13 @@ def plot_and_save_chart(df, symbol, entry, sl, tp, signal_type):
         mpf.make_addplot(plot_df['EMA_200'], color='orange', width=1.2),
     ]
 
-    h_lines = dict(hlines=[entry, sl, tp], colors=['#2196F3', '#F44336', '#4CAF50'], linestyle='--', widths=1.2)
+    # چاککردنی هەڵەکە: بەکارهێنانی linewidths لەبری widths
+    h_lines = dict(
+        hlines=[entry, sl, tp], 
+        colors=['#2196F3', '#F44336', '#4CAF50'], 
+        linestyle='--', 
+        linewidths=1.2
+    )
     custom_style = mpf.make_mpf_style(base_mpf_style='nightclouds', rc={'font.size': 8})
 
     mpf.plot(
@@ -167,11 +175,10 @@ def scanner_loop():
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "🚀 *بۆتی سیگناڵ چالاکە!*\nبۆ وەرگرتنی وێنەی ڕاستەوخۆ فەرمانی `/test` بنێرە.", parse_mode="Markdown")
+    bot.reply_to(message, "🚀 *بۆتی سیگناڵ چالاکە!*\nبۆ وەرگرتنی وێنەی چارت و تێست فەرمانی `/test` بنێرە.", parse_mode="Markdown")
 
 @bot.message_handler(commands=['test'])
 def test_signal(message):
-    # بەکارهێنانی Thread بۆ ئەوەی بۆتەکە لە تەلەگرام گیف نەبێت
     threading.Thread(target=check_signal, args=('BTC/USDT:USDT', True, message.chat.id)).start()
 
 if __name__ == "__main__":
