@@ -8,6 +8,7 @@ import pandas_ta as ta
 import matplotlib
 matplotlib.use('Agg')
 import mplfinance as mpf
+import matplotlib.pyplot as plt
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
@@ -44,71 +45,64 @@ def get_all_futures_symbols():
         return []
 
 def plot_and_save_chart(df, symbol, entry, sl, tp, signal_type):
-    """دروستکردنی چارت بە دیزاین و ڕەنگەکانی TradingView Dark Theme"""
-    filename = f"chart_{int(time.time()*1000)}.png"
+    """دروستکردنی چارت بە ستایلی تەواو ڕەسەنی TradingView Light"""
+    filename = f"tv_chart_{int(time.time()*1000)}.png"
     
-    plot_df = df.tail(60).copy()
+    plot_df = df.tail(65).copy()
     plot_df['timestamp'] = pd.to_datetime(plot_df['timestamp'], unit='ms')
     plot_df.set_index('timestamp', inplace=True)
     
-    # ڕەنگەکانی تەواو هاوشێوەی TradingView
+    # ڕەنگەکانی TradingView (سەوزی نەعنایی و سووری کز)
     marketcolors = mpf.make_marketcolors(
-        up='#089981',        # سەوزی مۆمی TradingView
-        down='#F23645',      # سووری مۆمی TradingView
+        up='#089981',
+        down='#F23645',
         edge={'up': '#089981', 'down': '#F23645'},
-        wick={'up': '#089981', 'down': '#F23645'},
-        volume={'up': '#089981', 'down': '#F23645'}
+        wick={'up': '#089981', 'down': '#F23645'}
     )
     
-    tv_style = mpf.make_mpf_style(
+    tv_light_style = mpf.make_mpf_style(
         marketcolors=marketcolors,
-        facecolor='#131722',       # ڕەنگی ڕەشی تەنکی پاشبنەمای TradingView
-        edgecolor='#2A2E39',
-        figcolor='#131722',
-        gridcolor='#1E222D',       # هێڵی تۆڕی کزی TradingView
-        gridstyle='--',
+        facecolor='#FFFFFF',      # پاشبنەمای سپی خاوێن
+        edgecolor='#E0E3EB',
+        figcolor='#FFFFFF',
+        gridcolor='#F0F3FA',      # هێڵی تۆڕی زۆر کاڵ
+        gridstyle='-',
         gridaxis='both',
         rc={
-            'text.color': '#D1D4DC',
+            'text.color': '#131722',
             'axes.labelcolor': '#787B86',
             'xtick.color': '#787B86',
             'ytick.color': '#787B86',
             'font.family': 'sans-serif',
-            'font.size': 8
+            'font.size': 9
         }
     )
 
-    # ئیندیکەیتەرەکان
-    apds = [
-        mpf.make_addplot(plot_df['EMA_50'].astype(float), color='#2962FF', width=1.4),   # شینی TradingView
-        mpf.make_addplot(plot_df['EMA_200'].astype(float), color='#FF9800', width=1.5),  # پرتەقاڵی EMA 200
-    ]
+    clean_symbol = symbol.replace('/', '').replace(':USDT', '') + 'PERP'
+    last_price = plot_df['close'].iloc[-1]
+    
+    title_text = f"{clean_symbol} PERPETUAL CONTRACT · 15 · Bitget  {last_price}"
 
-    # هێڵە ئاسۆییەکانی Target و Entry و Stop Loss
+    # هێڵەکانی TP و Entry و SL بە ڕەنگی نەرم
     h_lines = dict(
         hlines=[float(tp), float(entry), float(sl)],
         colors=['#089981', '#2962FF', '#F23645'],
         linestyle='--',
-        linewidths=1.3
+        linewidths=1.2
     )
-
-    clean_symbol = symbol.replace('/', '').replace(':USDT', '')
-    title_text = f"\n{clean_symbol}.P ({TIMEFRAME}) | {signal_type}\nTP: {tp}  |  Entry: {entry}  |  SL: {sl}"
 
     fig, axlist = mpf.plot(
         plot_df,
         type='candle',
-        volume=True,
-        addplot=apds,
+        volume=False,
         hlines=h_lines,
-        style=tv_style,
-        title=title_text,
+        style=tv_light_style,
+        title=f"\n{title_text}\n(Green: TP | Blue: Entry | Red: SL)",
         returnfig=True,
-        figsize=(9, 5.2),
-        panel_ratios=(4, 1),
-        savefig=dict(fname=filename, dpi=150, bbox_inches='tight')
+        figsize=(10, 5.5),
+        savefig=dict(fname=filename, dpi=160, bbox_inches='tight')
     )
-    
+    plt.close(fig)
     return filename
 
 def check_signal(symbol, force_send=False, chat_id=None):
@@ -166,11 +160,11 @@ def check_signal(symbol, force_send=False, chat_id=None):
                 f"📍 *نرخی چوونەژوور:* `{close}`\n"
                 f"🎯 *تارگێت:* `{tp}`\n"
                 f"🛑 *ستۆپ لۆس:* `{sl}`\n"
-                f"⚡️️ *لیڤەرەیج:* `{leverage}`\n\n"
+                f"⚡️ *لیڤەرەیج:* `{leverage}`\n\n"
                 f"📊 *شیکاری:*\n"
                 f"• ترێند: `Bullish Trend`\n"
                 f"• خاڵی RSI: `{round(rsi, 1)}`\n\n"
-                f"🔗 [کردنەوەی چارت لە TradingView]({tv_link})"
+                f"📈 [بینینی تەواوی چارت لە TradingView]({tv_link})"
             )
             with open(chart_path, 'rb') as photo:
                 bot.send_photo(target_chat, photo, caption=caption, parse_mode="Markdown")
@@ -187,7 +181,7 @@ def check_signal(symbol, force_send=False, chat_id=None):
             caption = (
                 f"🔴 *سیگناڵی فرۆشتن (SHORT)*\n\n"
                 f"🪙 *دراو:* `{display_name}` (Bitget Futures)\n"
-                f"⏱ *تایم‌‌فرەیم:* `15m`\n"
+                f"⏱ *تایم‌فرەیم:* `15m`\n"
                 f"📍 *نرخی چوونەژوور:* `{close}`\n"
                 f"🎯 *تارگێت:* `{tp}`\n"
                 f"🛑 *ستۆپ لۆس:* `{sl}`\n"
@@ -195,7 +189,7 @@ def check_signal(symbol, force_send=False, chat_id=None):
                 f"📊 *شیکاری:*\n"
                 f"• ترێند: `Bearish Trend`\n"
                 f"• خاڵی RSI: `{round(rsi, 1)}`\n\n"
-                f"🔗 [کردنەوەی چارت لە TradingView]({tv_link})"
+                f"📈 [بینینی تەواوی چارت لە TradingView]({tv_link})"
             )
             with open(chart_path, 'rb') as photo:
                 bot.send_photo(target_chat, photo, caption=caption, parse_mode="Markdown")
@@ -222,7 +216,7 @@ def scanner_loop():
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "🚀 *بۆتی سیگناڵی TradingView چالاکە!*\nبۆ بینینی چارت فەرمانی `/test` بنێرە.", parse_mode="Markdown")
+    bot.reply_to(message, "🚀 *بۆتی سیگناڵ ئامادەیە!*\nبۆ وەرگرتنی وێنەی چارت فەرمانی `/test` بنێرە.", parse_mode="Markdown")
 
 @bot.message_handler(commands=['test'])
 def test_signal(message):
