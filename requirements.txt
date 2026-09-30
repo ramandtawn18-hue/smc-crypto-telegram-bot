@@ -4,3 +4,4 @@ pandas_ta
 requests
 matplotlib
 mplfinance
+pyTelegramBotAPI
