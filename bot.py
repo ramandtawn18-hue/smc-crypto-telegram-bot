@@ -23,10 +23,15 @@ exchange = ccxt.bitget({
 TIMEFRAME = '15m'
 CANDLE_LIMIT = 260
 
-# کۆگای سیگناڵە چالاکەکان بۆ چاودێریکردنی گەیشتن بە TP1
-# شێواز: {symbol: {'type': 'LONG'/'SHORT', 'tp1': float, 'message_id': int, 'chat_id': str}}
+# کۆگای دۆخی سکانەر و سیگناڵەکان
 active_signals = {}
 last_signal_time = {}
+scanner_stats = {
+    "last_scan_time": "هێشتا دەستی پێنەکردووە",
+    "scanned_count": 0,
+    "total_symbols": 0,
+    "is_running": True
+}
 
 def calculate_leverage(entry_price, stop_loss):
     risk_pct = abs(entry_price - stop_loss) / entry_price * 100
@@ -49,7 +54,6 @@ def get_all_futures_symbols():
         return []
 
 def plot_and_save_chart(df, symbol, entry, sl, tp1, tp2, tp3, signal_type):
-    """دروستکردنی چارت بە ڕێژەی 16:9 و کێشانی تەواوی ئاستەکان بە ناوی ڕوون"""
     filename = f"tv_chart_{int(time.time()*1000)}.png"
     
     plot_df = df.tail(60).copy()
@@ -84,7 +88,6 @@ def plot_and_save_chart(df, symbol, entry, sl, tp1, tp2, tp3, signal_type):
     last_price = plot_df['close'].iloc[-1]
     title_text = f"{clean_symbol} · 15m · Bitget  ({last_price})"
 
-    # هێڵە ئاسۆییەکان
     h_lines = dict(
         hlines=[tp3, tp2, tp1, entry, sl],
         colors=['#056656', '#089981', '#26a69a', '#2962FF', '#F23645'],
@@ -92,7 +95,6 @@ def plot_and_save_chart(df, symbol, entry, sl, tp1, tp2, tp3, signal_type):
         linewidths=1.3
     )
 
-    # سایزی 16:9
     fig, axlist = mpf.plot(
         plot_df,
         type='candle',
@@ -105,7 +107,6 @@ def plot_and_save_chart(df, symbol, entry, sl, tp1, tp2, tp3, signal_type):
         savefig=dict(fname=filename, dpi=140, bbox_inches='tight')
     )
 
-    # زیادکردنی نووسینی ئاستەکان ڕاستەوخۆ لەسەر تەوەری چارتەکە
     ax = axlist[0]
     xmin, xmax = ax.get_xlim()
     text_x = xmin + (xmax - xmin) * 0.015
@@ -197,7 +198,6 @@ def check_signal(symbol, force_send=False, chat_id=None):
             if os.path.exists(chart_path):
                 os.remove(chart_path)
             
-            # هەڵگرتنی سیگناڵەکە بۆ چاودێریکردنی TP1
             active_signals[symbol] = {
                 'type': 'LONG',
                 'tp1': tp1,
@@ -250,7 +250,6 @@ def check_signal(symbol, force_send=False, chat_id=None):
             bot.send_message(target_chat, f"❌ هەڵە: `{str(e)}`", parse_mode="Markdown")
 
 def tp_monitoring_loop():
-    """بەردەوام چاودێریی نرخی بازاڕ دەکات بۆ سیگناڵە چالاکەکان تا بزانێت دەگەنە TP1"""
     while True:
         try:
             if active_signals:
@@ -268,10 +267,9 @@ def tp_monitoring_loop():
                         hit_msg = (
                             f"🎯 *TP1 HIT! ✅*\n\n"
                             f"🪙 دراو: `{data['name']}`\n"
-                            f"💵 ئاستی پێکراو: `{data['tp1']}`\n"
-                            f"✨ قازانجی بەشی یەکەم دەستەبەر کرا!"
+                            f"💵 نرخی پێکراو: `{data['tp1']}`\n"
+                            f"✨ قازانجی تارگێتی یەکەم بە سەرکەوتوویی مسۆگەر کرا!"
                         )
-                        # ڕیپلایکردنەوەی ڕاستەوخۆ لەسەر هەمان وێنەی سیگناڵەکە
                         bot.send_message(
                             data['chat_id'],
                             hit_msg,
@@ -283,38 +281,68 @@ def tp_monitoring_loop():
                     time.sleep(0.5)
 
             time.sleep(10)
-        except Exception as e:
+        except Exception:
             time.sleep(10)
 
 def scanner_loop():
+    global scanner_stats
     while True:
         try:
             symbols = get_all_futures_symbols()
+            scanner_stats["total_symbols"] = len(symbols)
+            scanned = 0
+            
             for symbol in symbols:
                 if symbol in last_signal_time and (time.time() - last_signal_time[symbol]) < 2400:
                     continue
                 check_signal(symbol)
+                scanned += 1
+                scanner_stats["scanned_count"] = scanned
+                scanner_stats["last_scan_time"] = time.strftime('%H:%M:%S')
                 time.sleep(0.15)
+                
             time.sleep(60)
-        except Exception:
+        except Exception as e:
             time.sleep(20)
+
+# --- فەرمانەکانی تەلەگرام ---
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "🚀 *بۆتی سیگناڵ ئامادەیە!*\nبۆ تێستکردنی چارت بە سایزی 16:9 و تەواوی ئاستەکان فەرمانی `/test` بنێرە.", parse_mode="Markdown")
+    bot.reply_to(
+        message, 
+        "🚀 *بۆتی سیگناڵی Bitget بە تەواوی ئامادەیە!*\n\n"
+        "• بۆ بینینی دۆخی پشکنین فەرمانی `/status` یان `/scan` بنێرە.\n"
+        "• بۆ تاقیکردنەوەی چارت بە ڕێژەی 16:9 فەرمانی `/test` بنێرە.", 
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(commands=['scan', 'status'])
+def send_status(message):
+    status_text = (
+        "📊 *ڕاپۆرتی دۆخی بۆت (Live Status)*\n\n"
+        f"🟢 دۆخی سێرڤەر: `Online & Active`\n"
+        f"⏱ تایم‌فرەیم: `15m`\n"
+        f"🪙 کۆی گشتی دراوەکانی Bitget: `{scanner_stats['total_symbols']}`\n"
+        f"🔍 دراوە پشکنراوەکانی ئەم خولە: `{scanner_stats['scanned_count']}`\n"
+        f"🕒 دوایین پشکنین: `{scanner_stats['last_scan_time']}`\n"
+        f"🎯 سیگناڵە چالاکەکان بۆ چاودێری TP1: `{len(active_signals)}`\n\n"
+        "⚡️ _سکانەر لە پاشبنەما بەردەوامە و هەرکات مەرجەکان پڕبوونەوە سیگناڵ دەنێرێت._"
+    )
+    bot.reply_to(message, status_text, parse_mode="Markdown")
 
 @bot.message_handler(commands=['test'])
 def test_signal(message):
+    bot.reply_to(message, "⏳ خەریکی ئامادەکردنی وێنەی چارت بە دیزاینی 16:9م...")
     threading.Thread(target=check_signal, args=('BTC/USDT:USDT', True, message.chat.id)).start()
 
 if __name__ == "__main__":
-    # دەستپێکردنی سکانەری بازاڕ
     t_scan = threading.Thread(target=scanner_loop, daemon=True)
     t_scan.start()
 
-    # دەستپێکردنی چاودێریی نرخ بۆ لێدانی TP1
     t_tp = threading.Thread(target=tp_monitoring_loop, daemon=True)
     t_tp.start()
 
     bot.infinity_polling(timeout=10, long_polling_timeout=5)
+
 
