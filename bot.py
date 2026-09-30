@@ -1,51 +1,31 @@
 import os
 import time
-import requests
+import threading
+import telebot
 import ccxt
 import pandas as pd
 import pandas_ta as ta
 import mplfinance as mpf
 import matplotlib
-matplotlib.use('Agg')  # بۆ کارکردن لەسەر سێرڤەر بەبێ GUI
+matplotlib.use('Agg')
 
-# --- ڕێکخستنەکانی تەلەگرام ---
+# --- هێنانی زانیارییەکان لە ژینگەی کارکردن ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 
-# پەیوەندی بە بازاڕی فیووچەرزی Bitget (USDT-M Futures)
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+
+# ئاڵوگۆڕی Bitget بۆ بازاڕی فیووچەرز
 exchange = ccxt.bitget({
     'enableRateLimit': True,
-    'options': {
-        'defaultType': 'swap'
-    }
+    'options': {'defaultType': 'swap'}
 })
 
 TIMEFRAME = '15m'
 CANDLE_LIMIT = 100
 last_signal_time = {}
 
-def send_telegram_photo(photo_path, caption):
-    """ناردنی وێنەی چارت لەگەڵ دەقی شیکارییەکە"""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    try:
-        with open(photo_path, 'rb') as photo:
-            payload = {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "caption": caption,
-                "parse_mode": "Markdown"
-            }
-            files = {"photo": photo}
-            response = requests.post(url, data=payload, files=files, timeout=20)
-            return response.json()
-    except Exception as e:
-        print(f"Error sending photo to Telegram: {e}")
-    finally:
-        # سڕینەوەی وێنەکە لە سێرڤەر بۆ ئەوەی جێگا نەگرێت
-        if os.path.exists(photo_path):
-            os.remove(photo_path)
-
 def calculate_leverage(entry_price, stop_loss):
-    """هەژمارکردنی لیڤەرەیجی گونجاو بەپێی مەودای ستۆپ لۆس"""
     risk_pct = abs(entry_price - stop_loss) / entry_price * 100
     if risk_pct <= 1.2:
         return "10x - 12x"
@@ -55,28 +35,22 @@ def calculate_leverage(entry_price, stop_loss):
         return "3x - 5x"
 
 def get_all_futures_symbols():
-    """وەرگرتنی تەواوی دراوەکانی بازاڕی فیووچەرزی Bitget"""
     try:
         markets = exchange.load_markets()
-        symbols = [
+        return [
             s for s, m in markets.items()
             if m.get('quote') == 'USDT' and m.get('active', True) and m.get('swap', True)
         ]
-        return symbols
     except Exception as e:
-        print(f"Error loading Bitget markets: {e}")
+        print(f"Error loading markets: {e}")
         return []
 
 def plot_and_save_chart(df, symbol, entry, sl, tp, signal_type):
-    """کێشانی مۆمەکان و ئاستەکانی TP / SL لەسەر وێنە"""
     filename = f"chart_{symbol.replace('/', '_').replace(':', '_')}_{int(time.time())}.png"
-    
-    # ئامادەکردنی داتاکان بۆ mplfinance
     plot_df = df.tail(60).copy()
     plot_df['timestamp'] = pd.to_datetime(plot_df['timestamp'], unit='ms')
     plot_df.set_index('timestamp', inplace=True)
     
-    # هێڵەکان بۆ ئیندیکەیتەرەکان و ئاستەکان
     apds = [
         mpf.make_addplot(plot_df['EMA_50'], color='cyan', width=1.2),
         mpf.make_addplot(plot_df['EMA_200'], color='orange', width=1.5),
@@ -84,10 +58,7 @@ def plot_and_save_chart(df, symbol, entry, sl, tp, signal_type):
 
     h_lines = dict(hlines=[entry, sl, tp], colors=['blue', 'red', 'green'], linestyle='--', widths=1.2)
 
-    custom_style = mpf.make_mpf_style(
-        base_mpf_style='nightclouds',
-        rc={'font.size': 8}
-    )
+    custom_style = mpf.make_mpf_style(base_mpf_style='nightclouds', rc={'font.size': 8})
 
     mpf.plot(
         plot_df,
@@ -108,8 +79,6 @@ def analyze_symbol(symbol):
             return
 
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        
-        # ئیندیکەیتەرەکان
         df['EMA_50'] = ta.ema(df['close'], length=50)
         df['EMA_200'] = ta.ema(df['close'], length=200)
         df['RSI'] = ta.rsi(df['close'], length=14)
@@ -130,10 +99,7 @@ def analyze_symbol(symbol):
         display_name = symbol.split(':')[0]
         current_time = time.time()
 
-        # ----------------- مەرجی کڕین (LONG) -----------------
-        # 1. ترێندی بەرزبوونەوە: EMA 50 لەسەروو EMA 200 و نرخ لەسەرووی هەردووکیان
-        # 2. RSI گەڕانەوە لە کاتی Pullback (لەژێر 42 بێت و بەرەو سەرەوە وەرگەڕێتەوە)
-        # 3. قەبارەی بازرگانی لە ئاستی ئاسایی زیاتر بێت
+        # مەرجی LONG
         if close > ema_50 > ema_200 and rsi < 42 and last['RSI'] > prev['RSI'] and vol > vol_ma:
             sl = round(close - (atr * 1.5), 5)
             tp1 = round(close + (atr * 2.5), 5)
@@ -141,30 +107,25 @@ def analyze_symbol(symbol):
             leverage = calculate_leverage(close, sl)
 
             chart_path = plot_and_save_chart(df, display_name, close, sl, tp1, "LONG")
-            
             caption = (
                 f"🟢 *سیگناڵی کڕین (LONG)*\n\n"
                 f"🪙 *دراو:* `{display_name}` (Bitget Futures)\n"
                 f"⏱ *تایم‌فرەیم:* `15m`\n"
-                f"📍 *نرخی چوونەژوور (Entry):* `{close}`\n"
-                f"🎯 *تارگێتی یەکەم (TP1):* `{tp1}`\n"
-                f"🎯 *تارگێتی دووەم (TP2):* `{tp2}`\n"
-                f"🛑 *ستۆپ لۆس (SL):* `{sl}`\n"
-                f"⚡️ *لیڤەرەیجی پێشنیارکراو:* `{leverage}`\n\n"
-                f"📊 *شیکاری تەکنیکی:*\n"
-                f"• ترێندی سەروو: `EMA50 > EMA200`\n"
-                f"• خاڵی هەڵگەڕانەوەی RSI: `{round(rsi, 1)}`\n"
-                f"• پشکنینی نەختینە: `Volume > Average`"
+                f"📍 *نرخی چوونەژوور:* `{close}`\n"
+                f"🎯 *تارگێت ١:* `{tp1}`\n"
+                f"🎯 *تارگێت ٢:* `{tp2}`\n"
+                f"🛑 *ستۆپ لۆس:* `{sl}`\n"
+                f"⚡️ *لیڤەرەیج:* `{leverage}`\n\n"
+                f"📊 *شیکاری:*\n"
+                f"• ترێند: `Bullish Trend`\n"
+                f"• دۆخی RSI: `{round(rsi, 1)}`"
             )
-            send_telegram_photo(chart_path, caption)
+            with open(chart_path, 'rb') as photo:
+                bot.send_photo(TELEGRAM_CHAT_ID, photo, caption=caption, parse_mode="Markdown")
+            os.remove(chart_path)
             last_signal_time[symbol] = current_time
-            print(f"Signal Alert: {display_name} LONG")
-            time.sleep(2)
 
-        # ----------------- مەرجی فرۆشتن (SHORT) -----------------
-        # 1. ترێندی دابەزین: EMA 50 لەژێر EMA 200 و نرخ لەژێر هەردووکیان
-        # 2. RSI گەڕانەوە لە کاتی بەرزبوونەوەی کاتی (لەسەرووی 58 بێت و داببەزێت)
-        # 3. قەبارەی بازرگانی بەرز بێت
+        # مەرجی SHORT
         elif close < ema_50 < ema_200 and rsi > 58 and last['RSI'] < prev['RSI'] and vol > vol_ma:
             sl = round(close + (atr * 1.5), 5)
             tp1 = round(close - (atr * 2.5), 5)
@@ -172,50 +133,61 @@ def analyze_symbol(symbol):
             leverage = calculate_leverage(close, sl)
 
             chart_path = plot_and_save_chart(df, display_name, close, sl, tp1, "SHORT")
-            
             caption = (
                 f"🔴 *سیگناڵی فرۆشتن (SHORT)*\n\n"
                 f"🪙 *دراو:* `{display_name}` (Bitget Futures)\n"
                 f"⏱ *تایم‌فرەیم:* `15m`\n"
-                f"📍 *نرخی چوونەژوور (Entry):* `{close}`\n"
-                f"🎯 *تارگێتی یەکەم (TP1):* `{tp1}`\n"
-                f"🎯 *تارگێتی دووەم (TP2):* `{tp2}`\n"
-                f"🛑 *ستۆپ لۆس (SL):* `{sl}`\n"
-                f"⚡️ *لیڤەرەیجی پێشنیارکراو:* `{leverage}`\n\n"
-                f"📊 *شیکاری تەکنیکی:*\n"
-                f"• ترێندی خواروو: `EMA50 < EMA200`\n"
-                f"• خاڵی هەڵگەڕانەوەی RSI: `{round(rsi, 1)}`\n"
-                f"• پشکنینی نەختینە: `Volume > Average`"
+                f"📍 *نرخی چوونەژوور:* `{close}`\n"
+                f"🎯 *تارگێت ١:* `{tp1}`\n"
+                f"🎯 *تارگێت ٢:* `{tp2}`\n"
+                f"🛑 *ستۆپ لۆس:* `{sl}`\n"
+                f"⚡️ *لیڤەرەیج:* `{leverage}`\n\n"
+                f"📊 *شیکاری:*\n"
+                f"• ترێند: `Bearish Trend`\n"
+                f"• دۆخی RSI: `{round(rsi, 1)}`"
             )
-            send_telegram_photo(chart_path, caption)
+            with open(chart_path, 'rb') as photo:
+                bot.send_photo(TELEGRAM_CHAT_ID, photo, caption=caption, parse_mode="Markdown")
+            os.remove(chart_path)
             last_signal_time[symbol] = current_time
-            print(f"Signal Alert: {display_name} SHORT")
-            time.sleep(2)
 
-    except Exception as e:
-        # هەڵەی کاتی فەچکردنی هەندێک جووتە دراو
+    except Exception:
         pass
 
-def main():
-    print("بۆت دەستی بە کارکردن کرد...")
+def scanner_loop():
+    """لووپی سکانکردنی بازاڕ لە پاشبنەما (Background)"""
     while True:
         try:
             symbols = get_all_futures_symbols()
-            print(f"[{time.strftime('%H:%M:%S')}] پشکنینی {len(symbols)} دراوی بازاڕی فیووچەرز...")
-            
             for symbol in symbols:
-                # ڕێگری لەوەی هەمان دراو لە ماوەی کەمتر لە کاتژمێرێکدا دووبارە ببێتەوە
                 if symbol in last_signal_time and (time.time() - last_signal_time[symbol]) < 3600:
                     continue
-
                 analyze_symbol(symbol)
-                time.sleep(0.15)  # پاراستنی داواکارییەکان لە لیمیت بوون
-
-            # دوای تەواوبوونی گشت بازاڕەکە، 3 خولەک چاوەڕێ دەکات
-            time.sleep(180)
+                time.sleep(0.15)
+            time.sleep(120)
         except Exception as e:
-            print(f"Global Loop Error: {e}")
+            print(f"Scanner error: {e}")
             time.sleep(30)
 
+# --- فەرمانەکانی تەلەگرام ---
+
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    reply = (
+        "🚀 *بۆتی سیگناڵی کریپتۆ (Bitget Futures) بەسەرکەوتوویی کاردەکات!*\n\n"
+        "📊 *تایم‌فرەیم:* `15m`\n"
+        "🔍 بۆتەکە بە بەردەوامی بازاڕ دەپشکنێت و کاتێک مەرجەکانی ستراتیجی پڕبوونەوە سیگناڵەکە بە وێنەی چارتەوە دەنێرێت."
+    )
+    bot.reply_to(message, reply, parse_mode="Markdown")
+
+@bot.message_handler(commands=['scan', 'status'])
+def send_status(message):
+    bot.reply_to(message, "⚡️ سکانەرەکە لە پاشبنەما بەردەوامە لە فەحسکردنی هەموو مارکێتی فیووچەرزی Bitget...")
+
 if __name__ == "__main__":
-    main()
+    # چالاککردنی سکانەرەکە لە Threadێکی جیاواز بۆ ئەوەی ڕێگری لە وەڵامدانەوەی نامەکان نەکات
+    scanner_thread = threading.Thread(target=scanner_loop, daemon=True)
+    scanner_thread.start()
+
+    print("بۆتەکە ئامادەیە و بەردەوامە لە گوێگرتن لە نامەکان...")
+    bot.infinity_polling(timeout=10, long_polling_timeout=5)
