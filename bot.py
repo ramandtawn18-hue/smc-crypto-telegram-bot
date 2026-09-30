@@ -21,7 +21,7 @@ exchange = ccxt.bitget({
 })
 
 TIMEFRAME = '1m'
-CANDLE_LIMIT = 260
+CANDLE_LIMIT = 80
 
 active_signals = {}
 last_signal_time = {}
@@ -41,20 +41,19 @@ def calculate_leverage(entry_price, stop_loss):
         return "3x - 5x"
 
 def get_top_moving_symbols():
-    """ڕاستەوخۆ دەرهێنانی ئەو دراوانەی گەورەترین بەرزبوونەوە یان دابەزین و قەبارەیان هەیە"""
+    """هەڵبژاردنی هەموو ئەو دراوانەی جووڵەی بەرچاویان هەیە بەبێ سنووردارکردن بە ٢٥ دراو"""
     try:
         tickers = exchange.fetch_tickers()
         futures_tickers = [
             t for s, t in tickers.items()
-            if s.endswith(':USDT') and t.get('percentage') is not None and t.get('baseVolume', 0) > 10000
+            if s.endswith(':USDT') and t.get('percentage') is not None and t.get('baseVolume', 0) > 5000
         ]
+        # تەنها فلتەرکردنی بەپێی بوونی جووڵە (سەرووی 1% گۆڕانکاری) بەبێ بڕینی ژمارەکە
+        active_movers = [t for t in futures_tickers if abs(float(t.get('percentage', 0))) >= 1.0]
         
-        # ڕیزبەندی بەپێی بەرزترین گۆڕانکاری (چ پۆزەتیڤ چ نێگەتیڤ)
-        sorted_by_change = sorted(futures_tickers, key=lambda x: abs(float(x.get('percentage', 0))), reverse=True)
-        
-        # دەرهێنانی 25 دراوی هەرە گەرم و خاوەن جووڵەی بازاڕ
-        top_symbols = [t['symbol'] for t in sorted_by_change[:25]]
-        return top_symbols
+        # ڕیزکردن لە بەهێزترینەوە بۆ خوارەوە
+        sorted_coins = sorted(active_movers, key=lambda x: abs(float(x.get('percentage', 0))), reverse=True)
+        return [t['symbol'] for t in sorted_coins]
     except Exception as e:
         print(f"Error fetching top movers: {e}")
         return []
@@ -62,7 +61,7 @@ def get_top_moving_symbols():
 def plot_and_save_chart(df, symbol, entry, sl, tp1, tp2, tp3, signal_type):
     filename = f"tv_chart_{int(time.time()*1000)}.png"
     
-    plot_df = df.tail(60).copy()
+    plot_df = df.tail(45).copy()
     plot_df['timestamp'] = pd.to_datetime(plot_df['timestamp'], unit='ms')
     plot_df.set_index('timestamp', inplace=True)
     
@@ -137,7 +136,7 @@ def check_signal(symbol, force_send=False, chat_id=None):
     target_chat = chat_id if chat_id else TELEGRAM_CHAT_ID
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
-        if not ohlcv or len(ohlcv) < 220:
+        if not ohlcv or len(ohlcv) < 35:
             if force_send:
                 bot.send_message(target_chat, "⚠️ داتای پێویست وەرنەگیرا.")
             return
@@ -148,20 +147,19 @@ def check_signal(symbol, force_send=False, chat_id=None):
         df['low'] = df['low'].astype(float)
         df['volume'] = df['volume'].astype(float)
 
-        df['EMA_50'] = ta.ema(df['close'], length=50)
-        df['EMA_200'] = ta.ema(df['close'], length=200)
+        df['EMA_9'] = ta.ema(df['close'], length=9)
+        df['EMA_21'] = ta.ema(df['close'], length=21)
         df['RSI'] = ta.rsi(df['close'], length=14)
         df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
 
         df.dropna(inplace=True)
-        if len(df) < 50:
+        if len(df) < 20:
             return
 
         last = df.iloc[-2]
         prev = df.iloc[-3]
 
         close = float(last['close'])
-        ema_200 = float(last['EMA_200'])
         rsi = float(last['RSI'])
         atr = float(last['ATR'])
 
@@ -169,9 +167,8 @@ def check_signal(symbol, force_send=False, chat_id=None):
         coin_base = display_name.replace('/', '').replace('USDT', '')
         tv_link = f"https://www.tradingview.com/chart/?symbol=BITGET%3A{coin_base}USDT.P"
 
-        # مەرجی زیرەک و خێرا بۆ دیاریکردنی شەپۆلی کڕین و فرۆشتن
-        is_long = (close > ema_200) and (rsi < 55) and (last['RSI'] > prev['RSI'])
-        is_short = (close < ema_200) and (rsi > 45) and (last['RSI'] < prev['RSI'])
+        is_long = (last['EMA_9'] > last['EMA_21']) and (prev['EMA_9'] <= prev['EMA_21']) and (rsi >= 48)
+        is_short = (last['EMA_9'] < last['EMA_21']) and (prev['EMA_9'] >= prev['EMA_21']) and (rsi <= 52)
 
         if force_send:
             is_long = True
@@ -194,9 +191,9 @@ def check_signal(symbol, force_send=False, chat_id=None):
                 f"🎯 *تارگێتی سێیەم (TP3):* `{tp3}`\n"
                 f"🛑 *ستۆپ لۆس (SL):* `{sl}`\n"
                 f"⚡️ *لیڤەرەیج:* `{leverage}`\n\n"
-                f"📊 *شیکاری زیرەک:*\n"
-                f"• شێوازی بازاڕ: `Top Moving Coin`\n"
-                f"• پێوەری بەهێزی RSI: `{round(rsi, 1)}`\n\n"
+                f"📊 *شیکاری اسکالپینگ:*\n"
+                f"• بڕین: `EMA 9 > EMA 21 Cross`\n"
+                f"• خاڵی RSI: `{round(rsi, 1)}`\n\n"
                 f"📈 [کردنەوە لە TradingView]({tv_link})"
             )
             with open(chart_path, 'rb') as photo:
@@ -231,9 +228,9 @@ def check_signal(symbol, force_send=False, chat_id=None):
                 f"🎯 *تارگێتی سێیەم (TP3):* `{tp3}`\n"
                 f"🛑 *ستۆپ لۆس (SL):* `{sl}`\n"
                 f"⚡️ *لیڤەرەیج:* `{leverage}`\n\n"
-                f"📊 *شیکاری زیرەک:*\n"
-                f"• شێوازی بازاڕ: `Top Moving Coin`\n"
-                f"• پێوەری بەهێزی RSI: `{round(rsi, 1)}`\n\n"
+                f"📊 *شیکاری اسکالپینگ:*\n"
+                f"• بڕین: `EMA 9 < EMA 21 Cross`\n"
+                f"• خاڵی RSI: `{round(rsi, 1)}`\n\n"
                 f"📈 [کردنەوە لە TradingView]({tv_link})"
             )
             with open(chart_path, 'rb') as photo:
@@ -293,39 +290,37 @@ def smart_scanner_loop():
     global scanner_stats
     while True:
         try:
-            # دۆزینەوەی ئەو دراوانەی ئێستا بەرزبوونەوە یان دابەزینی بەهێزیان هەیە
             hot_symbols = get_top_moving_symbols()
             scanner_stats["hot_coins_count"] = len(hot_symbols)
-            scanner_stats["last_hot_coins"] = [s.split(':')[0] for s in hot_symbols[:6]]
+            scanner_stats["last_hot_coins"] = [s.split(':')[0] for s in hot_symbols[:8]]
             scanner_stats["last_scan_time"] = time.strftime('%H:%M:%S')
 
             for symbol in hot_symbols:
                 if symbol in last_signal_time and (time.time() - last_signal_time[symbol]) < 1800:
                     continue
                 check_signal(symbol)
-                time.sleep(0.2)
+                time.sleep(0.15)
 
-            time.sleep(15)
+            time.sleep(10)
         except Exception as e:
-            print(f"Loop error: {e}")
             time.sleep(10)
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "🚀 *بۆتی زیرەکی Top Movers چالاکە!*\nبۆ بینینی دۆخی دراوە گەرمەکان فەرمانی `/scan` بنێرە.", parse_mode="Markdown")
+    bot.reply_to(message, "🚀 *بۆتی خێرای اسکالپینگ چالاکە!*\nبۆ پشکنینی دۆخی دراوەکان فەرمانی `/scan` بنێرە.", parse_mode="Markdown")
 
 @bot.message_handler(commands=['scan', 'status'])
 def send_status(message):
     coins_preview = ", ".join(scanner_stats["last_hot_coins"]) if scanner_stats["last_hot_coins"] else "لە دیاریکردندایە..."
     status_text = (
-        "⚡️ *سیستەمی سکانەری زیرەک (Smart Top Movers)*\n\n"
-        f"🟢 دۆخ: `Active & Scanning Hot Coins`\n"
+        "⚡️ *سیستەمی سکانەری بێ‌سنوور*\n\n"
+        f"🟢 دۆخ: `Active & Scanning All Hot Movers`\n"
         f"⏱ تایم‌فرەیم: `{TIMEFRAME}`\n"
         f"🔥 ژمارەی دراوە پڕجووڵەکان: `{scanner_stats['hot_coins_count']}`\n"
         f"🪙 نموونەی گەرمترین دراوەکان:\n`{coins_preview}`\n"
         f"🕒 دوایین پشکنین: `{scanner_stats['last_scan_time']}`\n"
         f"🎯 سیگناڵە چالاکەکان بۆ TP1: `{len(active_signals)}`\n\n"
-        "💡 _بۆتەکە تەنها چاودێریی ئەو دراوانە دەکات کە ئێستا بازاڕەکەیان گەرمە و جووڵەی گەورە دروست دەکەن._"
+        "💡 _هەموو ئەو دراوانەی جووڵەی ڕاستەقینەیان هەیە بەبێ سنووری ژمارە دەپشکنرێن._"
     )
     bot.reply_to(message, status_text, parse_mode="Markdown")
 
