@@ -15,7 +15,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
-exchange = ccxt.bitget({
+# گۆڕینی ئێکسچەینج بۆ MEXC Futures (Swap)
+exchange = ccxt.mexc({
     'enableRateLimit': True,
     'options': {'defaultType': 'swap'}
 })
@@ -41,21 +42,18 @@ def calculate_leverage(entry_price, stop_loss):
         return "3x - 5x"
 
 def get_top_moving_symbols():
-    """هەڵبژاردنی هەموو ئەو دراوانەی جووڵەی بەرچاویان هەیە بەبێ سنووردارکردن بە ٢٥ دراو"""
     try:
         tickers = exchange.fetch_tickers()
         futures_tickers = [
             t for s, t in tickers.items()
-            if s.endswith(':USDT') and t.get('percentage') is not None and t.get('baseVolume', 0) > 5000
+            if s.endswith(':USDT') and t.get('percentage') is not None and t.get('baseVolume', 0) > 1000
         ]
-        # تەنها فلتەرکردنی بەپێی بوونی جووڵە (سەرووی 1% گۆڕانکاری) بەبێ بڕینی ژمارەکە
+        # وەرگرتنی ئەو دراوانەی جووڵەی سەرووی 1% یان هەیە لە MEXC
         active_movers = [t for t in futures_tickers if abs(float(t.get('percentage', 0))) >= 1.0]
-        
-        # ڕیزکردن لە بەهێزترینەوە بۆ خوارەوە
         sorted_coins = sorted(active_movers, key=lambda x: abs(float(x.get('percentage', 0))), reverse=True)
         return [t['symbol'] for t in sorted_coins]
     except Exception as e:
-        print(f"Error fetching top movers: {e}")
+        print(f"Error fetching MEXC movers: {e}")
         return []
 
 def plot_and_save_chart(df, symbol, entry, sl, tp1, tp2, tp3, signal_type):
@@ -91,7 +89,7 @@ def plot_and_save_chart(df, symbol, entry, sl, tp1, tp2, tp3, signal_type):
 
     clean_symbol = symbol.replace('/', '').replace(':USDT', '') + 'PERP'
     last_price = plot_df['close'].iloc[-1]
-    title_text = f"{clean_symbol} · {TIMEFRAME} · Bitget  ({last_price})"
+    title_text = f"{clean_symbol} · {TIMEFRAME} · MEXC  ({last_price})"
 
     h_lines = dict(
         hlines=[tp3, tp2, tp1, entry, sl],
@@ -138,7 +136,7 @@ def check_signal(symbol, force_send=False, chat_id=None):
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
         if not ohlcv or len(ohlcv) < 35:
             if force_send:
-                bot.send_message(target_chat, "⚠️ داتای پێویست وەرنەگیرا.")
+                bot.send_message(target_chat, "⚠️ داتای پێویست لە MEXC وەرنەگیرا.")
             return
 
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -165,7 +163,7 @@ def check_signal(symbol, force_send=False, chat_id=None):
 
         display_name = symbol.split(':')[0]
         coin_base = display_name.replace('/', '').replace('USDT', '')
-        tv_link = f"https://www.tradingview.com/chart/?symbol=BITGET%3A{coin_base}USDT.P"
+        tv_link = f"https://www.tradingview.com/chart/?symbol=MEXC%3A{coin_base}USDT.P"
 
         is_long = (last['EMA_9'] > last['EMA_21']) and (prev['EMA_9'] <= prev['EMA_21']) and (rsi >= 48)
         is_short = (last['EMA_9'] < last['EMA_21']) and (prev['EMA_9'] >= prev['EMA_21']) and (rsi <= 52)
@@ -183,7 +181,7 @@ def check_signal(symbol, force_send=False, chat_id=None):
             chart_path = plot_and_save_chart(df, display_name, close, sl, tp1, tp2, tp3, "LONG")
             caption = (
                 f"🟢 *سیگناڵی کڕین (LONG)*\n\n"
-                f"🪙 *دراو:* `{display_name}` (Bitget Futures)\n"
+                f"🪙 *دراو:* `{display_name}` (MEXC Futures)\n"
                 f"⏱ *تایم‌فرەیم:* `{TIMEFRAME}`\n"
                 f"📍 *نرخی چوونەژوور:* `{close}`\n"
                 f"🎯 *تارگێتی یەکەم (TP1):* `{tp1}`\n"
@@ -220,7 +218,7 @@ def check_signal(symbol, force_send=False, chat_id=None):
             chart_path = plot_and_save_chart(df, display_name, close, sl, tp1, tp2, tp3, "SHORT")
             caption = (
                 f"🔴 *سیگناڵی فرۆشتن (SHORT)*\n\n"
-                f"🪙 *دراو:* `{display_name}` (Bitget Futures)\n"
+                f"🪙 *دراو:* `{display_name}` (MEXC Futures)\n"
                 f"⏱ *تایم‌فرەیم:* `{TIMEFRAME}`\n"
                 f"📍 *نرخی چوونەژوور:* `{close}`\n"
                 f"🎯 *تارگێتی یەکەم (TP1):* `{tp1}`\n"
@@ -268,7 +266,7 @@ def tp_monitoring_loop():
                     if hit:
                         hit_msg = (
                             f"🎯 *TP1 HIT! ✅*\n\n"
-                            f"🪙 دراو: `{data['name']}`\n"
+                            f"🪙 دراو: `{data['name']}` (MEXC)\n"
                             f"💵 ئاستی پێکراو: `{data['tp1']}`\n"
                             f"✨ قازانجی تارگێتی یەکەم دەستەبەر کرا!"
                         )
@@ -307,20 +305,20 @@ def smart_scanner_loop():
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "🚀 *بۆتی خێرای اسکالپینگ چالاکە!*\nبۆ پشکنینی دۆخی دراوەکان فەرمانی `/scan` بنێرە.", parse_mode="Markdown")
+    bot.reply_to(message, "🚀 *بۆتی MEXC Futures چالاکە!*\nبۆ پشکنینی دراوەکان فەرمانی `/scan` بنێرە.", parse_mode="Markdown")
 
 @bot.message_handler(commands=['scan', 'status'])
 def send_status(message):
     coins_preview = ", ".join(scanner_stats["last_hot_coins"]) if scanner_stats["last_hot_coins"] else "لە دیاریکردندایە..."
     status_text = (
-        "⚡️ *سیستەمی سکانەری بێ‌سنوور*\n\n"
-        f"🟢 دۆخ: `Active & Scanning All Hot Movers`\n"
+        "⚡️ *سیستەمی سکانەری MEXC Futures*\n\n"
+        f"🟢 دۆخ: `Active & Scanning MEXC Movers`\n"
         f"⏱ تایم‌فرەیم: `{TIMEFRAME}`\n"
         f"🔥 ژمارەی دراوە پڕجووڵەکان: `{scanner_stats['hot_coins_count']}`\n"
-        f"🪙 نموونەی گەرمترین دراوەکان:\n`{coins_preview}`\n"
+        f"🪙 گەرمترین دراوەکان:\n`{coins_preview}`\n"
         f"🕒 دوایین پشکنین: `{scanner_stats['last_scan_time']}`\n"
         f"🎯 سیگناڵە چالاکەکان بۆ TP1: `{len(active_signals)}`\n\n"
-        "💡 _هەموو ئەو دراوانەی جووڵەی ڕاستەقینەیان هەیە بەبێ سنووری ژمارە دەپشکنرێن._"
+        "💡 _دراوەکانی فیووچەرزی MEXC دەپشکنرێن بۆ بڕینی خێرای EMA._"
     )
     bot.reply_to(message, status_text, parse_mode="Markdown")
 
