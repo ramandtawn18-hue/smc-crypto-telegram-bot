@@ -20,7 +20,7 @@ exchange = ccxt.bitget({
     'options': {'defaultType': 'swap'}
 })
 
-TIMEFRAME = '15m'
+TIMEFRAME = '1m'
 CANDLE_LIMIT = 260
 
 # کۆگای دۆخی سکانەر و سیگناڵەکان
