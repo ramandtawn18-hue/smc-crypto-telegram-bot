@@ -20,7 +20,7 @@ exchange = ccxt.bitget({
 })
 
 TIMEFRAME = '15m'
-CANDLE_LIMIT = 120
+CANDLE_LIMIT = 100
 last_signal_time = {}
 
 def calculate_leverage(entry_price, stop_loss):
@@ -40,12 +40,12 @@ def get_all_futures_symbols():
             if m.get('quote') == 'USDT' and m.get('active', True) and m.get('swap', True)
         ]
     except Exception as e:
-        print(f"Error loading markets: {e}")
+        print(f"Market error: {e}")
         return []
 
 def plot_and_save_chart(df, symbol, entry, sl, tp, signal_type):
     filename = f"chart_{int(time.time()*1000)}.png"
-    plot_df = df.tail(50).copy()
+    plot_df = df.tail(45).copy()
     plot_df['timestamp'] = pd.to_datetime(plot_df['timestamp'], unit='ms')
     plot_df.set_index('timestamp', inplace=True)
     
@@ -60,19 +60,22 @@ def plot_and_save_chart(df, symbol, entry, sl, tp, signal_type):
     mpf.plot(
         plot_df,
         type='candle',
-        volume=True,
+        volume=False,
         addplot=apds,
         hlines=h_lines,
         style=custom_style,
         title=f"\n{symbol} ({TIMEFRAME}) - {signal_type}\nGreen: TP | Blue: Entry | Red: SL",
-        savefig=filename
+        savefig=dict(fname=filename, dpi=100, bbox_inches='tight')
     )
     return filename
 
-def check_signal(symbol, force_send=False):
+def check_signal(symbol, force_send=False, chat_id=None):
+    target_chat = chat_id if chat_id else TELEGRAM_CHAT_ID
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
-        if not ohlcv or len(ohlcv) < 80:
+        if not ohlcv or len(ohlcv) < 60:
+            if force_send:
+                bot.send_message(target_chat, "⚠️ نەتوانرا داتای پێویست لە Bitget وەربگیرێت.")
             return
 
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -80,85 +83,74 @@ def check_signal(symbol, force_send=False):
         df['EMA_200'] = ta.ema(df['close'], length=200)
         df['RSI'] = ta.rsi(df['close'], length=14)
         df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-        df['VOL_MA'] = ta.sma(df['volume'], length=20)
 
         last = df.iloc[-2]
         prev = df.iloc[-3]
 
         close = float(last['close'])
-        ema_50 = float(last['EMA_50'])
-        ema_200 = float(last['EMA_200'])
+        ema_200 = float(last['EMA_200']) if not pd.isna(last['EMA_200']) else close
         rsi = float(last['RSI'])
-        atr = float(last['ATR'])
-        vol = float(last['volume'])
-        vol_ma = float(last['VOL_MA'])
+        atr = float(last['ATR']) if not pd.isna(last['ATR']) else (close * 0.01)
 
         display_name = symbol.split(':')[0]
-        current_time = time.time()
 
-        is_long = (close > ema_200) and (rsi < 48) and (last['RSI'] > prev['RSI']) and (vol >= vol_ma * 0.8)
-        is_short = (close < ema_200) and (rsi > 52) and (last['RSI'] < prev['RSI']) and (vol >= vol_ma * 0.8)
+        is_long = (close > ema_200) and (rsi < 48) and (last['RSI'] > prev['RSI'])
+        is_short = (close < ema_200) and (rsi > 52) and (last['RSI'] < prev['RSI'])
 
-        # ئەگەر تێست بوو، ڕاستەوخۆ بەپێی نزیکترین مەرج سیگناڵ دەنێرێت
         if force_send:
             is_long = True
 
         if is_long:
-            sl = round(close - (atr * 1.5), 5)
-            tp1 = round(close + (atr * 2.5), 5)
-            tp2 = round(close + (atr * 4.0), 5)
+            sl = round(close - (atr * 1.5), 4)
+            tp = round(close + (atr * 2.5), 4)
             leverage = calculate_leverage(close, sl)
 
-            chart_path = plot_and_save_chart(df, display_name, close, sl, tp1, "LONG")
+            chart_path = plot_and_save_chart(df, display_name, close, sl, tp, "LONG")
             caption = (
                 f"🟢 *سیگناڵی کڕین (LONG)*\n\n"
                 f"🪙 *دراو:* `{display_name}` (Bitget Futures)\n"
                 f"⏱ *تایم‌فرەیم:* `15m`\n"
                 f"📍 *نرخی چوونەژوور:* `{close}`\n"
-                f"🎯 *تارگێت ١:* `{tp1}`\n"
-                f"🎯 *تارگێت ٢:* `{tp2}`\n"
+                f"🎯 *تارگێت:* `{tp}`\n"
                 f"🛑 *ستۆپ لۆس:* `{sl}`\n"
                 f"⚡️ *لیڤەرەیج:* `{leverage}`\n\n"
                 f"📊 *شیکاری:*\n"
-                f"• ترێند: `Bullish Pullback`\n"
-                f"• ئاستی RSI: `{round(rsi, 1)}`"
+                f"• ترێند: `Bullish Trend`\n"
+                f"• خاڵی RSI: `{round(rsi, 1)}`"
             )
             with open(chart_path, 'rb') as photo:
-                bot.send_photo(TELEGRAM_CHAT_ID, photo, caption=caption, parse_mode="Markdown")
+                bot.send_photo(target_chat, photo, caption=caption, parse_mode="Markdown")
             if os.path.exists(chart_path):
                 os.remove(chart_path)
-            last_signal_time[symbol] = current_time
-            print(f"Signal sent: {display_name} LONG")
+            last_signal_time[symbol] = time.time()
 
         elif is_short:
-            sl = round(close + (atr * 1.5), 5)
-            tp1 = round(close - (atr * 2.5), 5)
-            tp2 = round(close - (atr * 4.0), 5)
+            sl = round(close + (atr * 1.5), 4)
+            tp = round(close - (atr * 2.5), 4)
             leverage = calculate_leverage(close, sl)
 
-            chart_path = plot_and_save_chart(df, display_name, close, sl, tp1, "SHORT")
+            chart_path = plot_and_save_chart(df, display_name, close, sl, tp, "SHORT")
             caption = (
                 f"🔴 *سیگناڵی فرۆشتن (SHORT)*\n\n"
                 f"🪙 *دراو:* `{display_name}` (Bitget Futures)\n"
                 f"⏱ *تایم‌فرەیم:* `15m`\n"
                 f"📍 *نرخی چوونەژوور:* `{close}`\n"
-                f"🎯 *تارگێت ١:* `{tp1}`\n"
-                f"🎯 *تارگێت ٢:* `{tp2}`\n"
+                f"🎯 *تارگێت:* `{tp}`\n"
                 f"🛑 *ستۆپ لۆس:* `{sl}`\n"
                 f"⚡️ *لیڤەرەیج:* `{leverage}`\n\n"
                 f"📊 *شیکاری:*\n"
-                f"• ترێند: `Bearish Pullback`\n"
-                f"• ئاستی RSI: `{round(rsi, 1)}`"
+                f"• ترێند: `Bearish Trend`\n"
+                f"• خاڵی RSI: `{round(rsi, 1)}`"
             )
             with open(chart_path, 'rb') as photo:
-                bot.send_photo(TELEGRAM_CHAT_ID, photo, caption=caption, parse_mode="Markdown")
+                bot.send_photo(target_chat, photo, caption=caption, parse_mode="Markdown")
             if os.path.exists(chart_path):
                 os.remove(chart_path)
-            last_signal_time[symbol] = current_time
-            print(f"Signal sent: {display_name} SHORT")
+            last_signal_time[symbol] = time.time()
 
     except Exception as e:
-        print(f"Error analyzing {symbol}: {e}")
+        if force_send:
+            bot.send_message(target_chat, f"❌ کێشەی تەکنیکی ڕوویدا:\n`{str(e)}`", parse_mode="Markdown")
 
 def scanner_loop():
     while True:
@@ -168,20 +160,19 @@ def scanner_loop():
                 if symbol in last_signal_time and (time.time() - last_signal_time[symbol]) < 2400:
                     continue
                 check_signal(symbol)
-                time.sleep(0.12)
+                time.sleep(0.15)
             time.sleep(60)
         except Exception as e:
-            print(f"Loop error: {e}")
             time.sleep(20)
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "🚀 *بۆتی سیگناڵ چالاکە!*\nبۆ پشکنینی وێنە فەرمانی `/test` لێبدە.", parse_mode="Markdown")
+    bot.reply_to(message, "🚀 *بۆتی سیگناڵ چالاکە!*\nبۆ وەرگرتنی وێنەی ڕاستەوخۆ فەرمانی `/test` بنێرە.", parse_mode="Markdown")
 
 @bot.message_handler(commands=['test'])
 def test_signal(message):
-    bot.reply_to(message, "⏳ خەریکی کێشانی وێنەی چارت و تێستکردنی سیگناڵم...")
-    check_signal('BTC/USDT:USDT', force_send=True)
+    # بەکارهێنانی Thread بۆ ئەوەی بۆتەکە لە تەلەگرام گیف نەبێت
+    threading.Thread(target=check_signal, args=('BTC/USDT:USDT', True, message.chat.id)).start()
 
 if __name__ == "__main__":
     t = threading.Thread(target=scanner_loop, daemon=True)
