@@ -683,7 +683,7 @@ def make_chart(sig):
     arrow_color = UP if direction == "LONG" else DOWN
     ax.scatter([n-1], [entry], s=42, color=arrow_color, edgecolor="white", linewidth=.8, zorder=9)
     ax.annotate(direction, xy=(n-1, entry), xytext=(max(0,n-15), entry), arrowprops=dict(arrowstyle="->", color=arrow_color, lw=1.7), color=arrow_color, fontsize=10, fontweight="bold")
-    ax.text(.01, 1.055, f"{sig['symbol']} · ICT 2022 MODEL · 15m · Bitget Futures", transform=ax.transAxes, fontsize=15, color=TEXT, fontweight="bold")
+    ax.text(.01, 1.055, f"{sig['symbol']} · SAIWAN CRYPTO SIGNAL · 15m · Bitget Futures", transform=ax.transAxes, fontsize=15, color=TEXT, fontweight="bold")
     ax.text(.01, 1.018, "LIQUIDITY SWEEP → MSS → CHOCH → FVG → OB → ENTRY", transform=ax.transAxes, fontsize=9.5, color=PURPLE, fontweight="bold")
     ax.text(.99, 1.018, direction, transform=ax.transAxes, fontsize=11, color=arrow_color, fontweight="bold", ha="right")
     ax.text(.01, .018, "Only ICT 2022 price-action components are shown · 15m closed candle", transform=ax.transAxes, fontsize=8.2, color=MUTED)
@@ -838,7 +838,7 @@ def scan_once():
 def signal_caption(sig):
     d = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
     return (
-        f"🚀 ICT 2022 SIGNAL\n\n{d}\n"
+        f"🚀 SAIWAN CRYPTO SIGNAL\n\n{d}\n"
         f"⭐ {sig['symbol']} · Bitget Futures\n"
         f"⏱ 15m\n\n"
         "Liquidity Sweep ✓  ·  MSS ✓  ·  CHOCH ✓  ·  FVG ✓  ·  OB ✓\n"
