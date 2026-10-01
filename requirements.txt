@@ -1,8 +1,0 @@
-ccxt
-pandas
-pandas_ta
-requests
-matplotlib
-mplfinance
-Pillow
-pyTelegramBotAPI
