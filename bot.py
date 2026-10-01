@@ -34,11 +34,17 @@ MIN_SCORE = 5
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 AI_REQUIRED = os.getenv("AI_REQUIRED", "true").strip().lower() not in {"0", "false", "no", "off"}
 AI_TIMEOUT = 20
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+# Groq free/on-demand limits are organization-wide. Serialize AI calls and
+# keep a small gap between requests so a full 466-symbol scan does not burst
+# 20+ candidate requests into the same minute.
+AI_MIN_INTERVAL = float(os.getenv("AI_MIN_INTERVAL", "3.0"))
+AI_MAX_RETRIES = 2
+ai_call_lock = threading.Lock()
+ai_last_call = 0.0
 groq_client = bool(GROQ_API_KEY)
-AI_LAST_ERROR = ""
 
 # SAIWAN AI Market Radar / risk-aware leverage (informational only)
 RADAR_MIN_SCORE = 72
@@ -65,24 +71,6 @@ active_signals = {}  # key -> tracked signal state for TP/SL notifications
 signal_history = []  # sent signal summaries for /search
 MAX_SIGNAL_HISTORY = 500
 monitor_thread = None
-
-# Live scanner diagnostics (shown by /status).
-scan_stats_lock = threading.Lock()
-scan_stats = {
-    "last_at": None,
-    "last_duration": 0.0,
-    "universe": 0,
-    "scanned": 0,
-    "confirmed": 0,
-    "ict_candidates": 0,
-    "ai_confirmed": 0,
-    "ai_wait": 0,
-    "ai_rejected": 0,
-    "ai_errors": 0,
-    "insufficient_data": 0,
-    "errors": 0,
-    "error_summary": "",
-}
 
 session = requests.Session()
 session.headers.update({"User-Agent": "SAIWAN-Crypto-Signal-Move-Hunter/5.0", "Accept": "application/json"})
@@ -676,81 +664,103 @@ def _ai_json(text):
     raise ValueError("AI returned invalid JSON")
 
 
-def _groq_ai_review(system, payload):
-    """Call Groq Chat Completions directly with strict JSON schema output."""
-    schema = {
-        "type": "object",
-        "properties": {
-            "decision": {"type": "string", "enum": ["CONFIRM", "WAIT", "REJECT"]},
-            "timing": {"type": "string", "enum": ["EARLY", "READY", "LATE", "INVALID"]},
-            "direction": {"type": "string", "enum": ["LONG", "SHORT"]},
-            "reason": {"type": "string"},
-            "reversal_watch": {"type": "boolean"},
-        },
-        "required": ["decision", "timing", "direction", "reason", "reversal_watch"],
-        "additionalProperties": False,
-    }
+def _groq_chat_json(system, user_payload, schema_name="saiwan_ai_review", schema=None, max_tokens=300):
+    """Call Groq safely with serialized requests and 429 backoff."""
+    global ai_last_call
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is missing")
+
     body = {
         "model": GROQ_MODEL,
         "messages": [
             {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
+            {"role": "user", "content": user_payload if isinstance(user_payload, str) else json.dumps(user_payload, separators=(",", ":"))},
         ],
-        "response_format": {
+        "reasoning_effort": "low",
+        "temperature": 0.2,
+        "max_tokens": max_tokens,
+    }
+    if schema is not None:
+        body["response_format"] = {
             "type": "json_schema",
             "json_schema": {
-                "name": "saiwan_ai_review",
+                "name": schema_name,
                 "strict": True,
                 "schema": schema,
             },
-        },
-        "temperature": 0.1,
-        "max_completion_tokens": 250,
-    }
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    last_error = None
-    for attempt in range(2):
-        try:
-            r = requests.post(GROQ_API_URL, headers=headers, json=body, timeout=AI_TIMEOUT)
-            if r.status_code >= 400:
+        }
+    else:
+        body["response_format"] = {"type": "json_object"}
+
+    # One AI request at a time. This is the important fix for the 8K TPM
+    # organization limit seen during the 466-symbol scan.
+    with ai_call_lock:
+        wait = AI_MIN_INTERVAL - (time.monotonic() - ai_last_call)
+        if wait > 0:
+            time.sleep(wait)
+        for attempt in range(AI_MAX_RETRIES + 1):
+            try:
+                r = requests.post(
+                    GROQ_API_URL,
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                    json=body,
+                    timeout=AI_TIMEOUT,
+                )
+                ai_last_call = time.monotonic()
+            except requests.RequestException as e:
+                ai_last_call = time.monotonic()
+                if attempt >= AI_MAX_RETRIES:
+                    raise RuntimeError(f"Groq request failed: {type(e).__name__}: {e}")
+                time.sleep(min(5.0, 1.5 * (attempt + 1)))
+                continue
+
+            if r.ok:
+                data = r.json()
+                choices = data.get("choices") or []
+                if not choices:
+                    raise RuntimeError("Groq returned no choices")
+                content = ((choices[0].get("message") or {}).get("content") or "").strip()
+                return _ai_json(content)
+
+            if r.status_code == 429 and attempt < AI_MAX_RETRIES:
+                retry_after = r.headers.get("retry-after")
                 try:
-                    err = r.json().get("error") or {}
-                    message = err.get("message") or r.text[:500]
-                    code = err.get("code") or err.get("type") or "api_error"
-                except Exception:
-                    message, code = r.text[:500], "api_error"
-                raise RuntimeError(f"Groq HTTP {r.status_code} [{code}]: {message}")
-            data = r.json()
-            choices = data.get("choices") or []
-            if not choices:
-                raise RuntimeError("Groq returned no choices")
-            message = choices[0].get("message") or {}
-            content = message.get("content")
-            if not content:
-                raise RuntimeError("Groq returned no assistant content")
-            return _ai_json(content)
-        except requests.Timeout:
-            last_error = RuntimeError(f"Groq timeout after {AI_TIMEOUT}s")
-        except requests.RequestException as e:
-            last_error = RuntimeError(f"Groq connection error: {e}")
-        except Exception as e:
-            last_error = e
-        if attempt == 0:
-            time.sleep(1.0)
-    raise last_error or RuntimeError("Groq request failed")
+                    delay = float(retry_after) if retry_after is not None else 5.0
+                except ValueError:
+                    delay = 5.0
+                # Do not spin on a minute-level TPM limit.
+                time.sleep(max(1.0, min(delay, 65.0)))
+                continue
+
+            try:
+                detail = r.json()
+            except Exception:
+                detail = r.text[:800]
+            raise RuntimeError(f"Groq HTTP {r.status_code}: {detail}")
+
+    raise RuntimeError("Groq request failed after retries")
+
+
+AI_REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "decision": {"type": "string", "enum": ["CONFIRM", "WAIT", "REJECT"]},
+        "timing": {"type": "string", "enum": ["EARLY", "READY", "LATE", "INVALID"]},
+        "direction": {"type": "string", "enum": ["LONG", "SHORT"]},
+        "reason": {"type": "string"},
+        "reversal_watch": {"type": "boolean"}
+    },
+    "required": ["decision", "timing", "direction", "reason", "reversal_watch"],
+    "additionalProperties": False
+}
 
 
 def ai_review_setup(sig, rows5, rows15):
     """AI is a timing/filter layer; it never creates a setup without ICT evidence."""
-    global AI_LAST_ERROR
-    if not GROQ_API_KEY:
+    if not groq_client:
         if AI_REQUIRED:
-            AI_LAST_ERROR = "GROQ_API_KEY is missing"
-            return None, AI_LAST_ERROR
-        return {"decision": "CONFIRM", "timing": "ICT_ONLY", "reason": "AI disabled", "reversal_watch": False}, None
+            return None, "AI unavailable: GROQ_API_KEY is missing"
+        return {"decision": "CONFIRM", "timing": "ICT_ONLY", "reason": "AI disabled"}, None
 
     payload = {
         "symbol": sig["symbol"],
@@ -770,8 +780,10 @@ def ai_review_setup(sig, rows5, rows15):
             "tp3": sig.get("tp3"),
             "context15": sig.get("context15"),
         },
-        "recent_5m": _compact_candles(rows5, 42),
-        "recent_15m": _compact_candles(rows15, 20),
+        # Keep the prompt deliberately small. The deterministic ICT engine
+        # already found the setup; AI only judges timing.
+        "recent_5m": _compact_candles(rows5, 14),
+        "recent_15m": _compact_candles(rows15, 6),
     }
     system = (
         "You are SAIWAN's ICT timing analyst. You do not predict prices and you do not invent setups. "
@@ -779,11 +791,13 @@ def ai_review_setup(sig, rows5, rows15):
         "Your job is only to decide whether the candidate is timely enough to alert now. "
         "Prefer early entries near the start of a move, but reject setups that are already clearly extended, "
         "invalidated, or contradicted by the supplied closed candles. Never use RSI, volume, MACD, Fibonacci, ATR, "
-        "EMA, indicators, scores, or confidence. Return the required JSON object only. "
-        "Do not change the direction unless the supplied ICT structure itself is invalid; if invalid, use REJECT."
+        "EMA, indicators, scores, or confidence. Return JSON only with keys: decision (CONFIRM/WAIT/REJECT), "
+        "timing (EARLY/READY/LATE/INVALID), direction (LONG/SHORT), reason (short string), "
+        "reversal_watch (true/false). Do not change the direction unless the supplied ICT structure itself is invalid; "
+        "if invalid, use REJECT."
     )
     try:
-        result = _groq_ai_review(system, payload)
+        result = _groq_chat_json(system, payload, "saiwan_ai_review", AI_REVIEW_SCHEMA, max_tokens=120)
         decision = str(result.get("decision", "REJECT")).upper()
         timing = str(result.get("timing", "INVALID")).upper()
         direction = str(result.get("direction", sig["direction"])).upper()
@@ -794,46 +808,34 @@ def ai_review_setup(sig, rows5, rows15):
         if direction != sig["direction"]:
             decision = "REJECT"
         result.update({"decision": decision, "timing": timing, "direction": direction})
-        AI_LAST_ERROR = ""
         return result, None
     except Exception as e:
-        AI_LAST_ERROR = f"{type(e).__name__}: {e}"
-        return None, AI_LAST_ERROR
+        return None, f"AI review failed: {type(e).__name__}: {e}"
 
-def analyze(symbol, rows5, rows15=None, diagnostics=False):
+
+def analyze(symbol, rows5, rows15=None):
     """SAIWAN Move Hunter: 5m entry hunting with 15m context, price action only."""
-    diag = {"ict_candidates": 0, "ai_confirmed": 0, "ai_wait": 0, "ai_rejected": 0, "ai_errors": 0}
     if len(rows5) < 120:
-        return (None, diag) if diagnostics else None
+        return None
     for r in rows5: r["symbol"] = symbol
     candidates = []
     for direction in ("LONG", "SHORT"):
         sig = _move_setup(rows5, direction)
         if sig:
-            diag["ict_candidates"] += 1
             sig["symbol"] = symbol
             sig["context15"] = _context_15m(rows15, direction)
             sig["timeframe"] = "5m Entry · 15m Context"
             ai, err = ai_review_setup(sig, rows5, rows15 or [])
             if err:
-                diag["ai_errors"] += 1
                 print(f"AI REVIEW {symbol} {direction}: {err}")
                 continue
-            decision = ai.get("decision") if ai else "REJECT"
-            if decision == "CONFIRM":
-                diag["ai_confirmed"] += 1
-            elif decision == "WAIT":
-                diag["ai_wait"] += 1
-            else:
-                diag["ai_rejected"] += 1
-            if not ai or decision != "CONFIRM":
+            if not ai or ai.get("decision") != "CONFIRM":
                 continue
             sig["ai_timing"] = ai.get("timing", "READY")
             sig["ai_reason"] = ai.get("reason", "ICT setup confirmed")
             sig["ai_reversal_watch"] = bool(ai.get("reversal_watch", False))
             candidates.append(sig)
-    result = max(candidates, key=lambda x: x["time"]) if candidates else None
-    return (result, diag) if diagnostics else result
+    return max(candidates, key=lambda x: x["time"]) if candidates else None
 
 def make_chart(sig):
     """Render the SAIWAN Move Hunter setup with every ICT component annotated."""
@@ -972,47 +974,45 @@ def search_signals(query):
     return "\n".join(lines).strip()
 
 
+def ai_test():
+    """Small Telegram diagnostic proving the Groq key/model are reachable."""
+    if not groq_client:
+        return "❌ AI TEST FAILED\nGROQ_API_KEY is missing."
+    schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}, "reply": {"type": "string"}},
+        "required": ["ok", "reply"],
+        "additionalProperties": False
+    }
+    try:
+        result = _groq_chat_json(
+            "You are a connectivity test. Return JSON only.",
+            "Reply with ok=true and a short reply saying SAIWAN AI OK.",
+            "saiwan_ai_test", schema, max_tokens=80
+        )
+        if result.get("ok") is True:
+            return f"✅ AI TEST OK\nModel: {GROQ_MODEL}\nReply: {result.get('reply', 'SAIWAN AI OK')}"
+        return f"❌ AI TEST FAILED\nUnexpected response: {result}"
+    except Exception as e:
+        return f"❌ AI TEST FAILED\n{type(e).__name__}: {e}"
+
+
 def status_text():
     with state_lock:
-        scanner = scanner_running
-        pending = len(pending_signals)
-        tracked = len(active_signals)
-    with scan_stats_lock:
-        st = dict(scan_stats)
-    last_at = st.get("last_at") or "never"
-    duration = st.get("last_duration", 0.0)
-    errors = st.get("error_summary") or "none"
-    return (
-        "BOT STATUS: ONLINE\n"
-        f"Scanner: {'RUNNING' if scanner else 'STOPPED'}\n"
-        "Market: Bitget USDT Perpetual Futures (full eligible market)\n"
-        "Strategy: SAIWAN CRYPTO SIGNAL — Move Hunter\n"
-        "Model: SAIWAN Move Hunter — Liquidity Sweep + MSS + CHOCH + FVG + OB\n"
-        "Data source: Bitget Futures market data\n"
-        "Scan: 5m closed candles + 15m context\n"
-        f"Pending signals: {pending}\n"
-        f"Tracked signals: {tracked}\n"
-        f"AI: {GROQ_MODEL if groq_client else 'NOT CONNECTED'}\n"
-        f"AI last error: {AI_LAST_ERROR[:240] if AI_LAST_ERROR else 'none'}\n"
-        "\n"
-        "LAST SCAN DIAGNOSTICS\n"
-        f"Last scan (UTC): {last_at}\n"
-        f"Duration: {duration:.1f}s\n"
-        f"Universe: {st.get('universe', 0)}\n"
-        f"Scanned: {st.get('scanned', 0)}\n"
-        f"ICT candidates: {st.get('ict_candidates', 0)}\n"
-        f"AI confirmed: {st.get('ai_confirmed', 0)}\n"
-        f"AI wait: {st.get('ai_wait', 0)}\n"
-        f"AI rejected: {st.get('ai_rejected', 0)}\n"
-        f"AI errors: {st.get('ai_errors', 0)}\n"
-        f"Signals confirmed: {st.get('confirmed', 0)}\n"
-        f"Data too short: {st.get('insufficient_data', 0)}\n"
-        f"Scan errors: {st.get('errors', 0)}\n"
-        f"Error types: {errors}\n"
-        "\n"
-        "Chart: ICT components annotated\n"
-        "TradingView: chart link only"
-    )
+        return (
+            "BOT STATUS: ONLINE\n"
+            f"Scanner: {'RUNNING' if scanner_running else 'STOPPED'}\n"
+            "Market: Bitget USDT Perpetual Futures (full eligible market)\n"
+            "Strategy: SAIWAN CRYPTO SIGNAL — Move Hunter\n"
+            "Model: SAIWAN Move Hunter — Liquidity Sweep + MSS + CHOCH + FVG + OB\n"
+            "Data source: Bitget Futures market data\n"
+            "Scan: 5m closed candles + 15m context\n"
+            f"Pending signals: {len(pending_signals)}\n"
+            f"Tracked signals: {len(active_signals)}\n"
+            f"AI: {GROQ_MODEL if groq_client else 'NOT CONNECTED'}\n"
+            "Chart: ICT components annotated\n"
+            "TradingView: chart link only"
+        )
 
 def _error_bucket(exc):
     msg = str(exc).replace("\n", " ").strip()
@@ -1030,7 +1030,6 @@ def _error_bucket(exc):
 
 def scan_once():
     global pending_signals
-    started = time.time()
     contracts = get_contracts()
     tickers = get_tickers()
     tv = {x.get("symbol"): x for x in tickers}
@@ -1044,6 +1043,7 @@ def scan_once():
         if liquidity > 0:
             eligible.append((liquidity, sym))
     eligible.sort(reverse=True)
+    # Scan the whole eligible market by default. MAX_PAIRS > 0 can still cap it if needed.
     pairs = [s for _, s in eligible] if MAX_PAIRS <= 0 else [s for _, s in eligible[:MAX_PAIRS]]
 
     def check_symbol(symbol):
@@ -1051,24 +1051,17 @@ def scan_once():
             rows5 = get_klines(symbol, TF_5M, CANDLE_LIMIT)
             rows15 = get_klines(symbol, TF_15M, 180)
             if len(rows5) < 120 or len(rows15) < 30:
-                return symbol, None, None, {"insufficient_data": 1}
-            sig, diag = analyze(symbol, rows5, rows15, diagnostics=True)
-            return symbol, sig, None, diag
+                return symbol, None, None
+            return symbol, analyze(symbol, rows5, rows15), None
         except Exception as e:
-            return symbol, None, e, {}
+            return symbol, None, e
 
     found = []
     error_buckets = {}
-    totals = {
-        "ict_candidates": 0, "ai_confirmed": 0, "ai_wait": 0,
-        "ai_rejected": 0, "ai_errors": 0, "insufficient_data": 0,
-    }
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
         futures = [pool.submit(check_symbol, symbol) for symbol in pairs]
         for fut in as_completed(futures):
-            symbol, sig, err, diag = fut.result()
-            for key in totals:
-                totals[key] += int(diag.get(key, 0))
+            symbol, sig, err = fut.result()
             if err is not None:
                 key = _error_bucket(err)
                 error_buckets[key] = error_buckets.get(key, 0) + 1
@@ -1084,48 +1077,26 @@ def scan_once():
         for sig in found:
             seen_signals.add(sig["key"])
             seen_order.append(sig["key"])
+            # Do not queue another signal for a symbol that is already being tracked.
             if sig["symbol"] not in active_symbols:
                 pending_signals.append(sig)
-        pending_signals.sort(key=lambda x: x.get("time", 0), reverse=True)
+        # Keep only the strongest Radar candidates so the cooldown never creates
+        # a backlog of stale alerts. Radar score is the primary market ranking.
+        pending_signals.sort(key=lambda x: (x.get("radar_score", 0), x.get("score", 0), x.get("confidence", 0), x.get("time", 0)), reverse=True)
         del pending_signals[12:]
         while len(seen_order) > 4000:
             seen_signals.discard(seen_order.pop(0))
 
     total_errors = sum(error_buckets.values())
-    summary = ", ".join(f"{name}={count}" for name, count in sorted(error_buckets.items(), key=lambda kv: kv[1], reverse=True)[:6])
-    duration = time.time() - started
-    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    with scan_stats_lock:
-        scan_stats.update({
-            "last_at": now_utc,
-            "last_duration": duration,
-            "universe": len(eligible),
-            "scanned": len(pairs),
-            "confirmed": len(found),
-            "ict_candidates": totals["ict_candidates"],
-            "ai_confirmed": totals["ai_confirmed"],
-            "ai_wait": totals["ai_wait"],
-            "ai_rejected": totals["ai_rejected"],
-            "ai_errors": totals["ai_errors"],
-            "insufficient_data": totals["insufficient_data"],
-            "errors": total_errors,
-            "error_summary": summary,
-        })
-
-    print(
-        "Bitget Move Hunter scan: "
-        f"universe={len(eligible)}, scanned={len(pairs)}, "
-        f"ict_candidates={totals['ict_candidates']}, ai_confirmed={totals['ai_confirmed']}, "
-        f"ai_wait={totals['ai_wait']}, ai_rejected={totals['ai_rejected']}, "
-        f"ai_errors={totals['ai_errors']}, confirmed={len(found)}, "
-        f"errors={total_errors}, duration={duration:.1f}s, workers={SCAN_WORKERS}"
-    )
+    summary = ", ".join(f"{name}={count}" for name, count in sorted(error_buckets.items(), key=lambda kv: kv[1], reverse=True)[:4])
+    print(f"Bitget Move Hunter scan: universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
     if not contracts:
         print("Bitget warning: no contracts returned from /api/v2/mix/market/contracts")
     elif not tickers:
         print("Bitget warning: no tickers returned from /api/v2/mix/market/tickers")
     if summary:
         print(f"Bitget error summary: {summary}")
+
 
 def signal_caption(sig):
     d = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
@@ -1295,23 +1266,6 @@ def stop_scanner():
     stop_event.set()
 
 
-def ai_test_text():
-    """Run one tiny live API request so Railway/Groq connectivity is testable."""
-    global AI_LAST_ERROR
-    if not GROQ_API_KEY:
-        return "❌ AI TEST: GROQ_API_KEY is missing."
-    try:
-        result = _groq_ai_review(
-            "Return a valid review object. This is a connectivity test; choose WAIT, timing READY, direction LONG, reason test ok, reversal_watch false.",
-            {"test": True, "candidate_direction": "LONG"},
-        )
-        AI_LAST_ERROR = ""
-        return f"✅ AI TEST OK\nModel: {GROQ_MODEL}\nDecision: {result.get('decision')}\nTiming: {result.get('timing')}"
-    except Exception as e:
-        AI_LAST_ERROR = f"{type(e).__name__}: {e}"
-        return f"❌ AI TEST FAILED\n{AI_LAST_ERROR[:800]}"
-
-
 def poll_updates():
     global offset, active_chat_id
     conflict_wait = 3
@@ -1340,7 +1294,7 @@ def poll_updates():
                         "/scan - Start scanner\n"
                         "/stop - Stop scanner\n"
                         "/status - Bot status\n"
-                        "/aitest - Test AI connection\n"
+                        "/aitest - Test Groq AI connection\n"
                         "/search SYMBOL - Find saved signals\n\n"
                         "Market: Bitget USDT Perpetual Futures\n"
                         "Timeframe: 5m entry + 15m context\n"
@@ -1360,7 +1314,7 @@ def poll_updates():
                 elif text.startswith("/status"):
                     send_message(active_chat_id, status_text())
                 elif text.startswith("/aitest"):
-                    send_message(active_chat_id, ai_test_text())
+                    send_message(active_chat_id, ai_test())
                 elif text.startswith("/search"):
                     send_message(active_chat_id, search_signals(text))
         except Exception as e:
