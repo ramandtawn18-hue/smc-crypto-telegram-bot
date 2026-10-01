@@ -32,11 +32,10 @@ CHART_CANDLES = 70
 HTTP_TIMEOUT = 15
 MIN_SCORE = 5
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+SAIWAN_AI_URL = os.getenv("SAIWAN_AI_URL", "").rstrip("/")
+SAIWAN_AI_API_KEY = os.getenv("SAIWAN_AI_API_KEY", "")
 AI_REQUIRED = os.getenv("AI_REQUIRED", "true").strip().lower() not in {"0", "false", "no", "off"}
-AI_TIMEOUT = 20
+AI_TIMEOUT = 15
 # Groq free/on-demand limits are organization-wide. Serialize AI calls and
 # keep a small gap between requests so a full 466-symbol scan does not burst
 # 20+ candidate requests into the same minute.
@@ -46,7 +45,6 @@ AI_MAX_RETRIES = 2
 AI_MAX_REVIEWS_PER_SCAN = int(os.getenv("AI_MAX_REVIEWS_PER_SCAN", "5"))
 ai_call_lock = threading.Lock()
 ai_last_call = 0.0
-groq_client = bool(GROQ_API_KEY)
 
 # SAIWAN AI Market Radar / risk-aware leverage (informational only)
 RADAR_MIN_SCORE = 72
@@ -650,130 +648,69 @@ def _compact_candles(rows, count=36):
     return out
 
 
-def _ai_json(text, schema=None):
-    """Parse AI output robustly. JSON is preferred, but plain tagged output is accepted.
-
-    GPT-OSS can occasionally emit reasoning/prose instead of a JSON object even when
-    the prompt asks for JSON. We therefore keep JSON support but use a tiny, deterministic
-    pipe format as the fallback so one bad generation never kills an ICT candidate.
-    """
-    raw = (text or "").strip()
-    cleaned = raw
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`").strip()
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:].strip()
+def _ai_json(text):
+    """Extract a JSON object from the model's text response."""
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
     try:
-        return json.loads(cleaned)
+        return json.loads(text)
     except Exception:
-        pass
-    start, end = cleaned.find("{"), cleaned.rfind("}")
-    if start >= 0 and end > start:
-        try:
-            return json.loads(cleaned[start:end + 1])
-        except Exception:
-            pass
-
-    # ICT review fallback: DECISION|TIMING|DIRECTION|REVERSAL|REASON
-    if schema and "decision" in (schema.get("properties") or {}):
-        line = next((x.strip() for x in raw.splitlines() if "|" in x), "")
-        parts = [x.strip() for x in line.split("|", 4)] if line else []
-        if len(parts) == 5:
-            decision = parts[0].upper()
-            timing = parts[1].upper()
-            direction = parts[2].upper()
-            reversal = parts[3].lower() in {"true", "1", "yes", "watch"}
-            reason = parts[4][:180].strip() or "ICT timing reviewed"
-            if decision in {"CONFIRM", "WAIT", "REJECT"} and timing in {"EARLY", "READY", "LATE", "INVALID"} and direction in {"LONG", "SHORT"}:
-                return {"decision": decision, "timing": timing, "direction": direction, "reason": reason, "reversal_watch": reversal}
-        # Last-resort keyword extraction from prose. This is intentionally conservative.
-        upper = raw.upper()
-        decision = next((x for x in ("CONFIRM", "REJECT", "WAIT") if x in upper), None)
-        timing = next((x for x in ("EARLY", "READY", "LATE", "INVALID") if x in upper), "INVALID")
-        direction = next((x for x in ("LONG", "SHORT") if x in upper), None)
-        if decision and direction:
-            return {
-                "decision": decision, "timing": timing, "direction": direction,
-                "reason": "AI timing review", "reversal_watch": "REVERS" in upper,
-            }
-
-    # Connectivity-test fallback.
-    if schema and "ok" in (schema.get("properties") or {}):
-        upper = raw.upper()
-        return {"ok": ("OK=TRUE" in upper or "OK|TRUE" in upper or "TRUE" in upper), "reply": raw[:120] or "SAIWAN AI OK"}
-
+        start, end = text.find("{"), text.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(text[start:end + 1])
     raise ValueError("AI returned invalid JSON")
 
 
-def _groq_chat_json(system, user_payload, schema_name="saiwan_ai_review", schema=None, max_tokens=300):
-    """Call Groq safely with serialized requests and 429 backoff."""
+def _saiwan_ai_analyze(payload):
+    """Call the private SAIWAN AI v1 decision API."""
     global ai_last_call
-    if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY is missing")
+    if not SAIWAN_AI_URL:
+        raise RuntimeError("SAIWAN_AI_URL is missing")
+    if not SAIWAN_AI_API_KEY:
+        raise RuntimeError("SAIWAN_AI_API_KEY is missing")
 
-    body = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_payload if isinstance(user_payload, str) else json.dumps(user_payload, separators=(",", ":"))},
-        ],
-        "reasoning_effort": "low",
-        "include_reasoning": False,
-        "temperature": 0.2,
-        "max_completion_tokens": max_tokens,
+    url = f"{SAIWAN_AI_URL}/analyze"
+    headers = {
+        "Authorization": f"Bearer {SAIWAN_AI_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
     }
-    # Do not enable Groq server-side JSON validation here. GPT-OSS is a reasoning
-    # model, and constrained JSON generation can fail with json_validate_failed
-    # even when the request is otherwise valid. We hide reasoning and validate
-    # the final JSON locally with _ai_json().
 
-    # One AI request at a time. This is the important fix for the 8K TPM
-    # organization limit seen during the 466-symbol scan.
     with ai_call_lock:
         wait = AI_MIN_INTERVAL - (time.monotonic() - ai_last_call)
         if wait > 0:
             time.sleep(wait)
         for attempt in range(AI_MAX_RETRIES + 1):
             try:
-                r = requests.post(
-                    GROQ_API_URL,
-                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                    json=body,
-                    timeout=AI_TIMEOUT,
-                )
+                r = requests.post(url, headers=headers, json=payload, timeout=AI_TIMEOUT)
                 ai_last_call = time.monotonic()
             except requests.RequestException as e:
                 ai_last_call = time.monotonic()
                 if attempt >= AI_MAX_RETRIES:
-                    raise RuntimeError(f"Groq request failed: {type(e).__name__}: {e}")
-                time.sleep(min(5.0, 1.5 * (attempt + 1)))
+                    raise RuntimeError(f"SAIWAN AI connection failed: {type(e).__name__}: {e}")
+                time.sleep(min(3.0, 0.8 * (attempt + 1)))
                 continue
 
             if r.ok:
                 data = r.json()
-                choices = data.get("choices") or []
-                if not choices:
-                    raise RuntimeError("Groq returned no choices")
-                content = ((choices[0].get("message") or {}).get("content") or "").strip()
-                return _ai_json(content, schema)
+                if not isinstance(data, dict):
+                    raise RuntimeError("SAIWAN AI returned invalid JSON")
+                return data
 
-            if r.status_code == 429 and attempt < AI_MAX_RETRIES:
-                retry_after = r.headers.get("retry-after")
-                try:
-                    delay = float(retry_after) if retry_after is not None else 5.0
-                except ValueError:
-                    delay = 5.0
-                # Do not spin on a minute-level TPM limit.
-                time.sleep(max(1.0, min(delay, 65.0)))
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < AI_MAX_RETRIES:
+                time.sleep(min(5.0, 1.0 * (attempt + 1)))
                 continue
 
             try:
                 detail = r.json()
             except Exception:
-                detail = r.text[:800]
-            raise RuntimeError(f"Groq HTTP {r.status_code}: {detail}")
+                detail = r.text[:500]
+            raise RuntimeError(f"SAIWAN AI HTTP {r.status_code}: {detail}")
 
-    raise RuntimeError("Groq request failed after retries")
+    raise RuntimeError("SAIWAN AI request failed")
 
 
 AI_REVIEW_SCHEMA = {
@@ -791,53 +728,56 @@ AI_REVIEW_SCHEMA = {
 
 
 def ai_review_setup(sig, rows5, rows15):
-    """AI is a timing/filter layer; it never creates a setup without ICT evidence."""
-    if not groq_client:
+    """SAIWAN AI is the private ICT decision/timing layer."""
+    if not saiwan_ai_client:
         if AI_REQUIRED:
-            return None, "AI unavailable: GROQ_API_KEY is missing"
-        return {"decision": "CONFIRM", "timing": "ICT_ONLY", "reason": "AI disabled", "reversal_watch": False}, None
+            return None, "SAIWAN AI unavailable: URL/API key missing"
+        return {"decision": "CONFIRM", "timing": "READY", "reason": "AI disabled", "reversal_watch": False}, None
 
+    zone = sig.get("entry_zone") or {}
+    lo, hi = zone.get("low"), zone.get("high")
+    current = None
+    if rows5:
+        current = rows5[-1].get("close")
+    proximity = 0.0
+    try:
+        lo, hi, current = float(lo), float(hi), float(current)
+        width = max(abs(hi - lo), abs(current) * 1e-9)
+        if lo <= current <= hi:
+            proximity = 1.0
+        else:
+            distance = min(abs(current - lo), abs(current - hi))
+            proximity = max(0.0, 1.0 - distance / (width * 2.0))
+    except (TypeError, ValueError):
+        proximity = 0.0
+
+    checks = sig.get("checks") or {}
     payload = {
         "symbol": sig["symbol"],
-        "candidate_direction": sig["direction"],
-        "timeframe": "5m entry / 15m context",
-        "ict": {
-            "liquidity_sweep": True,
-            "mss": True,
-            "choch": True,
-            "fvg": sig.get("fvg"),
-            "ob": sig.get("ob"),
-            "entry_zone": sig.get("entry_zone"),
-            "entry": sig.get("entry"),
-            "sl": sig.get("sl"),
-            "tp1": sig.get("tp1"),
-            "tp2": sig.get("tp2"),
-            "tp3": sig.get("tp3"),
-            "context15": sig.get("context15"),
-        },
-        # Deliberately tiny: AI sees only the candles needed to judge timing.
-        "recent_5m": _compact_candles(rows5, 6),
-        "recent_15m": _compact_candles(rows15, 3),
+        "direction": sig["direction"],
+        "liquidity_sweep": bool(checks.get("Liquidity Sweep", True)),
+        "mss": bool(checks.get("MSS", True)),
+        "choch": bool(checks.get("CHOCH", True)),
+        "fvg": bool(sig.get("fvg")),
+        "ob": bool(sig.get("ob")),
+        "context_15m": sig.get("context15") in {"BULLISH CONTEXT", "BEARISH CONTEXT"},
+        "entry_proximity": round(proximity, 4),
+        "fresh_setup": bool(sig.get("early_entry", False)) and sig.get("ict_age", 99) <= 3,
+        "entry": sig.get("entry"),
+        "sl": sig.get("sl"),
+        "tp1": sig.get("tp1"),
+        "tp2": sig.get("tp2"),
+        "tp3": sig.get("tp3"),
+        "context15": sig.get("context15"),
     }
-    system = (
-        "You are SAIWAN's ICT timing analyst. You do not predict prices and you do not invent setups. "
-        "The deterministic engine has already found Liquidity Sweep + MSS + CHOCH + FVG + OB. "
-        "Decide only whether this exact setup is timely enough to alert now. Prefer EARLY/READY entries "
-        "near the beginning of a move. Reject if the move is already extended, the setup is invalidated, "
-        "or the closed candles contradict the ICT direction. Never use RSI, volume, MACD, Fibonacci, ATR, "
-        "EMA, indicators, scores, confidence, or any outside market data. Return exactly one JSON object "
-        "with keys decision, timing, direction, reason, reversal_watch. decision must be CONFIRM, WAIT, or REJECT; "
-        "timing must be EARLY, READY, LATE, or INVALID; direction must equal the candidate direction unless "
-        "the setup is invalid, in which case use REJECT. Keep reason under 18 words."
-    )
     try:
-        result = _groq_chat_json(system, payload, "saiwan_ai_review", AI_REVIEW_SCHEMA, max_tokens=128)
+        result = _saiwan_ai_analyze(payload)
         decision = str(result.get("decision", "REJECT")).upper()
         timing = str(result.get("timing", "INVALID")).upper()
         direction = str(result.get("direction", sig["direction"])).upper()
         if decision not in {"CONFIRM", "WAIT", "REJECT"}:
             decision = "REJECT"
-        if timing not in {"EARLY", "READY", "LATE", "INVALID"}:
+        if timing not in {"EARLY", "READY", "LATE", "INVALID", "WAIT"}:
             timing = "INVALID"
         if direction != sig["direction"]:
             decision = "REJECT"
@@ -849,7 +789,7 @@ def ai_review_setup(sig, rows5, rows15):
         })
         return result, None
     except Exception as e:
-        return None, f"AI review failed: {type(e).__name__}: {e}"
+        return None, f"SAIWAN AI review failed: {type(e).__name__}: {e}"
 
 
 def build_ict_candidates(symbol, rows5, rows15=None):
@@ -1055,24 +995,35 @@ def search_signals(query):
 
 
 def ai_test():
-    """Small Telegram diagnostic proving the Groq key/model are reachable."""
-    if not groq_client:
-        return "❌ AI TEST FAILED\nGROQ_API_KEY is missing."
-    schema = {
-        "type": "object",
-        "properties": {"ok": {"type": "boolean"}, "reply": {"type": "string"}},
-        "required": ["ok", "reply"],
-        "additionalProperties": False
-    }
+    """Telegram diagnostic for the private SAIWAN AI service."""
+    if not saiwan_ai_client:
+        return "❌ AI TEST FAILED\nSAIWAN_AI_URL or SAIWAN_AI_API_KEY is missing."
     try:
-        result = _groq_chat_json(
-            "You are a connectivity test. Return exactly: OK|TRUE|SAIWAN AI OK and nothing else.",
-            "OK|TRUE|SAIWAN AI OK",
-            "saiwan_ai_test", schema, max_tokens=80
+        r = requests.get(
+            f"{SAIWAN_AI_URL}/health",
+            headers={"Authorization": f"Bearer {SAIWAN_AI_API_KEY}"},
+            timeout=AI_TIMEOUT,
         )
-        if result.get("ok") is True:
-            return f"✅ AI TEST OK\nModel: {GROQ_MODEL}\nReply: {result.get('reply', 'SAIWAN AI OK')}"
-        return f"❌ AI TEST FAILED\nUnexpected response: {result}"
+        if not r.ok:
+            return f"❌ AI TEST FAILED\nHTTP {r.status_code}: {r.text[:300]}"
+        data = r.json()
+        test = _saiwan_ai_analyze({
+            "direction": "LONG",
+            "liquidity_sweep": True,
+            "mss": True,
+            "choch": True,
+            "fvg": True,
+            "ob": True,
+            "context_15m": True,
+            "entry_proximity": 1.0,
+            "fresh_setup": True,
+        })
+        return (
+            "✅ SAIWAN AI TEST OK\n"
+            f"Service: {data.get('service', 'SAIWAN AI')}\n"
+            f"Decision: {test.get('decision')}\n"
+            f"Timing: {test.get('timing')}"
+        )
     except Exception as e:
         return f"❌ AI TEST FAILED\n{type(e).__name__}: {e}"
 
@@ -1089,7 +1040,7 @@ def status_text():
             "Scan: 5m closed candles + 15m context\n"
             f"Pending signals: {len(pending_signals)}\n"
             f"Tracked signals: {len(active_signals)}\n"
-            f"AI: {GROQ_MODEL if groq_client else 'NOT CONNECTED'} · max {AI_MAX_REVIEWS_PER_SCAN}/scan\n"
+            f"AI: SAIWAN AI v1 {'CONNECTED' if saiwan_ai_client else 'NOT CONNECTED'} · max {AI_MAX_REVIEWS_PER_SCAN}/scan\n"
             "Chart: ICT components annotated\n"
             "TradingView: chart link only"
         )
@@ -1410,7 +1361,7 @@ def poll_updates():
                         "/scan - Start scanner\n"
                         "/stop - Stop scanner\n"
                         "/status - Bot status\n"
-                        "/aitest - Test Groq AI connection\n"
+                        "/aitest - Test SAIWAN AI connection\n"
                         "/search SYMBOL - Find saved signals\n\n"
                         "Market: Bitget USDT Perpetual Futures\n"
                         "Timeframe: 5m entry + 15m context\n"
