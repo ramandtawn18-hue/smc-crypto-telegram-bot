@@ -11,6 +11,8 @@ Features:
 - Cooldown per symbol, max open signals
 """
 import os
+import html
+import re
 import time
 import math
 import sqlite3
@@ -92,7 +94,8 @@ def tg(method, **payload):
 
 
 def send(text, symbol=None, reply_to=None):
-    """Sends a message; if reply_to is given, replies to that original signal message."""
+    """Sends a message (HTML). If Telegram rejects it, retries as plain text.
+    Returns message_id, or None if it could not be delivered."""
     payload = dict(chat_id=CHAT_ID, text=text, parse_mode="HTML", disable_web_page_preview=True)
     if symbol:
         url = f"https://www.tradingview.com/chart/?symbol=BITGET:{symbol}.P"
@@ -101,6 +104,15 @@ def send(text, symbol=None, reply_to=None):
         payload["reply_to_message_id"] = reply_to
         payload["allow_sending_without_reply"] = True
     res = tg("sendMessage", **payload)
+    if not res.get("ok"):
+        log.warning("Telegram rejected message (%s). Retrying as plain text.", res.get("description"))
+        plain = dict(payload)
+        plain.pop("parse_mode", None)
+        plain["text"] = html.unescape(re.sub(r"</?[a-z]+>", "", text))
+        res = tg("sendMessage", **plain)
+        if not res.get("ok"):
+            log.error("Telegram send failed: %s", res.get("description"))
+            return None
     return (res.get("result") or {}).get("message_id")
 
 
@@ -338,7 +350,7 @@ def send_photo(png, caption):
 
 def format_signal(s):
     icon = "🟢" if s["side"] == "LONG" else "🔴"
-    ck = "\n".join(f"{'✅' if ok else '❌'} {k}" for k, ok in s["checks"].items())
+    ck = "\n".join(f"{'✅' if ok else '❌'} {html.escape(k)}" for k, ok in s["checks"].items())
     wr = stats_text(short=True)
     return (
         f"🚀 <b>NEW SIGNAL</b>\n\n"
@@ -437,7 +449,7 @@ def stats_text(short=False):
 LABELS = [("no_data", "No data"), ("no_breakout", "No breakout"), ("weak_candle", "Weak candle"),
           ("low_volume", "Low volume"), ("against_htf", "Against HTF trend"),
           ("low_score", "Score too low"), ("cooldown", "Cooldown"),
-          ("skipped_timeout", "Skipped (time limit)"), ("api_errors", "API errors")]
+          ("skipped_timeout", "Skipped (time limit)"), ("api_errors", "API errors"), ("send_failed", "Telegram send failed")]
 
 
 def scan_summary():
@@ -497,6 +509,11 @@ def scan():
             except Exception as e:
                 log.warning("chart error %s: %s", sym, e)
         mid = send(format_signal(s), symbol=sym)
+        if mid is None:
+            log.error("signal %s could not be delivered -> not tracked", sym)
+            q("DELETE FROM signals WHERE id=(SELECT MAX(id) FROM signals WHERE symbol=?)", (sym,), commit=True)
+            SCAN_STATS["send_failed"] += 1
+            continue
         q("UPDATE signals SET msg_id=? WHERE id=(SELECT MAX(id) FROM signals WHERE symbol=?)",
           (mid, sym), commit=True)
         open_n += 1
@@ -583,3 +600,4 @@ if __name__ == "__main__":
     send(f"✅ Bot started. Auto-scanning every {TF} candle (trend filter {HTF}). Use /status anytime.")
     threading.Thread(target=commands_loop, daemon=True).start()
     scanner_loop()
+
