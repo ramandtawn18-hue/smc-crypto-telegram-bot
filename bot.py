@@ -23,19 +23,19 @@ from collections import Counter
 # ---------------- CONFIG (env variables) ----------------
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = str(os.environ["CHAT_ID"])
-DB_PATH = os.getenv("DB_PATH", "signals.db")      # on Railway: mount a volume, e.g. /data/signals.db
-TF = os.getenv("TF", "15m")                       # signal timeframe
-HTF = os.getenv("HTF", "1h")                      # trend timeframe
-TOP_N = int(os.getenv("TOP_N", "40"))             # scan top N coins by volume
+DB_PATH = os.getenv("DB_PATH", "test.db")      # on Railway: mount a volume, e.g. /data/signals.db
+TF = os.getenv("TF", "1m")                       # signal timeframe
+HTF = os.getenv("HTF", "5m")                      # trend timeframe
+TOP_N = int(os.getenv("TOP_N", "20"))             # scan top N coins by volume
 MIN_24H_VOLUME = float(os.getenv("MIN_24H_VOLUME", "5000000"))
-MIN_SCORE = int(os.getenv("MIN_SCORE", "5"))      # out of 6 extra checks
+MIN_SCORE = int(os.getenv("MIN_SCORE", "3"))      # out of 6 extra checks
 ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.5"))
 MAX_LEV = int(os.getenv("MAX_LEV", "3"))
-COOLDOWN_H = float(os.getenv("COOLDOWN_H", "8"))
+COOLDOWN_H = float(os.getenv("COOLDOWN_H", "0.1"))
 MAX_OPEN = int(os.getenv("MAX_OPEN", "5"))
 EXPIRE_H = float(os.getenv("EXPIRE_H", "48"))
-MIN_VOL_RATIO = float(os.getenv("MIN_VOL_RATIO", "1.5"))
-ENABLE_CHART = os.getenv("ENABLE_CHART", "1") == "1"
+MIN_VOL_RATIO = float(os.getenv("MIN_VOL_RATIO", "1.2"))
+ENABLE_CHART = os.getenv("ENABLE_CHART", "0") == "1"
 
 BASE = "https://api.bitget.com"
 TF_MS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000}
@@ -583,4 +583,3 @@ if __name__ == "__main__":
     send(f"✅ Bot started. Auto-scanning every {TF} candle (trend filter {HTF}). Use /status anytime.")
     threading.Thread(target=commands_loop, daemon=True).start()
     scanner_loop()
-
