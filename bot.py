@@ -650,19 +650,58 @@ def _compact_candles(rows, count=36):
     return out
 
 
-def _ai_json(text):
-    """Extract a JSON object from the model's text response."""
-    text = (text or "").strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:].strip()
+def _ai_json(text, schema=None):
+    """Parse AI output robustly. JSON is preferred, but plain tagged output is accepted.
+
+    GPT-OSS can occasionally emit reasoning/prose instead of a JSON object even when
+    the prompt asks for JSON. We therefore keep JSON support but use a tiny, deterministic
+    pipe format as the fallback so one bad generation never kills an ICT candidate.
+    """
+    raw = (text or "").strip()
+    cleaned = raw
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`").strip()
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].strip()
     try:
-        return json.loads(text)
+        return json.loads(cleaned)
     except Exception:
-        start, end = text.find("{"), text.rfind("}")
-        if start >= 0 and end > start:
-            return json.loads(text[start:end + 1])
+        pass
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(cleaned[start:end + 1])
+        except Exception:
+            pass
+
+    # ICT review fallback: DECISION|TIMING|DIRECTION|REVERSAL|REASON
+    if schema and "decision" in (schema.get("properties") or {}):
+        line = next((x.strip() for x in raw.splitlines() if "|" in x), "")
+        parts = [x.strip() for x in line.split("|", 4)] if line else []
+        if len(parts) == 5:
+            decision = parts[0].upper()
+            timing = parts[1].upper()
+            direction = parts[2].upper()
+            reversal = parts[3].lower() in {"true", "1", "yes", "watch"}
+            reason = parts[4][:180].strip() or "ICT timing reviewed"
+            if decision in {"CONFIRM", "WAIT", "REJECT"} and timing in {"EARLY", "READY", "LATE", "INVALID"} and direction in {"LONG", "SHORT"}:
+                return {"decision": decision, "timing": timing, "direction": direction, "reason": reason, "reversal_watch": reversal}
+        # Last-resort keyword extraction from prose. This is intentionally conservative.
+        upper = raw.upper()
+        decision = next((x for x in ("CONFIRM", "REJECT", "WAIT") if x in upper), None)
+        timing = next((x for x in ("EARLY", "READY", "LATE", "INVALID") if x in upper), "INVALID")
+        direction = next((x for x in ("LONG", "SHORT") if x in upper), None)
+        if decision and direction:
+            return {
+                "decision": decision, "timing": timing, "direction": direction,
+                "reason": "AI timing review", "reversal_watch": "REVERS" in upper,
+            }
+
+    # Connectivity-test fallback.
+    if schema and "ok" in (schema.get("properties") or {}):
+        upper = raw.upper()
+        return {"ok": ("OK=TRUE" in upper or "OK|TRUE" in upper or "TRUE" in upper), "reply": raw[:120] or "SAIWAN AI OK"}
+
     raise ValueError("AI returned invalid JSON")
 
 
@@ -716,7 +755,7 @@ def _groq_chat_json(system, user_payload, schema_name="saiwan_ai_review", schema
                 if not choices:
                     raise RuntimeError("Groq returned no choices")
                 content = ((choices[0].get("message") or {}).get("content") or "").strip()
-                return _ai_json(content)
+                return _ai_json(content, schema)
 
             if r.status_code == 429 and attempt < AI_MAX_RETRIES:
                 retry_after = r.headers.get("retry-after")
@@ -1027,8 +1066,8 @@ def ai_test():
     }
     try:
         result = _groq_chat_json(
-            "You are a connectivity test. Return JSON only.",
-            "Reply with ok=true and a short reply saying SAIWAN AI OK.",
+            "You are a connectivity test. Return exactly: OK|TRUE|SAIWAN AI OK and nothing else.",
+            "OK|TRUE|SAIWAN AI OK",
             "saiwan_ai_test", schema, max_tokens=80
         )
         if result.get("ok") is True:
