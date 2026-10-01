@@ -677,13 +677,14 @@ def _groq_chat_json(system, user_payload, schema_name="saiwan_ai_review", schema
             {"role": "user", "content": user_payload if isinstance(user_payload, str) else json.dumps(user_payload, separators=(",", ":"))},
         ],
         "reasoning_effort": "low",
+        "reasoning_format": "hidden",
         "temperature": 0.2,
-        "max_tokens": max_tokens,
+        "max_completion_tokens": max_tokens,
     }
-    # Groq's JSON-schema validation can reject an otherwise valid generation
-    # on some model/runtime combinations. Use JSON Object Mode for reliability;
-    # the prompt + local validation below still enforce the expected fields.
-    body["response_format"] = {"type": "json_object"}
+    # Do not enable Groq server-side JSON validation here. GPT-OSS is a reasoning
+    # model, and constrained JSON generation can fail with json_validate_failed
+    # even when the request is otherwise valid. We hide reasoning and validate
+    # the final JSON locally with _ai_json().
 
     # One AI request at a time. This is the important fix for the 8K TPM
     # organization limit seen during the 466-symbol scan.
@@ -790,7 +791,7 @@ def ai_review_setup(sig, rows5, rows15):
         "if invalid, use REJECT."
     )
     try:
-        result = _groq_chat_json(system, payload, "saiwan_ai_review", AI_REVIEW_SCHEMA, max_tokens=120)
+        result = _groq_chat_json(system, payload, "saiwan_ai_review", AI_REVIEW_SCHEMA, max_tokens=256)
         decision = str(result.get("decision", "REJECT")).upper()
         timing = str(result.get("timing", "INVALID")).upper()
         direction = str(result.get("direction", sig["direction"])).upper()
