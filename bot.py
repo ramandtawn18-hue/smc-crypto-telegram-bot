@@ -18,6 +18,7 @@ import logging
 import threading
 import requests
 import pandas as pd
+from collections import Counter
 
 # ---------------- CONFIG (env variables) ----------------
 TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -39,6 +40,11 @@ ENABLE_CHART = os.getenv("ENABLE_CHART", "1") == "1"
 BASE = "https://api.bitget.com"
 TF_MS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000}
 PRODUCT = "USDT-FUTURES"
+# Bitget wants uppercase H for hours (1H, 4H)
+BG_GRAN = {"1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1H", "4h": "4H"}
+SCAN_STATS = Counter()
+LAST_SCAN = {}
+scan_lock = threading.Lock()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
@@ -105,21 +111,26 @@ def fmt(p):
 
 # ---------------- DATA ----------------
 def get_json(path, params):
+    last = None
     for _ in range(3):
         try:
             r = requests.get(BASE + path, params=params, timeout=15)
             d = r.json()
             if d.get("code") == "00000":
                 return d["data"]
+            last = f"{d.get('code')} {d.get('msg')}"
+            break                      # API rejected the request: retrying will not help
         except Exception as e:
-            log.debug("api error %s", e)
-        time.sleep(1)
+            last = str(e)
+            time.sleep(1)
+    log.warning("API failed %s %s -> %s", path, params, last)
+    SCAN_STATS["api_errors"] += 1
     return None
 
 
 def candles(symbol, tf, limit=250, closed_only=True):
     data = get_json("/api/v2/mix/market/candles",
-                    {"symbol": symbol, "productType": PRODUCT, "granularity": tf, "limit": limit})
+                    {"symbol": symbol, "productType": PRODUCT, "granularity": BG_GRAN[tf], "limit": limit})
     if not data:
         return None
     df = pd.DataFrame(data).iloc[:, :6]
@@ -175,37 +186,51 @@ def htf_bias(df):
 
 # ---------------- STRATEGY ----------------
 def analyze(symbol, btc_bias):
+    st = SCAN_STATS
     df = candles(symbol, TF)
     if df is None:
+        st["no_data"] += 1
         return None
-    hdf = candles(symbol, HTF)
-    if hdf is None:
-        return None
-    bias = htf_bias(hdf)
-    if bias == 0:
-        return None
-    side = "LONG" if bias == 1 else "SHORT"
-    d = bias
-
     c, h, l, o, v = df["c"], df["h"], df["l"], df["o"], df["v"]
-    e20, e50 = ema(c, 20), ema(c, 50)
-    r = rsi(c)
-    a = atr(df)
-    price, a_now = c.iloc[-1], a.iloc[-1]
+    price = c.iloc[-1]
     rng = h.iloc[-1] - l.iloc[-1]
-    if rng <= 0:
+    avg_v = v.iloc[-21:-1].mean()
+    if rng <= 0 or avg_v <= 0:
+        st["no_data"] += 1
         return None
-    vol_ratio = v.iloc[-1] / v.iloc[-21:-1].mean()
+    vol_ratio = v.iloc[-1] / avg_v
 
-    # ---- hard gates (all required) ----
+    # ---- cheap gates on the signal timeframe first ----
+    up = price > h.iloc[-21:-1].max()
+    dn = price < l.iloc[-21:-1].min()
+    if not (up or dn):
+        st["no_breakout"] += 1
+        return None
+    side = "LONG" if up else "SHORT"
+    d = 1 if up else -1
     if side == "LONG":
-        breakout = price > h.iloc[-21:-1].max()
         strong = price > o.iloc[-1] and (price - l.iloc[-1]) / rng >= 0.7
     else:
-        breakout = price < l.iloc[-21:-1].min()
         strong = price < o.iloc[-1] and (h.iloc[-1] - price) / rng >= 0.7
-    if not (breakout and strong and vol_ratio >= MIN_VOL_RATIO):
+    if not strong:
+        st["weak_candle"] += 1
         return None
+    if vol_ratio < MIN_VOL_RATIO:
+        st["low_volume"] += 1
+        return None
+
+    # ---- higher-timeframe trend (only fetched for real candidates) ----
+    hdf = candles(symbol, HTF)
+    if hdf is None:
+        st["no_data"] += 1
+        return None
+    if htf_bias(hdf) != d:
+        st["against_htf"] += 1
+        return None
+
+    e20, e50 = ema(c, 20), ema(c, 50)
+    r = rsi(c)
+    a_now = atr(df).iloc[-1]
 
     # ---- scored checks ----
     if side == "LONG":
@@ -225,6 +250,7 @@ def analyze(symbol, btc_bias):
     checks["BTC not against"] = btc_bias in (0, d)
     score = sum(checks.values())
     if score < MIN_SCORE:
+        st["low_score"] += 1
         return None
 
     sl_dist = ATR_SL_MULT * a_now
@@ -236,7 +262,6 @@ def analyze(symbol, btc_bias):
     return dict(symbol=symbol, side=side, entry=entry, sl=sl, tp=tps, score=score,
                 rsi=float(r.iloc[-1]), vol=float(vol_ratio), sl_pct=sl_pct, lev=lev,
                 checks=checks, candle_ts=int(df["ts"].iloc[-1]), df=df)
-
 
 
 def make_chart(s, bars=90):
@@ -409,7 +434,28 @@ def stats_text(short=False):
 
 
 # ---------------- SCANNER ----------------
+LABELS = [("no_data", "No data"), ("no_breakout", "No breakout"), ("weak_candle", "Weak candle"),
+          ("low_volume", "Low volume"), ("against_htf", "Against HTF trend"),
+          ("low_score", "Score too low"), ("cooldown", "Cooldown"),
+          ("skipped_timeout", "Skipped (time limit)"), ("api_errors", "API errors")]
+
+
+def scan_summary():
+    if not LAST_SCAN:
+        return "No scan has run yet."
+    s = LAST_SCAN["stats"]
+    age = int(time.time() - LAST_SCAN["ts"])
+    lines = [f"Last scan: {age}s ago, took {LAST_SCAN['secs']:.0f}s",
+             f"Checked: {s['checked']} | Signals: {s['signals']}"]
+    lines += [f"• {label}: {s[k]}" for k, label in LABELS if s.get(k)]
+    return "\n".join(lines)
+
+
 def scan():
+    global SCAN_STATS, LAST_SCAN
+    SCAN_STATS = Counter()
+    t0 = time.time()
+    deadline = t0 + max(40, TF_MS[TF] / 1000 * 0.9)
     open_n = q("SELECT COUNT(*) c FROM signals WHERE status='OPEN'")[0]["c"]
     found = 0
     if open_n >= MAX_OPEN:
@@ -417,19 +463,27 @@ def scan():
         return -1
     btc = candles("BTCUSDT", HTF)
     btc_b = htf_bias(btc) if btc is not None else 0
-    for sym in top_symbols():
+    syms = top_symbols()
+    if not syms:
+        log.warning("no symbols returned from Bitget tickers")
+    for i, sym in enumerate(syms):
+        if time.time() > deadline:
+            SCAN_STATS["skipped_timeout"] = len(syms) - i
+            break
         if open_n >= MAX_OPEN:
             break
         recent = q("SELECT 1 FROM signals WHERE symbol=? AND ts>?",
                    (sym, int((time.time() - COOLDOWN_H * 3600) * 1000)))
         if recent:
+            SCAN_STATS["cooldown"] += 1
             continue
+        SCAN_STATS["checked"] += 1
         try:
             s = analyze(sym, btc_b)
         except Exception as e:
             log.warning("%s analyze error: %s", sym, e)
             continue
-        time.sleep(0.2)
+        time.sleep(0.1)
         if not s:
             continue
         q("""INSERT INTO signals(ts,symbol,side,entry,sl,tp1,tp2,tp3,score,rsi,vol,stop,last_ts)
@@ -447,26 +501,36 @@ def scan():
           (mid, sym), commit=True)
         open_n += 1
         found += 1
-        log.info("signal %s %s", sym, s["side"])
+        log.info("SIGNAL %s %s", sym, s["side"])
+    SCAN_STATS["signals"] = found
+    LAST_SCAN = dict(ts=time.time(), secs=time.time() - t0, stats=SCAN_STATS)
+    log.info("scan done in %.0fs | %s", LAST_SCAN["secs"], dict(SCAN_STATS))
     return found
+
+
+def run_cycle():
+    with scan_lock:                  # never two scans at the same time
+        track()
+        scan()
 
 
 def scanner_loop():
     step = TF_MS[TF] / 1000
+    first = True
     while True:
         try:
-            time.sleep(step - (time.time() % step) + 8)   # wait for candle close
-            track()
-            scan()
+            if first:
+                time.sleep(5)        # first scan right after startup
+                first = False
+            else:
+                time.sleep(step - (time.time() % step) + 8)   # then after every candle close
+            run_cycle()
         except Exception as e:
             log.exception("loop error: %s", e)
             time.sleep(30)
 
 
 # ---------------- COMMANDS ----------------
-scan_lock = threading.Lock()
-
-
 def manual_scan():
     if not scan_lock.acquire(blocking=False):
         send("⏳ A scan is already running.")
@@ -477,10 +541,9 @@ def manual_scan():
         n = scan()
         if n == -1:
             send(f"Max open signals reached ({MAX_OPEN}). No new scan.")
-        elif n == 0:
-            send("✅ Scan finished. No signal meets all conditions right now.")
         else:
-            send(f"✅ Scan finished. {n} new signal(s) sent.")
+            head = "✅ Scan finished. " + (f"{n} new signal(s) sent." if n else "No signal meets all conditions right now.")
+            send(head + "\n\n" + scan_summary())
     except Exception as e:
         log.exception("manual scan error")
         send(f"❌ Scan error: {e}")
@@ -501,17 +564,23 @@ def commands_loop():
                 send(stats_text())
             elif t == "/scan":
                 threading.Thread(target=manual_scan, daemon=True).start()
+            elif t == "/status":
+                n_open = q("SELECT COUNT(*) c FROM signals WHERE status='OPEN'")[0]["c"]
+                send(f"📡 <b>Status</b> (auto-scan every {TF} candle)\n"
+                     f"TF {TF} | HTF {HTF} | min score {MIN_SCORE} | min vol {MIN_VOL_RATIO}x | top {TOP_N}\n"
+                     f"Open signals: {n_open}/{MAX_OPEN}\n\n" + scan_summary())
             elif t == "/open":
                 rows = q("SELECT * FROM signals WHERE status='OPEN'")
                 send("\n".join(f"{r['symbol']} {r['side']} entry {fmt(r['entry'])} TP hit: {r['tp_hit']}"
                                for r in rows) or "No open signals.")
             elif t in ("/start", "/help"):
-                send("Commands:\n/scan — scan now\n/stats — real results\n/open — open signals")
+                send("Commands:\n/status — what the bot is doing\n/scan — scan now\n/stats — real results\n/open — open signals")
         time.sleep(1)
 
 
 if __name__ == "__main__":
     log.info("Bot started")
-    send("✅ Bot started.")
+    send(f"✅ Bot started. Auto-scanning every {TF} candle (trend filter {HTF}). Use /status anytime.")
     threading.Thread(target=commands_loop, daemon=True).start()
     scanner_loop()
+
