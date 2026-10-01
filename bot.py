@@ -42,6 +42,8 @@ AI_TIMEOUT = 20
 # 20+ candidate requests into the same minute.
 AI_MIN_INTERVAL = float(os.getenv("AI_MIN_INTERVAL", "3.0"))
 AI_MAX_RETRIES = 2
+# AI is only used for the strongest ICT candidates after the full market scan.
+AI_MAX_REVIEWS_PER_SCAN = int(os.getenv("AI_MAX_REVIEWS_PER_SCAN", "5"))
 ai_call_lock = threading.Lock()
 ai_last_call = 0.0
 groq_client = bool(GROQ_API_KEY)
@@ -677,7 +679,7 @@ def _groq_chat_json(system, user_payload, schema_name="saiwan_ai_review", schema
             {"role": "user", "content": user_payload if isinstance(user_payload, str) else json.dumps(user_payload, separators=(",", ":"))},
         ],
         "reasoning_effort": "low",
-        "reasoning_format": "hidden",
+        "include_reasoning": False,
         "temperature": 0.2,
         "max_completion_tokens": max_tokens,
     }
@@ -754,7 +756,7 @@ def ai_review_setup(sig, rows5, rows15):
     if not groq_client:
         if AI_REQUIRED:
             return None, "AI unavailable: GROQ_API_KEY is missing"
-        return {"decision": "CONFIRM", "timing": "ICT_ONLY", "reason": "AI disabled"}, None
+        return {"decision": "CONFIRM", "timing": "ICT_ONLY", "reason": "AI disabled", "reversal_watch": False}, None
 
     payload = {
         "symbol": sig["symbol"],
@@ -774,24 +776,23 @@ def ai_review_setup(sig, rows5, rows15):
             "tp3": sig.get("tp3"),
             "context15": sig.get("context15"),
         },
-        # Keep the prompt deliberately small. The deterministic ICT engine
-        # already found the setup; AI only judges timing.
-        "recent_5m": _compact_candles(rows5, 14),
-        "recent_15m": _compact_candles(rows15, 6),
+        # Deliberately tiny: AI sees only the candles needed to judge timing.
+        "recent_5m": _compact_candles(rows5, 6),
+        "recent_15m": _compact_candles(rows15, 3),
     }
     system = (
         "You are SAIWAN's ICT timing analyst. You do not predict prices and you do not invent setups. "
         "The deterministic engine has already found Liquidity Sweep + MSS + CHOCH + FVG + OB. "
-        "Your job is only to decide whether the candidate is timely enough to alert now. "
-        "Prefer early entries near the start of a move, but reject setups that are already clearly extended, "
-        "invalidated, or contradicted by the supplied closed candles. Never use RSI, volume, MACD, Fibonacci, ATR, "
-        "EMA, indicators, scores, or confidence. Return exactly one valid JSON object and nothing else. The object must contain these keys: decision (CONFIRM/WAIT/REJECT), "
-        "timing (EARLY/READY/LATE/INVALID), direction (LONG/SHORT), reason (short string), "
-        "reversal_watch (true/false). Do not change the direction unless the supplied ICT structure itself is invalid; "
-        "if invalid, use REJECT."
+        "Decide only whether this exact setup is timely enough to alert now. Prefer EARLY/READY entries "
+        "near the beginning of a move. Reject if the move is already extended, the setup is invalidated, "
+        "or the closed candles contradict the ICT direction. Never use RSI, volume, MACD, Fibonacci, ATR, "
+        "EMA, indicators, scores, confidence, or any outside market data. Return exactly one JSON object "
+        "with keys decision, timing, direction, reason, reversal_watch. decision must be CONFIRM, WAIT, or REJECT; "
+        "timing must be EARLY, READY, LATE, or INVALID; direction must equal the candidate direction unless "
+        "the setup is invalid, in which case use REJECT. Keep reason under 18 words."
     )
     try:
-        result = _groq_chat_json(system, payload, "saiwan_ai_review", AI_REVIEW_SCHEMA, max_tokens=256)
+        result = _groq_chat_json(system, payload, "saiwan_ai_review", AI_REVIEW_SCHEMA, max_tokens=128)
         decision = str(result.get("decision", "REJECT")).upper()
         timing = str(result.get("timing", "INVALID")).upper()
         direction = str(result.get("direction", sig["direction"])).upper()
@@ -801,35 +802,81 @@ def ai_review_setup(sig, rows5, rows15):
             timing = "INVALID"
         if direction != sig["direction"]:
             decision = "REJECT"
-        result.update({"decision": decision, "timing": timing, "direction": direction})
+        result.update({
+            "decision": decision,
+            "timing": timing,
+            "direction": direction,
+            "reversal_watch": bool(result.get("reversal_watch", False)),
+        })
         return result, None
     except Exception as e:
         return None, f"AI review failed: {type(e).__name__}: {e}"
 
 
-def analyze(symbol, rows5, rows15=None):
-    """SAIWAN Move Hunter: 5m entry hunting with 15m context, price action only."""
+def build_ict_candidates(symbol, rows5, rows15=None):
+    """Build ICT candidates without calling AI. Used for the full-market first pass."""
     if len(rows5) < 120:
-        return None
-    for r in rows5: r["symbol"] = symbol
-    candidates = []
+        return []
+    for r in rows5:
+        r["symbol"] = symbol
+    out = []
     for direction in ("LONG", "SHORT"):
         sig = _move_setup(rows5, direction)
-        if sig:
-            sig["symbol"] = symbol
-            sig["context15"] = _context_15m(rows15, direction)
-            sig["timeframe"] = "5m Entry · 15m Context"
-            ai, err = ai_review_setup(sig, rows5, rows15 or [])
-            if err:
-                print(f"AI REVIEW {symbol} {direction}: {err}")
-                continue
-            if not ai or ai.get("decision") != "CONFIRM":
-                continue
-            sig["ai_timing"] = ai.get("timing", "READY")
-            sig["ai_reason"] = ai.get("reason", "ICT setup confirmed")
-            sig["ai_reversal_watch"] = bool(ai.get("reversal_watch", False))
-            candidates.append(sig)
-    return max(candidates, key=lambda x: x["time"]) if candidates else None
+        if not sig:
+            continue
+        sig["symbol"] = symbol
+        sig["_ai_rows5"] = rows5
+        sig["_ai_rows15"] = rows15 or []
+        sig["context15"] = _context_15m(rows15, direction)
+        sig["timeframe"] = "5m Entry · 15m Context"
+        sig["ict_age"] = max(0, len(rows5) - 1 - int(sig.get("mss_index", len(rows5) - 1)))
+        zone = sig.get("entry_zone") or {}
+        lo, hi = zone.get("low"), zone.get("high")
+        cur = rows5[-1].get("close")
+        if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and isinstance(cur, (int, float)):
+            width = max(abs(hi - lo), abs(cur) * 1e-9)
+            if lo <= cur <= hi:
+                sig["zone_distance"] = 0.0
+            else:
+                sig["zone_distance"] = min(abs(cur - lo), abs(cur - hi)) / width
+        else:
+            sig["zone_distance"] = 999.0
+        sig["context_match"] = (
+            1 if ((direction == "LONG" and sig["context15"] == "BULLISH CONTEXT") or
+                  (direction == "SHORT" and sig["context15"] == "BEARISH CONTEXT")) else 0
+        )
+        out.append(sig)
+    return out
+
+
+def _ict_candidate_rank(sig):
+    """ICT-only preselection; no indicators, volume, score, or confidence."""
+    return (
+        sig.get("context_match", 0),
+        -sig.get("ict_age", 99),
+        -sig.get("zone_distance", 999.0),
+        sig.get("time", 0),
+    )
+
+
+def analyze(symbol, rows5, rows15=None):
+    """SAIWAN Move Hunter: ICT setup + one optional AI timing review."""
+    candidates = build_ict_candidates(symbol, rows5, rows15)
+    if not candidates:
+        return None
+    reviewed = []
+    for sig in candidates:
+        ai, err = ai_review_setup(sig, rows5, rows15 or [])
+        if err:
+            print(f"AI REVIEW {symbol} {sig['direction']}: {err}")
+            continue
+        if not ai or ai.get("decision") != "CONFIRM":
+            continue
+        sig["ai_timing"] = ai.get("timing", "READY")
+        sig["ai_reason"] = ai.get("reason", "ICT setup confirmed")
+        sig["ai_reversal_watch"] = bool(ai.get("reversal_watch", False))
+        reviewed.append(sig)
+    return max(reviewed, key=lambda x: x["time"]) if reviewed else None
 
 def make_chart(sig):
     """Render the SAIWAN Move Hunter setup with every ICT component annotated."""
@@ -1003,7 +1050,7 @@ def status_text():
             "Scan: 5m closed candles + 15m context\n"
             f"Pending signals: {len(pending_signals)}\n"
             f"Tracked signals: {len(active_signals)}\n"
-            f"AI: {GROQ_MODEL if groq_client else 'NOT CONNECTED'}\n"
+            f"AI: {GROQ_MODEL if groq_client else 'NOT CONNECTED'} · max {AI_MAX_REVIEWS_PER_SCAN}/scan\n"
             "Chart: ICT components annotated\n"
             "TradingView: chart link only"
         )
@@ -1023,6 +1070,7 @@ def _error_bucket(exc):
 
 
 def scan_once():
+    """Two-phase scan: full-market ICT pass, then AI reviews only top candidates."""
     global pending_signals
     contracts = get_contracts()
     tickers = get_tickers()
@@ -1037,7 +1085,6 @@ def scan_once():
         if liquidity > 0:
             eligible.append((liquidity, sym))
     eligible.sort(reverse=True)
-    # Scan the whole eligible market by default. MAX_PAIRS > 0 can still cap it if needed.
     pairs = [s for _, s in eligible] if MAX_PAIRS <= 0 else [s for _, s in eligible[:MAX_PAIRS]]
 
     def check_symbol(symbol):
@@ -1045,52 +1092,88 @@ def scan_once():
             rows5 = get_klines(symbol, TF_5M, CANDLE_LIMIT)
             rows15 = get_klines(symbol, TF_15M, 180)
             if len(rows5) < 120 or len(rows15) < 30:
-                return symbol, None, None
-            return symbol, analyze(symbol, rows5, rows15), None
+                return symbol, [], None
+            return symbol, build_ict_candidates(symbol, rows5, rows15), None
         except Exception as e:
-            return symbol, None, e
+            return symbol, [], e
 
-    found = []
+    ict_candidates = []
     error_buckets = {}
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
         futures = [pool.submit(check_symbol, symbol) for symbol in pairs]
         for fut in as_completed(futures):
-            symbol, sig, err = fut.result()
+            symbol, candidates, err = fut.result()
             if err is not None:
                 key = _error_bucket(err)
                 error_buckets[key] = error_buckets.get(key, 0) + 1
                 continue
-            if sig:
-                key = f"{symbol}:{sig['direction']}:{sig['time']}"
-                if key not in seen_signals:
-                    sig["key"] = key
-                    found.append(sig)
+            ict_candidates.extend(candidates)
+
+    # AI is deliberately NOT called during the 466-symbol threaded pass.
+    # First select a tiny ICT-only shortlist, then review it sequentially.
+    ict_candidates.sort(key=_ict_candidate_rank, reverse=True)
+    shortlist = ict_candidates[:max(0, AI_MAX_REVIEWS_PER_SCAN)]
+    found = []
+    ai_confirmed = 0
+    ai_wait = 0
+    ai_rejected = 0
+    ai_errors = 0
+
+    for sig in shortlist:
+        ai, err = ai_review_setup(
+            sig,
+            sig.get("_ai_rows5", []),
+            sig.get("_ai_rows15", []),
+        )
+        if err:
+            ai_errors += 1
+            print(f"AI REVIEW {sig['symbol']} {sig['direction']}: {err}")
+            continue
+        decision = (ai or {}).get("decision")
+        if decision == "CONFIRM":
+            ai_confirmed += 1
+            sig["ai_timing"] = ai.get("timing", "READY")
+            sig["ai_reason"] = ai.get("reason", "ICT setup confirmed")
+            sig["ai_reversal_watch"] = bool(ai.get("reversal_watch", False))
+            key = f"{sig['symbol']}:{sig['direction']}:{sig['time']}"
+            if key not in seen_signals:
+                sig["key"] = key
+                sig.pop("_ai_rows5", None)
+                sig.pop("_ai_rows15", None)
+                found.append(sig)
+        elif decision == "WAIT":
+            ai_wait += 1
+        else:
+            ai_rejected += 1
 
     with state_lock:
         active_symbols = {x.get("symbol") for x in active_signals.values()}
         for sig in found:
             seen_signals.add(sig["key"])
             seen_order.append(sig["key"])
-            # Do not queue another signal for a symbol that is already being tracked.
             if sig["symbol"] not in active_symbols:
                 pending_signals.append(sig)
-        # Keep only the strongest Radar candidates so the cooldown never creates
-        # a backlog of stale alerts. Radar score is the primary market ranking.
-        pending_signals.sort(key=lambda x: (x.get("radar_score", 0), x.get("score", 0), x.get("confidence", 0), x.get("time", 0)), reverse=True)
+        # Keep the pending queue small and fresh; this is only an ICT timestamp
+        # ordering, not a radar/indicator score.
+        pending_signals.sort(key=lambda x: x.get("time", 0), reverse=True)
         del pending_signals[12:]
         while len(seen_order) > 4000:
             seen_signals.discard(seen_order.pop(0))
 
     total_errors = sum(error_buckets.values())
     summary = ", ".join(f"{name}={count}" for name, count in sorted(error_buckets.items(), key=lambda kv: kv[1], reverse=True)[:4])
-    print(f"Bitget Move Hunter scan: universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
+    print(
+        f"Bitget Move Hunter scan: universe={len(eligible)}, scanned={len(pairs)}, "
+        f"ICT candidates={len(ict_candidates)}, AI shortlist={len(shortlist)}, "
+        f"AI confirmed={ai_confirmed}, wait={ai_wait}, rejected={ai_rejected}, "
+        f"AI errors={ai_errors}, data_errors={total_errors}"
+    )
     if not contracts:
         print("Bitget warning: no contracts returned from /api/v2/mix/market/contracts")
     elif not tickers:
         print("Bitget warning: no tickers returned from /api/v2/mix/market/tickers")
     if summary:
         print(f"Bitget error summary: {summary}")
-
 
 def signal_caption(sig):
     d = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
