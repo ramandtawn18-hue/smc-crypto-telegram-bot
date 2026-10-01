@@ -30,12 +30,14 @@ MIN_24H_VOLUME = float(os.getenv("MIN_24H_VOLUME", "5000000"))
 MIN_SCORE = int(os.getenv("MIN_SCORE", "5"))      # out of 6 extra checks
 ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.5"))
 MAX_LEV = int(os.getenv("MAX_LEV", "3"))
-COOLDOWN_H = int(os.getenv("COOLDOWN_H", "8"))
+COOLDOWN_H = float(os.getenv("COOLDOWN_H", "8"))
 MAX_OPEN = int(os.getenv("MAX_OPEN", "5"))
-EXPIRE_H = int(os.getenv("EXPIRE_H", "48"))
+EXPIRE_H = float(os.getenv("EXPIRE_H", "48"))
+MIN_VOL_RATIO = float(os.getenv("MIN_VOL_RATIO", "1.5"))
+ENABLE_CHART = os.getenv("ENABLE_CHART", "1") == "1"
 
 BASE = "https://api.bitget.com"
-TF_MS = {"5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000}
+TF_MS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000}
 PRODUCT = "USDT-FUTURES"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -202,7 +204,7 @@ def analyze(symbol, btc_bias):
     else:
         breakout = price < l.iloc[-21:-1].min()
         strong = price < o.iloc[-1] and (h.iloc[-1] - price) / rng >= 0.7
-    if not (breakout and strong and vol_ratio >= 1.5):
+    if not (breakout and strong and vol_ratio >= MIN_VOL_RATIO):
         return None
 
     # ---- scored checks ----
@@ -233,7 +235,80 @@ def analyze(symbol, btc_bias):
     lev = max(1, min(MAX_LEV, int(0.5 / sl_pct)))
     return dict(symbol=symbol, side=side, entry=entry, sl=sl, tp=tps, score=score,
                 rsi=float(r.iloc[-1]), vol=float(vol_ratio), sl_pct=sl_pct, lev=lev,
-                checks=checks, candle_ts=int(df["ts"].iloc[-1]))
+                checks=checks, candle_ts=int(df["ts"].iloc[-1]), df=df)
+
+
+
+def make_chart(s, bars=90):
+    """Returns PNG bytes: candlesticks + EMA20/50 + entry/SL/TP zones."""
+    import io
+    from datetime import datetime, timezone
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    full = s["df"]
+    df = full.tail(bars).reset_index(drop=True)
+    e20 = ema(full["c"], 20).tail(bars).reset_index(drop=True)
+    e50 = ema(full["c"], 50).tail(bars).reset_index(drop=True)
+    n = len(df)
+    bg, up, dn, txt = "#0f1419", "#26a69a", "#ef5350", "#d1d4dc"
+
+    fig, ax = plt.subplots(figsize=(10, 6), dpi=110)
+    fig.patch.set_facecolor(bg)
+    ax.set_facecolor(bg)
+    for i in range(n):
+        o, h, l, c = df.at[i, "o"], df.at[i, "h"], df.at[i, "l"], df.at[i, "c"]
+        col = up if c >= o else dn
+        ax.vlines(i, l, h, color=col, linewidth=1)
+        ax.add_patch(Rectangle((i - 0.35, min(o, c)), 0.7, max(abs(c - o), (h - l) * 0.01 + 1e-12),
+                               color=col, linewidth=0))
+    ax.plot(range(n), e20, color="#f5a623", linewidth=1, label="EMA20")
+    ax.plot(range(n), e50, color="#4aa3ff", linewidth=1, label="EMA50")
+
+    entry, sl, tps = s["entry"], s["sl"], s["tp"]
+    x0, x1 = n - 1, n + 11
+    ax.fill_between([x0, x1], entry, tps[2], color=up, alpha=0.13, linewidth=0)
+    ax.fill_between([x0, x1], sl, entry, color=dn, alpha=0.13, linewidth=0)
+    levels = [(entry, "ENTRY", "#ffffff"), (sl, "SL", dn),
+              (tps[0], "TP1", up), (tps[1], "TP2", up), (tps[2], "TP3", up)]
+    for price, name, col in levels:
+        ax.hlines(price, 0, x1, colors=col, linestyles="dashed", linewidth=0.8, alpha=0.8)
+        ax.text(x1 + 0.3, price, f"{name} {fmt(price)}", color=col, fontsize=8, va="center")
+
+    lo = min(df["l"].min(), sl, tps[0])
+    hi = max(df["h"].max(), sl, tps[2])
+    pad = (hi - lo) * 0.04
+    ax.set_ylim(lo - pad, hi + pad)
+    ax.set_xlim(-1, n + 22)
+    step = max(1, n // 8)
+    ticks = list(range(0, n, step))
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([datetime.fromtimestamp(df.at[i, "ts"] / 1000, tz=timezone.utc).strftime("%d %H:%M")
+                        for i in ticks], color=txt, fontsize=8)
+    ax.tick_params(axis="y", colors=txt, labelsize=8)
+    ax.yaxis.tick_left()
+    ax.grid(color="#2a2e39", linewidth=0.5, alpha=0.6)
+    for sp in ax.spines.values():
+        sp.set_visible(False)
+    arrow = "LONG" if s["side"] == "LONG" else "SHORT"
+    ax.set_title(f"{s['symbol']} · {TF} · {arrow} · Bitget Futures (UTC)", color=txt, fontsize=11, loc="left")
+    ax.legend(loc="upper left", facecolor=bg, edgecolor="none", labelcolor=txt, fontsize=8)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=bg, bbox_inches="tight")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def send_photo(png, caption):
+    try:
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto",
+                      data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML"},
+                      files={"photo": ("chart.png", png, "image/png")}, timeout=60)
+    except Exception as e:
+        log.warning("sendPhoto error: %s", e)
 
 
 def format_signal(s):
@@ -336,9 +411,10 @@ def stats_text(short=False):
 # ---------------- SCANNER ----------------
 def scan():
     open_n = q("SELECT COUNT(*) c FROM signals WHERE status='OPEN'")[0]["c"]
+    found = 0
     if open_n >= MAX_OPEN:
         log.info("max open reached")
-        return
+        return -1
     btc = candles("BTCUSDT", HTF)
     btc_b = htf_bias(btc) if btc is not None else 0
     for sym in top_symbols():
@@ -360,11 +436,19 @@ def scan():
              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
           (int(time.time() * 1000), sym, s["side"], s["entry"], s["sl"], *s["tp"],
            s["score"], s["rsi"], s["vol"], s["sl"], s["candle_ts"]), commit=True)
+        if ENABLE_CHART:
+            try:
+                icon = "🟢" if s["side"] == "LONG" else "🔴"
+                send_photo(make_chart(s), f"{icon} <b>{s['side']}</b> {sym} · {TF}")
+            except Exception as e:
+                log.warning("chart error %s: %s", sym, e)
         mid = send(format_signal(s), symbol=sym)
         q("UPDATE signals SET msg_id=? WHERE id=(SELECT MAX(id) FROM signals WHERE symbol=?)",
           (mid, sym), commit=True)
         open_n += 1
+        found += 1
         log.info("signal %s %s", sym, s["side"])
+    return found
 
 
 def scanner_loop():
@@ -380,6 +464,29 @@ def scanner_loop():
 
 
 # ---------------- COMMANDS ----------------
+scan_lock = threading.Lock()
+
+
+def manual_scan():
+    if not scan_lock.acquire(blocking=False):
+        send("⏳ A scan is already running.")
+        return
+    try:
+        send("🔍 Scanning market now...")
+        track()
+        n = scan()
+        if n == -1:
+            send(f"Max open signals reached ({MAX_OPEN}). No new scan.")
+        elif n == 0:
+            send("✅ Scan finished. No signal meets all conditions right now.")
+        else:
+            send(f"✅ Scan finished. {n} new signal(s) sent.")
+    except Exception as e:
+        log.exception("manual scan error")
+        send(f"❌ Scan error: {e}")
+    finally:
+        scan_lock.release()
+
 def commands_loop():
     offset = 0
     while True:
@@ -392,12 +499,14 @@ def commands_loop():
             t = (m.get("text") or "").split("@")[0].strip().lower()
             if t == "/stats":
                 send(stats_text())
+            elif t == "/scan":
+                threading.Thread(target=manual_scan, daemon=True).start()
             elif t == "/open":
                 rows = q("SELECT * FROM signals WHERE status='OPEN'")
                 send("\n".join(f"{r['symbol']} {r['side']} entry {fmt(r['entry'])} TP hit: {r['tp_hit']}"
                                for r in rows) or "No open signals.")
             elif t in ("/start", "/help"):
-                send("Commands:\n/stats — real results\n/open — open signals")
+                send("Commands:\n/scan — scan now\n/stats — real results\n/open — open signals")
         time.sleep(1)
 
 
