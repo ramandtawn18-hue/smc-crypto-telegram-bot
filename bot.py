@@ -68,6 +68,24 @@ signal_history = []  # sent signal summaries for /search
 MAX_SIGNAL_HISTORY = 500
 monitor_thread = None
 
+# Live scanner diagnostics (shown by /status).
+scan_stats_lock = threading.Lock()
+scan_stats = {
+    "last_at": None,
+    "last_duration": 0.0,
+    "universe": 0,
+    "scanned": 0,
+    "confirmed": 0,
+    "ict_candidates": 0,
+    "ai_confirmed": 0,
+    "ai_wait": 0,
+    "ai_rejected": 0,
+    "ai_errors": 0,
+    "insufficient_data": 0,
+    "errors": 0,
+    "error_summary": "",
+}
+
 session = requests.Session()
 session.headers.update({"User-Agent": "SAIWAN-Crypto-Signal-Move-Hunter/5.0", "Accept": "application/json"})
 bitget_rate_lock = threading.Lock()
@@ -725,29 +743,40 @@ def ai_review_setup(sig, rows5, rows15):
         return None, f"AI review failed: {type(e).__name__}: {e}"
 
 
-def analyze(symbol, rows5, rows15=None):
+def analyze(symbol, rows5, rows15=None, diagnostics=False):
     """SAIWAN Move Hunter: 5m entry hunting with 15m context, price action only."""
+    diag = {"ict_candidates": 0, "ai_confirmed": 0, "ai_wait": 0, "ai_rejected": 0, "ai_errors": 0}
     if len(rows5) < 120:
-        return None
+        return (None, diag) if diagnostics else None
     for r in rows5: r["symbol"] = symbol
     candidates = []
     for direction in ("LONG", "SHORT"):
         sig = _move_setup(rows5, direction)
         if sig:
+            diag["ict_candidates"] += 1
             sig["symbol"] = symbol
             sig["context15"] = _context_15m(rows15, direction)
             sig["timeframe"] = "5m Entry · 15m Context"
             ai, err = ai_review_setup(sig, rows5, rows15 or [])
             if err:
+                diag["ai_errors"] += 1
                 print(f"AI REVIEW {symbol} {direction}: {err}")
                 continue
-            if not ai or ai.get("decision") != "CONFIRM":
+            decision = ai.get("decision") if ai else "REJECT"
+            if decision == "CONFIRM":
+                diag["ai_confirmed"] += 1
+            elif decision == "WAIT":
+                diag["ai_wait"] += 1
+            else:
+                diag["ai_rejected"] += 1
+            if not ai or decision != "CONFIRM":
                 continue
             sig["ai_timing"] = ai.get("timing", "READY")
             sig["ai_reason"] = ai.get("reason", "ICT setup confirmed")
             sig["ai_reversal_watch"] = bool(ai.get("reversal_watch", False))
             candidates.append(sig)
-    return max(candidates, key=lambda x: x["time"]) if candidates else None
+    result = max(candidates, key=lambda x: x["time"]) if candidates else None
+    return (result, diag) if diagnostics else result
 
 def make_chart(sig):
     """Render the SAIWAN Move Hunter setup with every ICT component annotated."""
@@ -888,20 +917,44 @@ def search_signals(query):
 
 def status_text():
     with state_lock:
-        return (
-            "BOT STATUS: ONLINE\n"
-            f"Scanner: {'RUNNING' if scanner_running else 'STOPPED'}\n"
-            "Market: Bitget USDT Perpetual Futures (full eligible market)\n"
-            "Strategy: SAIWAN CRYPTO SIGNAL — Move Hunter\n"
-            "Model: SAIWAN Move Hunter — Liquidity Sweep + MSS + CHOCH + FVG + OB\n"
-            "Data source: Bitget Futures market data\n"
-            "Scan: 5m closed candles + 15m context\n"
-            f"Pending signals: {len(pending_signals)}\n"
-            f"Tracked signals: {len(active_signals)}\n"
-            f"AI: {OPENAI_MODEL if openai_client else 'NOT CONNECTED'}\n"
-            "Chart: ICT components annotated\n"
-            "TradingView: chart link only"
-        )
+        scanner = scanner_running
+        pending = len(pending_signals)
+        tracked = len(active_signals)
+    with scan_stats_lock:
+        st = dict(scan_stats)
+    last_at = st.get("last_at") or "never"
+    duration = st.get("last_duration", 0.0)
+    errors = st.get("error_summary") or "none"
+    return (
+        "BOT STATUS: ONLINE\n"
+        f"Scanner: {'RUNNING' if scanner else 'STOPPED'}\n"
+        "Market: Bitget USDT Perpetual Futures (full eligible market)\n"
+        "Strategy: SAIWAN CRYPTO SIGNAL — Move Hunter\n"
+        "Model: SAIWAN Move Hunter — Liquidity Sweep + MSS + CHOCH + FVG + OB\n"
+        "Data source: Bitget Futures market data\n"
+        "Scan: 5m closed candles + 15m context\n"
+        f"Pending signals: {pending}\n"
+        f"Tracked signals: {tracked}\n"
+        f"AI: {OPENAI_MODEL if openai_client else 'NOT CONNECTED'}\n"
+        "\n"
+        "LAST SCAN DIAGNOSTICS\n"
+        f"Last scan (UTC): {last_at}\n"
+        f"Duration: {duration:.1f}s\n"
+        f"Universe: {st.get('universe', 0)}\n"
+        f"Scanned: {st.get('scanned', 0)}\n"
+        f"ICT candidates: {st.get('ict_candidates', 0)}\n"
+        f"AI confirmed: {st.get('ai_confirmed', 0)}\n"
+        f"AI wait: {st.get('ai_wait', 0)}\n"
+        f"AI rejected: {st.get('ai_rejected', 0)}\n"
+        f"AI errors: {st.get('ai_errors', 0)}\n"
+        f"Signals confirmed: {st.get('confirmed', 0)}\n"
+        f"Data too short: {st.get('insufficient_data', 0)}\n"
+        f"Scan errors: {st.get('errors', 0)}\n"
+        f"Error types: {errors}\n"
+        "\n"
+        "Chart: ICT components annotated\n"
+        "TradingView: chart link only"
+    )
 
 def _error_bucket(exc):
     msg = str(exc).replace("\n", " ").strip()
@@ -919,6 +972,7 @@ def _error_bucket(exc):
 
 def scan_once():
     global pending_signals
+    started = time.time()
     contracts = get_contracts()
     tickers = get_tickers()
     tv = {x.get("symbol"): x for x in tickers}
@@ -932,7 +986,6 @@ def scan_once():
         if liquidity > 0:
             eligible.append((liquidity, sym))
     eligible.sort(reverse=True)
-    # Scan the whole eligible market by default. MAX_PAIRS > 0 can still cap it if needed.
     pairs = [s for _, s in eligible] if MAX_PAIRS <= 0 else [s for _, s in eligible[:MAX_PAIRS]]
 
     def check_symbol(symbol):
@@ -940,17 +993,24 @@ def scan_once():
             rows5 = get_klines(symbol, TF_5M, CANDLE_LIMIT)
             rows15 = get_klines(symbol, TF_15M, 180)
             if len(rows5) < 120 or len(rows15) < 30:
-                return symbol, None, None
-            return symbol, analyze(symbol, rows5, rows15), None
+                return symbol, None, None, {"insufficient_data": 1}
+            sig, diag = analyze(symbol, rows5, rows15, diagnostics=True)
+            return symbol, sig, None, diag
         except Exception as e:
-            return symbol, None, e
+            return symbol, None, e, {}
 
     found = []
     error_buckets = {}
+    totals = {
+        "ict_candidates": 0, "ai_confirmed": 0, "ai_wait": 0,
+        "ai_rejected": 0, "ai_errors": 0, "insufficient_data": 0,
+    }
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
         futures = [pool.submit(check_symbol, symbol) for symbol in pairs]
         for fut in as_completed(futures):
-            symbol, sig, err = fut.result()
+            symbol, sig, err, diag = fut.result()
+            for key in totals:
+                totals[key] += int(diag.get(key, 0))
             if err is not None:
                 key = _error_bucket(err)
                 error_buckets[key] = error_buckets.get(key, 0) + 1
@@ -966,26 +1026,48 @@ def scan_once():
         for sig in found:
             seen_signals.add(sig["key"])
             seen_order.append(sig["key"])
-            # Do not queue another signal for a symbol that is already being tracked.
             if sig["symbol"] not in active_symbols:
                 pending_signals.append(sig)
-        # Keep only the strongest Radar candidates so the cooldown never creates
-        # a backlog of stale alerts. Radar score is the primary market ranking.
-        pending_signals.sort(key=lambda x: (x.get("radar_score", 0), x.get("score", 0), x.get("confidence", 0), x.get("time", 0)), reverse=True)
+        pending_signals.sort(key=lambda x: x.get("time", 0), reverse=True)
         del pending_signals[12:]
         while len(seen_order) > 4000:
             seen_signals.discard(seen_order.pop(0))
 
     total_errors = sum(error_buckets.values())
-    summary = ", ".join(f"{name}={count}" for name, count in sorted(error_buckets.items(), key=lambda kv: kv[1], reverse=True)[:4])
-    print(f"Bitget Move Hunter scan: universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
+    summary = ", ".join(f"{name}={count}" for name, count in sorted(error_buckets.items(), key=lambda kv: kv[1], reverse=True)[:6])
+    duration = time.time() - started
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    with scan_stats_lock:
+        scan_stats.update({
+            "last_at": now_utc,
+            "last_duration": duration,
+            "universe": len(eligible),
+            "scanned": len(pairs),
+            "confirmed": len(found),
+            "ict_candidates": totals["ict_candidates"],
+            "ai_confirmed": totals["ai_confirmed"],
+            "ai_wait": totals["ai_wait"],
+            "ai_rejected": totals["ai_rejected"],
+            "ai_errors": totals["ai_errors"],
+            "insufficient_data": totals["insufficient_data"],
+            "errors": total_errors,
+            "error_summary": summary,
+        })
+
+    print(
+        "Bitget Move Hunter scan: "
+        f"universe={len(eligible)}, scanned={len(pairs)}, "
+        f"ict_candidates={totals['ict_candidates']}, ai_confirmed={totals['ai_confirmed']}, "
+        f"ai_wait={totals['ai_wait']}, ai_rejected={totals['ai_rejected']}, "
+        f"ai_errors={totals['ai_errors']}, confirmed={len(found)}, "
+        f"errors={total_errors}, duration={duration:.1f}s, workers={SCAN_WORKERS}"
+    )
     if not contracts:
         print("Bitget warning: no contracts returned from /api/v2/mix/market/contracts")
     elif not tickers:
         print("Bitget warning: no tickers returned from /api/v2/mix/market/tickers")
     if summary:
         print(f"Bitget error summary: {summary}")
-
 
 def signal_caption(sig):
     d = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
