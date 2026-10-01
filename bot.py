@@ -416,424 +416,293 @@ def suggested_leverage(radar, volatility, risk_pct):
         return 4
     return 3
 
+def _candle_bull(r):
+    return r["close"] > r["open"]
+
+
+def _candle_bear(r):
+    return r["close"] < r["open"]
+
+
+def _body_ratio(r):
+    rng = max(r["high"] - r["low"], 1e-12)
+    return abs(r["close"] - r["open"]) / rng
+
+
+def _find_fvg(rows, direction, start_idx, end_idx):
+    """Find the latest 3-candle FVG created by displacement."""
+    found = []
+    for i in range(max(2, start_idx), min(end_idx, len(rows) - 1)):
+        a, b, c = rows[i-2], rows[i-1], rows[i]
+        if direction == "LONG" and c["low"] > a["high"] and _candle_bull(b):
+            found.append({"low": a["high"], "high": c["low"], "index": i, "kind": "BULLISH FVG"})
+        elif direction == "SHORT" and c["high"] < a["low"] and _candle_bear(b):
+            found.append({"low": c["high"], "high": a["low"], "index": i, "kind": "BEARISH FVG"})
+    return found[-1] if found else None
+
+
+def _find_order_block(rows, direction, before_idx):
+    """Last opposite candle before the displacement leg."""
+    lo = max(0, before_idx - 8)
+    for i in range(before_idx - 1, lo - 1, -1):
+        r = rows[i]
+        if direction == "LONG" and _candle_bear(r):
+            return {"low": r["low"], "high": r["high"], "index": i, "kind": "BULLISH OB"}
+        if direction == "SHORT" and _candle_bull(r):
+            return {"low": r["low"], "high": r["high"], "index": i, "kind": "BEARISH OB"}
+    return None
+
+
+def _overlap(a, b):
+    if not a or not b:
+        return None
+    lo, hi = max(a["low"], b["low"]), min(a["high"], b["high"])
+    if lo <= hi:
+        return {"low": lo, "high": hi}
+    return None
+
+
+def _recent_liquidity(rows, upto, direction, lookback=45):
+    """Return the nearest prior swing pool that can be swept."""
+    w0 = max(0, upto - lookback)
+    window = rows[w0:upto]
+    highs, lows = swing_points(window, 2, 2)
+    if direction == "LONG":
+        pools = [(i + w0, p) for i, p in lows]
+        return pools[-1] if pools else None
+    pools = [(i + w0, p) for i, p in highs]
+    return pools[-1] if pools else None
+
+
+def _structure_break(rows, direction, sweep_idx, end_idx):
+    """MSS/CHOCH confirmation from internal swings after the liquidity sweep."""
+    start = max(2, sweep_idx + 1)
+    end = min(end_idx, len(rows) - 1)
+    if end <= start + 1:
+        return None
+    window = rows[max(0, sweep_idx - 18):end + 1]
+    highs, lows = swing_points(window, 1, 1)
+    off = max(0, sweep_idx - 18)
+    if direction == "LONG":
+        prior_highs = [(i + off, p) for i, p in highs if i + off <= sweep_idx]
+        if not prior_highs:
+            return None
+        level_idx, level = prior_highs[-1]
+        for i in range(start, end + 1):
+            if rows[i]["close"] > level and _candle_bull(rows[i]):
+                return {"index": i, "level": level, "type": "MSS + CHOCH"}
+    else:
+        prior_lows = [(i + off, p) for i, p in lows if i + off <= sweep_idx]
+        if not prior_lows:
+            return None
+        level_idx, level = prior_lows[-1]
+        for i in range(start, end + 1):
+            if rows[i]["close"] < level and _candle_bear(rows[i]):
+                return {"index": i, "level": level, "type": "MSS + CHOCH"}
+    return None
+
+
+def _sweep_candidates(rows):
+    """Return recent liquidity sweeps using only price/swing structure."""
+    out = []
+    start = max(10, len(rows) - 70)
+    for i in range(start, len(rows) - 2):
+        prior = rows[max(0, i-35):i]
+        highs, lows = swing_points(prior, 2, 2)
+        if highs:
+            high_level = max(p for _, p in highs[-5:])
+            if rows[i]["high"] > high_level and rows[i]["close"] < high_level:
+                out.append(("SHORT", i, high_level))
+        if lows:
+            low_level = min(p for _, p in lows[-5:])
+            if rows[i]["low"] < low_level and rows[i]["close"] > low_level:
+                out.append(("LONG", i, low_level))
+    return out
+
+
 def analyze(symbol, rows15):
-    """15m-only SAIWAN structure/zone engine.
-
-    The signal is built around the reference bot's visible workflow:
-    structure -> supply/demand -> break -> close -> retest/rejection ->
-    volume/momentum -> entry, with late entries rejected.
-    """
-    if len(rows15) < 120:
+    """ICT 2022 price-action model: Liquidity Sweep -> MSS/CHOCH -> FVG/OB retest."""
+    if len(rows15) < 100:
         return None
-    r15 = rows15  # get_klines() already removed the forming candle.
-    cur, prev = r15[-1], r15[-2]
-    closes = [r["close"] for r in r15]
-    a = atr(r15, 14)
-    rv = rsi(closes, 14)
-    if not a or not rv:
+    rows = rows15
+    candidates = _sweep_candidates(rows)
+    if not candidates:
         return None
 
-    trend, ema20_now, ema50_now, ema200_now = trend_context(r15)
-    vol_score, volatility = volatility_score(r15)
-    body = abs(cur["close"] - cur["open"])
-    rng = max(cur["high"] - cur["low"], 1e-12)
-    close_pos = (cur["close"] - cur["low"]) / rng
-    momentum_long = cur["close"] > cur["open"] and body >= 0.40*a and close_pos >= 0.66
-    momentum_short = cur["close"] < cur["open"] and body >= 0.40*a and close_pos <= 0.34
-    long_rsi, short_rsi = 52 <= rv <= 68, 32 <= rv <= 48
+    # Prefer the most recent valid sweep whose full sequence is now confirmed.
+    for direction, sweep_idx, liquidity in reversed(candidates):
+        if sweep_idx >= len(rows) - 1:
+            continue
+        structure = _structure_break(rows, direction, sweep_idx, len(rows) - 1)
+        if not structure:
+            continue
+        mss_idx = structure["index"]
+        fvg = _find_fvg(rows, direction, mss_idx - 1, len(rows))
+        if not fvg or fvg["index"] <= mss_idx:
+            continue
+        ob = _find_order_block(rows, direction, fvg["index"])
+        if not ob:
+            continue
+        zone = _overlap(fvg, ob) or fvg
+        cur = rows[-1]
+        # Signal only when the latest CLOSED candle returns to the FVG/OB area
+        # and reacts in the expected direction.
+        touched = cur["low"] <= zone["high"] and cur["high"] >= zone["low"]
+        if not touched:
+            # Allow the immediately previous closed candle to make the touch,
+            # with the current candle confirming the rejection.
+            if len(rows) < 2:
+                continue
+            prev = rows[-2]
+            prev_touched = prev["low"] <= zone["high"] and prev["high"] >= zone["low"]
+            if not prev_touched:
+                continue
+            confirm = _candle_bull(cur) if direction == "LONG" else _candle_bear(cur)
+            if not confirm:
+                continue
+        else:
+            confirm = _candle_bull(cur) if direction == "LONG" else _candle_bear(cur)
+            if not confirm:
+                continue
 
-    long_trendline, long_line = trendline_signal(r15, "LONG")
-    short_trendline, short_line = trendline_signal(r15, "SHORT")
-    long_structure, short_structure = structure_bias(r15, "LONG"), structure_bias(r15, "SHORT")
+        # CHOCH/MSS must remain valid: the current close cannot invalidate the
+        # displacement structure before entry.
+        if direction == "LONG" and cur["close"] <= structure["level"]:
+            continue
+        if direction == "SHORT" and cur["close"] >= structure["level"]:
+            continue
 
-    avg_vol = sum(x["vol"] for x in r15[-21:-1]) / 20.0
-    vol_ratio = cur["vol"] / avg_vol if avg_vol else 0.0
-    volume_ok = vol_ratio >= 1.15
+        entry = cur["close"]
+        if direction == "LONG":
+            sl = min(liquidity, ob["low"]) * 0.9995
+            if sl >= entry:
+                continue
+            future_highs = [p for _, p in swing_points(rows[max(0, mss_idx-10):], 2, 2)[0] if p > entry]
+            targets = sorted(set(future_highs))
+            # Prefer external liquidity above entry.
+            tp1 = targets[0] if targets else entry + (entry - sl) * 2.0
+            tp2 = targets[1] if len(targets) > 1 else entry + (entry - sl) * 3.0
+            tp3 = targets[2] if len(targets) > 2 else entry + (entry - sl) * 4.0
+        else:
+            sl = max(liquidity, ob["high"]) * 1.0005
+            if sl <= entry:
+                continue
+            future_lows = [p for _, p in swing_points(rows[max(0, mss_idx-10):], 2, 2)[1] if p < entry]
+            targets = sorted(set(future_lows), reverse=True)
+            tp1 = targets[0] if targets else entry - (sl - entry) * 2.0
+            tp2 = targets[1] if len(targets) > 1 else entry - (sl - entry) * 3.0
+            tp3 = targets[2] if len(targets) > 2 else entry - (sl - entry) * 4.0
 
-    resistance = max(x["high"] for x in r15[-21:-1])
-    support = min(x["low"] for x in r15[-21:-1])
-    long_break = cur["close"] > resistance and prev["close"] <= resistance and cur["close"] > cur["open"]
-    short_break = cur["close"] < support and prev["close"] >= support and cur["close"] < cur["open"]
+        if direction == "LONG":
+            tp1 = max(tp1, entry + (entry-sl)*1.5)
+            tp2 = max(tp2, tp1 + (entry-sl)*0.5)
+            tp3 = max(tp3, tp2 + (entry-sl)*0.5)
+        else:
+            tp1 = min(tp1, entry - (sl-entry)*1.5)
+            tp2 = min(tp2, tp1 - (sl-entry)*0.5)
+            tp3 = min(tp3, tp2 - (sl-entry)*0.5)
 
-    # A retest is a break that happened recently, followed by a test-and-hold.
-    retest_long = retest_short = False
-    retest_level_long = resistance
-    retest_level_short = support
-    for j in range(max(1, len(r15)-5), len(r15)-1):
-        prior_res = max(x["high"] for x in r15[max(0,j-20):j]) if j >= 20 else resistance
-        prior_sup = min(x["low"] for x in r15[max(0,j-20):j]) if j >= 20 else support
-        if r15[j]["close"] > prior_res and r15[j]["close"] > r15[j]["open"]:
-            lvl = prior_res
-            touched = min(r["low"] for r in r15[j+1:]) <= lvl + 0.18*a
-            held = cur["close"] > lvl and cur["close"] > cur["open"]
-            if touched and held:
-                retest_long, retest_level_long = True, lvl
-        if r15[j]["close"] < prior_sup and r15[j]["close"] < r15[j]["open"]:
-            lvl = prior_sup
-            touched = max(r["high"] for r in r15[j+1:]) >= lvl - 0.18*a
-            held = cur["close"] < lvl and cur["close"] < cur["open"]
-            if touched and held:
-                retest_short, retest_level_short = True, lvl
-
-    demand, supply = _zone_candidates(r15, a)
-    latest_demand = demand[-1] if demand else None
-    latest_supply = supply[-1] if supply else None
-    zone_tolerance = 0.20*a
-
-    # If a confirmed breakout is present, the broken level becomes the entry
-    # trigger. Otherwise a fresh rejection from a detected zone may qualify.
-    long_zone = latest_demand or {"low": support-0.25*a, "high": support+0.25*a}
-    short_zone = latest_supply or {"low": resistance-0.25*a, "high": resistance+0.25*a}
-    long_rejection = _zone_rejection(cur, long_zone, "LONG")
-    short_rejection = _zone_rejection(cur, short_zone, "SHORT")
-
-    long_trigger = retest_level_long if retest_long else resistance
-    short_trigger = retest_level_short if retest_short else support
-    long_break_confirm = long_break or retest_long
-    short_break_confirm = short_break or retest_short
-
-    long_extension = (cur["close"] - long_trigger) / a
-    short_extension = (short_trigger - cur["close"]) / a
-    not_extended_long = -0.20 <= long_extension <= 0.85
-    not_extended_short = -0.20 <= short_extension <= 0.85
-
-    # The zone must be relevant: either price is testing/holding it or the
-    # trigger is close enough to the latest detected demand/supply.
-    long_zone_ok = long_rejection or retest_long or abs(cur["close"]-long_zone["high"]) <= 1.10*a
-    short_zone_ok = short_rejection or retest_short or abs(cur["close"]-short_zone["low"]) <= 1.10*a
-
-    long_ready = (
-        trend == "BULLISH" and long_rsi and long_structure and long_break_confirm
-        and (momentum_long or long_rejection) and volume_ok and not_extended_long
-        and vol_score >= 4.5 and long_zone_ok
-    )
-    short_ready = (
-        trend == "BEARISH" and short_rsi and short_structure and short_break_confirm
-        and (momentum_short or short_rejection) and volume_ok and not_extended_short
-        and vol_score >= 4.5 and short_zone_ok
-    )
-    if long_ready == short_ready:
-        return None
-    direction = "LONG" if long_ready else "SHORT"
-
-    if direction == "LONG":
-        breakout_ok, trendline_ok, structure_ok = long_break_confirm, long_trendline, long_structure
-        momentum_ok, extension_ok = momentum_long or long_rejection, not_extended_long
-        zone_ok, retest_ok, rejection_ok = long_zone_ok, retest_long, long_rejection
-        trigger = long_trigger
-        zone = long_zone
-        checks = {
-            "Trend bullish": trend == "BULLISH",
-            "Higher-low structure": long_structure,
-            "Break + close confirmed": long_break_confirm,
-            "Demand zone respected": long_zone_ok,
-            "Retest / rejection": retest_long or long_rejection,
-            "Closed momentum candle": momentum_ok,
-            "Volume expansion": volume_ok,
-            "Not overextended": not_extended_long,
+        return {
+            "symbol": symbol, "direction": direction,
+            "structure": "Liquidity Sweep + MSS + CHOCH + FVG + OB",
+            "entry": entry, "trigger_level": structure["level"], "sl": sl,
+            "tp1": tp1, "tp2": tp2, "tp3": tp3,
+            "entry_zone_low": zone["low"], "entry_zone_high": zone["high"],
+            "score": 5, "max_score": 5, "time": cur["time"],
+            "liquidity": liquidity, "sweep_index": sweep_idx,
+            "mss_index": mss_idx, "mss_level": structure["level"],
+            "fvg": fvg, "ob": ob, "entry_zone": zone,
+            "rows": rows[max(0, min(sweep_idx - 10, len(rows) - 110)):],
+            "full_len": len(rows),
+            "checks": {"Liquidity Sweep": True, "MSS": True, "FVG": True, "OB": True, "CHOCH": True},
+            "retest_ok": True, "rejection_ok": True,
         }
-    else:
-        breakout_ok, trendline_ok, structure_ok = short_break_confirm, short_trendline, short_structure
-        momentum_ok, extension_ok = momentum_short or short_rejection, not_extended_short
-        zone_ok, retest_ok, rejection_ok = short_zone_ok, retest_short, short_rejection
-        trigger = short_trigger
-        zone = short_zone
-        checks = {
-            "Trend bearish": trend == "BEARISH",
-            "Lower-high structure": short_structure,
-            "Break + close confirmed": short_break_confirm,
-            "Supply zone respected": short_zone_ok,
-            "Retest / rejection": retest_short or short_rejection,
-            "Closed momentum candle": momentum_ok,
-            "Volume expansion": volume_ok,
-            "Not overextended": not_extended_short,
-        }
-
-    radar = radar_score(direction, trend, rv, vol_ratio, vol_score, structure_ok,
-                        breakout_ok, trendline_ok, momentum_ok, extension_ok,
-                        zone_ok, retest_ok, rejection_ok)
-    if radar < RADAR_MIN_SCORE:
-        return None
-
-    entry = cur["close"]
-    # Structure-based invalidation: use the relevant demand/supply plus recent
-    # swing extreme, rather than a blind ATR-only stop.
-    if direction == "LONG":
-        recent_lows = [x["low"] for x in r15[-16:]]
-        sl = min(min(recent_lows), zone["low"] - 0.12*a)
-        risk = entry - sl
-        if risk <= 0 or risk > 3.2*a:
-            return None
-        # First target is the nearest meaningful resistance; farther targets
-        # fall back to R multiples only when no clean level exists.
-        resistances = sorted(set(round(x[1], 12) for x in swing_points(r15[-100:],2,2)[0] if x[1] > entry))
-        tp1 = resistances[0] if resistances and resistances[0] > entry + 0.8*risk else entry + 1.5*risk
-        tp2 = resistances[1] if len(resistances)>1 and resistances[1] > tp1 else entry + 2.5*risk
-        tp3 = resistances[2] if len(resistances)>2 and resistances[2] > tp2 else entry + 4.0*risk
-        structure = "Breakout + higher-low + demand" if not retest_ok else "Retest hold + higher-low + demand"
-    else:
-        recent_highs = [x["high"] for x in r15[-16:]]
-        sl = max(max(recent_highs), zone["high"] + 0.12*a)
-        risk = sl - entry
-        if risk <= 0 or risk > 3.2*a:
-            return None
-        supports = sorted(set(round(x[1], 12) for x in swing_points(r15[-100:],2,2)[1] if x[1] < entry), reverse=True)
-        tp1 = supports[0] if supports and supports[0] < entry - 0.8*risk else entry - 1.5*risk
-        tp2 = supports[1] if len(supports)>1 and supports[1] < tp1 else entry - 2.5*risk
-        tp3 = supports[2] if len(supports)>2 and supports[2] < tp2 else entry - 4.0*risk
-        structure = "Breakdown + lower-high + supply" if not retest_ok else "Retest rejection + lower-high + supply"
-
-    # Keep targets in the correct order and never put a TP on the wrong side.
-    if direction == "LONG":
-        tp1, tp2, tp3 = max(tp1, entry+0.8*risk), max(tp2, tp1+0.2*risk), max(tp3, tp2+0.2*risk)
-    else:
-        tp1, tp2, tp3 = min(tp1, entry-0.8*risk), min(tp2, tp1-0.2*risk), min(tp3, tp2-0.2*risk)
-
-    score = sum(checks.values())
-    confidence = min(95, 68 + score*3 + min(vol_score,8) + (4 if retest_ok else 0) + (2 if rejection_ok else 0))
-    risk_pct = abs(entry-sl)/entry*100 if entry else 99.0
-    leverage = suggested_leverage(radar, volatility, risk_pct)
-    return {
-        "symbol": symbol, "direction": direction, "structure": structure,
-        "entry": entry, "trigger_level": trigger, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
-        "entry_zone_low": zone["low"], "entry_zone_high": zone["high"],
-        "score": score, "max_score": len(checks), "trend15": trend, "rsi": rv,
-        "volatility": volatility, "volatility_score": vol_score, "volume_ratio": vol_ratio,
-        "confidence": int(confidence), "radar_score": radar, "risk_pct": risk_pct,
-        "suggested_leverage": leverage, "trendline": long_line if direction=="LONG" else short_line,
-        "ema20": ema20_now, "ema50": ema50_now, "ema200": ema200_now, "time": cur["time"],
-        "rows": r15[-CHART_CANDLES:], "checks": checks, "retest_ok": retest_ok,
-        "rejection_ok": rejection_ok, "demand_zones": demand[-3:], "supply_zones": supply[-3:],
-    }
+    return None
 
 
 def make_chart(sig):
-    """TradingView-style chart for the conservative A+ setup scanner.
-
-    Uses the bot's real Bitget OHLC data and signal levels. The visual design is
-    intentionally closer to a manual TradingView setup: clean candles, right
-    price scale, structure line, support/resistance zone, projected R:R box,
-    target arrow, and minimal annotation. No volume subplot is used.
-    """
+    """Render the ICT 2022 setup with every signal component annotated."""
     rows = sig["rows"]
     n = len(rows)
     direction = sig["direction"]
     entry, sl = sig["entry"], sig["sl"]
-    trigger = sig.get("trigger_level", entry)
     tp1, tp2, tp3 = sig["tp1"], sig["tp2"], sig["tp3"]
-
-    BG = "#f7f7f8"
-    GRID = "#e4e6e8"
-    TEXT = "#17191c"
-    MUTED = "#73777d"
-    UP = "#16a085"
-    DOWN = "#e14b55"
-    TEAL = "#087f7a"
-    GOLD = "#c8a84e"
-    BORDER = "#cfd3d7"
-
-    fig, ax = plt.subplots(figsize=(14.4, 7.7), dpi=170, facecolor=BG)
+    BG, GRID, TEXT, MUTED = "#f7f7f8", "#e4e6e8", "#17191c", "#73777d"
+    UP, DOWN, GOLD, PURPLE = "#16a085", "#e14b55", "#c8a84e", "#7957d5"
+    fig, ax = plt.subplots(figsize=(14.4, 7.8), dpi=170, facecolor=BG)
     ax.set_facecolor(BG)
-
     width = 0.58
     for i, r in enumerate(rows):
-        up = r["close"] >= r["open"]
-        c = UP if up else DOWN
+        c = UP if r["close"] >= r["open"] else DOWN
         ax.vlines(i, r["low"], r["high"], color=c, linewidth=1.0, zorder=3)
         lo = min(r["open"], r["close"])
-        body_h = max(abs(r["close"] - r["open"]), abs(r["close"]) * 1e-5)
-        ax.add_patch(Rectangle(
-            (i - width / 2, lo), width, body_h,
-            facecolor=c, edgecolor=c, linewidth=0.5, zorder=4
-        ))
+        bh = max(abs(r["close"]-r["open"]), abs(r["close"])*1e-5)
+        ax.add_patch(Rectangle((i-width/2, lo), width, bh, facecolor=c, edgecolor=c, linewidth=.5, zorder=4))
 
-    chart_right = n + max(12, int(n * 0.22))
+    right = n + 14
+    fvg = sig["fvg"]; ob = sig["ob"]; zone = sig["entry_zone"]
+    def box(z, color, alpha, label, yoff=0):
+        local_index = z.get("index", 0) - (sig.get("full_len", n) - n) if "index" in z else 0
+        x0 = max(0, min(n-1, local_index - max(3, n//10)))
+        ax.add_patch(Rectangle((x0, z["low"]), right-x0, z["high"]-z["low"], facecolor=color, edgecolor=color, alpha=alpha, linewidth=1.0, zorder=1))
+        ax.text(x0+1, z["high"]+yoff, label, color=color, fontsize=8.2, fontweight="bold", va="bottom", zorder=6)
 
-    # Draw the actual price-action zones used by the signal engine.
-    # Green = demand, red = supply, matching the reference screenshots.
-    window = rows[-min(55, n):]
-    highs, lows = swing_points(window, left=2, right=2)
-    offset = n - len(window)
-    demand_zones = sig.get("demand_zones") or []
-    supply_zones = sig.get("supply_zones") or []
-    if not demand_zones and not supply_zones:
-        av = atr(rows, 14) or abs(rows[-1]["close"]) * 0.005
-        demand_zones = [{"low": min(r["low"] for r in rows[-12:]), "high": min(r["low"] for r in rows[-12:]) + 0.5*av}]
-        supply_zones = [{"low": max(r["high"] for r in rows[-12:]) - 0.5*av, "high": max(r["high"] for r in rows[-12:])}]
-    for z in demand_zones:
-        ax.add_patch(Rectangle((-1, z["low"]), chart_right + 1, z["high"]-z["low"],
-                               facecolor=UP, edgecolor=UP, linewidth=0.9, alpha=0.14, zorder=0))
-    for z in supply_zones:
-        ax.add_patch(Rectangle((-1, z["low"]), chart_right + 1, z["high"]-z["low"],
-                               facecolor=DOWN, edgecolor=DOWN, linewidth=0.9, alpha=0.13, zorder=0))
-    if demand_zones:
-        z = demand_zones[-1]
-        ax.text(1, z["high"], "DEMAND", color=UP, fontsize=7.8, fontweight="bold", va="bottom", zorder=5)
-    if supply_zones:
-        z = supply_zones[-1]
-        ax.text(1, z["high"], "SUPPLY", color=DOWN, fontsize=7.8, fontweight="bold", va="bottom", zorder=5)
+    box(ob, GOLD, .13, "ORDER BLOCK")
+    box(fvg, PURPLE, .15, "FVG")
+    ax.add_patch(Rectangle((max(0, fvg["index"]-2), zone["low"]), right-max(0, fvg["index"]-2), zone["high"]-zone["low"], facecolor=PURPLE, edgecolor=PURPLE, alpha=.08, linewidth=1.2, zorder=0))
+    ax.text(max(0, fvg["index"]-1), zone["high"], "ENTRY ZONE", color=PURPLE, fontsize=8, fontweight="bold", va="bottom")
 
-    # Structure trendline uses the same swing logic as the signal check.
-    trend_points = None
-    if direction == "LONG" and len(highs) >= 2 and highs[-1][1] < highs[-2][1]:
-        trend_points = (highs[-2], highs[-1])
-    elif direction == "SHORT" and len(lows) >= 2 and lows[-1][1] > lows[-2][1]:
-        trend_points = (lows[-2], lows[-1])
+    # Map stored indices from full series to chart-local indices using timestamp.
+    times = {r["time"]: i for i, r in enumerate(rows)}
+    full_rows = rows
+    sweep_price = sig["liquidity"]
+    # Sweep and MSS indices are converted approximately from the setup's latest
+    # chart window by matching the closest candle timestamp when possible.
+    sweep_local = max(0, n-1)
+    mss_local = max(0, n-1)
+    # The stored setup indices refer to the full scan; derive their local offset
+    # from the visible window size.
+    full_len_hint = sig.get("full_len", n)
+    sweep_local = sig["sweep_index"] - (full_len_hint - n)
+    mss_local = sig["mss_index"] - (full_len_hint - n)
+    if 0 <= sweep_local < n:
+        ax.scatter([sweep_local], [sweep_price], s=55, marker="v" if direction == "SHORT" else "^", color=DOWN if direction == "SHORT" else UP, zorder=8)
+        ax.annotate("LIQUIDITY SWEEP", xy=(sweep_local, sweep_price), xytext=(max(0,sweep_local-10), sweep_price), arrowprops=dict(arrowstyle="->", color=DOWN if direction=="SHORT" else UP, lw=1.4), color=DOWN if direction=="SHORT" else UP, fontsize=8.4, fontweight="bold")
+    if 0 <= mss_local < n:
+        ax.axhline(sig["mss_level"], color=GOLD, linestyle="--", linewidth=1.0, alpha=.85)
+        ax.annotate("MSS / CHOCH", xy=(mss_local, sig["mss_level"]), xytext=(max(0,mss_local-10), sig["mss_level"]), arrowprops=dict(arrowstyle="->", color=GOLD, lw=1.4), color=GOLD, fontsize=8.4, fontweight="bold")
 
-    if trend_points:
-        p1, p2 = trend_points
-        x_a, x_b = p1[0] + offset, p2[0] + offset
-        y_a, y_b = p1[1], p2[1]
-        y_ext = line_value((x_a, y_a), (x_b, y_b), chart_right)
-        ax.plot([x_a, chart_right], [y_a, y_ext], color=TEAL,
-                linewidth=2.2, alpha=0.95, zorder=5)
-        if sig["checks"].get("Trendline breakout" if direction == "LONG" else "Trendline breakdown"):
-            ax.text(min(x_b + 1, chart_right - 8), y_ext,
-                    "BREAKOUT" if direction == "LONG" else "BREAKDOWN",
-                    color=TEAL, fontsize=8.2, fontweight="bold", va="bottom")
+    ax.axhline(entry, color=TEXT, linewidth=1.15, linestyle="--")
+    ax.axhline(sl, color=DOWN, linewidth=1.0)
+    for y, lab, c in [(tp1,"TP1",UP),(tp2,"TP2",UP),(tp3,"TP3",UP)]:
+        ax.axhline(y, color=c, linewidth=.9, linestyle=":")
+        ax.text(right+.3, y, f"{lab} {fmt_price(y)}", color=c, fontsize=8, fontweight="bold", va="center")
+    ax.text(right+.3, entry, f"ENTRY {fmt_price(entry)}", color=TEXT, fontsize=8, fontweight="bold", va="center")
+    ax.text(right+.3, sl, f"SL {fmt_price(sl)}", color=DOWN, fontsize=8, fontweight="bold", va="center")
 
-    # The trigger level is the actual breakout/breakdown level used by the
-    # scanner. Keep it visually separate from the entry so the chart shows
-    # exactly what had to break before the signal was allowed.
-    entry_zone_lo = min(trigger, entry)
-    entry_zone_hi = max(trigger, entry)
-    zone_pad = max((entry_zone_hi - entry_zone_lo) * 0.18, abs(entry) * 0.00015)
-    ax.add_patch(Rectangle(
-        (-1, entry_zone_lo - zone_pad), n + 1,
-        max(entry_zone_hi - entry_zone_lo + 2 * zone_pad, abs(entry) * 0.0003),
-        facecolor=TEAL, edgecolor=TEAL, linewidth=0.9, alpha=0.08, zorder=0
-    ))
-    ax.axhline(trigger, color=GOLD if direction == "LONG" else DOWN,
-               linewidth=1.35, linestyle="--", alpha=0.95, zorder=5)
-    ax.text(1, trigger,
-            f"CONFIRMATION LEVEL  {fmt_price(trigger)}",
-            color=GOLD if direction == "LONG" else DOWN, fontsize=7.9,
-            fontweight="bold", va="bottom" if direction == "LONG" else "top",
-            alpha=0.95, zorder=6)
-    ax.scatter([n - 1], [entry], s=34, marker="o",
-               facecolor=TEAL, edgecolor="white", linewidth=0.9, zorder=8)
-    ax.text(n - 1, entry, "  CLOSED 15m", color=TEAL, fontsize=7.8,
-            fontweight="bold", va="bottom" if direction == "LONG" else "top",
-            ha="left", zorder=8)
+    arrow_color = UP if direction == "LONG" else DOWN
+    ax.scatter([n-1], [entry], s=42, color=arrow_color, edgecolor="white", linewidth=.8, zorder=9)
+    ax.annotate(direction, xy=(n-1, entry), xytext=(max(0,n-15), entry), arrowprops=dict(arrowstyle="->", color=arrow_color, lw=1.7), color=arrow_color, fontsize=10, fontweight="bold")
+    ax.text(.01, 1.055, f"{sig['symbol']} · ICT 2022 MODEL · 15m · Bitget Futures", transform=ax.transAxes, fontsize=15, color=TEXT, fontweight="bold")
+    ax.text(.01, 1.018, "LIQUIDITY SWEEP → MSS → CHOCH → FVG → OB → ENTRY", transform=ax.transAxes, fontsize=9.5, color=PURPLE, fontweight="bold")
+    ax.text(.99, 1.018, direction, transform=ax.transAxes, fontsize=11, color=arrow_color, fontweight="bold", ha="right")
+    ax.text(.01, .018, "Only ICT 2022 price-action components are shown · 15m closed candle", transform=ax.transAxes, fontsize=8.2, color=MUTED)
 
-    # Entry and risk/reward projection, like a TradingView long/short position tool.
-    box_x0 = n - max(3, int(n * 0.05))
-    box_x1 = chart_right - 1
-    ax.add_patch(Rectangle(
-        (box_x0, min(entry, sl)), box_x1 - box_x0, abs(sl - entry),
-        facecolor=DOWN, edgecolor=DOWN, linewidth=0.8, alpha=0.18, zorder=1
-    ))
-    ax.add_patch(Rectangle(
-        (box_x0, min(entry, tp3)), box_x1 - box_x0, abs(tp3 - entry),
-        facecolor=UP, edgecolor=UP, linewidth=0.9, alpha=0.16, zorder=1
-    ))
-
-    # Horizontal levels: minimal and right-labelled.
-    level_specs = [
-        (sl, "SL", DOWN, 1.0, "-"),
-        (entry, "ENTRY", TEXT, 1.15, "--"),
-        (tp1, "TP1", TEAL, 0.9, ":"),
-        (tp2, "TP2", TEAL, 0.9, ":"),
-        (tp3, "TP3", TEAL, 1.15, "-"),
-    ]
-    for y, label, c, lw, ls in level_specs:
-        ax.axhline(y, color=c, linewidth=lw, linestyle=ls, alpha=0.9, zorder=2)
-        ax.text(chart_right + 0.4, y, f"{label}  {fmt_price(y)}",
-                color=c, fontsize=8.1, fontweight="bold",
-                va="center", ha="left", clip_on=False)
-
-    # Direction arrow + projected target arrow.
-    arrow_color = TEAL if direction == "LONG" else DOWN
-    if direction == "LONG":
-        arrow_y = entry + (tp1 - entry) * 0.05
-        target_mid = (entry + tp3) / 2
-        ax.annotate("LONG", xy=(n - 1, entry), xytext=(n - 13, arrow_y),
-                    arrowprops=dict(arrowstyle="->", color=arrow_color, lw=1.6),
-                    color=arrow_color, fontsize=9.5, fontweight="bold")
-        ax.annotate("", xy=(box_x0 + (box_x1-box_x0)*0.55, tp3),
-                    xytext=(box_x0 + (box_x1-box_x0)*0.55, entry),
-                    arrowprops=dict(arrowstyle="->", color=TEAL, lw=1.5), zorder=7)
-        ax.text((box_x0 + box_x1)/2, target_mid,
-                "TP1 1.5R  •  TP2 2.5R  •  TP3 4R",
-                rotation=90, color=TEAL, fontsize=8.0,
-                fontweight="bold", ha="center", va="center", alpha=0.9)
-    else:
-        arrow_y = entry - (entry - tp1) * 0.05
-        target_mid = (entry + tp3) / 2
-        ax.annotate("SHORT", xy=(n - 1, entry), xytext=(n - 13, arrow_y),
-                    arrowprops=dict(arrowstyle="->", color=arrow_color, lw=1.6),
-                    color=arrow_color, fontsize=9.5, fontweight="bold")
-        ax.annotate("", xy=(box_x0 + (box_x1-box_x0)*0.55, tp3),
-                    xytext=(box_x0 + (box_x1-box_x0)*0.55, entry),
-                    arrowprops=dict(arrowstyle="->", color=DOWN, lw=1.5), zorder=7)
-        ax.text((box_x0 + box_x1)/2, target_mid,
-                "TP1 1.5R  •  TP2 2.5R  •  TP3 4R",
-                rotation=90, color=DOWN, fontsize=8.0,
-                fontweight="bold", ha="center", va="center", alpha=0.9)
-
-    # Header and explanatory line, matching the clean reference style.
-    title = f"{sig['symbol']} / TetherUS PERPETUAL CONTRACT · 15 · Bitget"
-    ax.text(0.01, 1.055, title, transform=ax.transAxes,
-            fontsize=15.2, color=TEXT, fontweight="bold", va="bottom")
-    last_close = rows[-1]["close"]
-    change = ((last_close / rows[-2]["close"]) - 1.0) * 100 if len(rows) > 1 and rows[-2]["close"] else 0.0
-    ax.text(0.01, 1.018, f"{fmt_price(last_close)}  {change:+.2f}%",
-            transform=ax.transAxes, fontsize=10.0,
-            color=UP if change >= 0 else DOWN, va="bottom")
-    if direction == "LONG":
-        headline = "LONG favored by the broader bullish context"
-    else:
-        headline = "SHORT favored by the broader bearish context"
-    ax.text(0.50, 0.965, headline, transform=ax.transAxes,
-            fontsize=12.2, color=TEAL if direction == "LONG" else DOWN,
-            fontweight="bold", ha="center", va="top")
-
-    # Compact footer; no volume panel, matching the reference image's simplicity.
-    setup_mode = "RETEST + HOLD" if sig.get("retest_ok") else ("ZONE REJECTION" if sig.get("rejection_ok") else "BREAK + CLOSE")
-    footer = (f"{setup_mode}   •   Trend {sig['trend15']}   •   RSI {sig['rsi']:.1f}   •   "
-              f"Volume {sig['volume_ratio']:.2f}x   •   Radar {sig['radar_score']}/100   •   "
-              f"15m CLOSED CONFIRMATION")
-    ax.text(0.01, 0.018, footer, transform=ax.transAxes,
-            fontsize=8.2, color=MUTED, va="bottom")
-
-    # Latest-price tag and TradingView-like axes.
-    ax.text(1.006, last_close, fmt_price(last_close), transform=ax.get_yaxis_transform(),
-            ha="left", va="center", fontsize=8.8, color="white",
-            bbox=dict(boxstyle="square,pad=0.28", facecolor=UP if change >= 0 else DOWN,
-                      edgecolor="none", alpha=0.96), clip_on=False)
-    ax.yaxis.tick_right()
-    ax.yaxis.set_label_position("right")
-    ax.tick_params(axis="y", colors=TEXT, labelsize=8.5, length=0)
+    ax.yaxis.tick_right(); ax.tick_params(axis="y", colors=TEXT, labelsize=8.3, length=0)
     ax.tick_params(axis="x", colors=MUTED, labelsize=8, length=0, pad=8)
-    ax.grid(axis="y", color=GRID, linewidth=0.65, alpha=0.9)
-    ax.grid(axis="x", color=GRID, linewidth=0.45, alpha=0.5)
-    for side in ["top", "left", "bottom"]:
-        ax.spines[side].set_visible(False)
-    ax.spines["right"].set_color(BORDER)
-
-    step = max(1, n // 7)
-    ticks = list(range(0, n, step))
-    if ticks[-1] != n - 1:
-        ticks.append(n - 1)
-    labels = [datetime.fromtimestamp(rows[i]["time"], tz=timezone.utc).strftime("%d\n%H:%M") for i in ticks]
-    ax.set_xticks(ticks)
-    ax.set_xticklabels(labels)
-
-    zone_lows = [z["low"] for z in demand_zones + supply_zones] or [entry]
-    zone_highs = [z["high"] for z in demand_zones + supply_zones] or [entry]
-    all_lows = [r["low"] for r in rows] + [sl, tp3] + zone_lows
-    all_highs = [r["high"] for r in rows] + [sl, tp3] + zone_highs
-    ymin, ymax = min(all_lows), max(all_highs)
-    span = max(ymax - ymin, abs(last_close) * 0.012)
-    ax.set_ylim(ymin - span * 0.06, ymax + span * 0.12)
-    ax.set_xlim(-1, chart_right + 8)
-    fig.subplots_adjust(left=0.035, right=0.86, top=0.89, bottom=0.09)
-
-    safe_symbol = "".join(ch if ch.isalnum() else "_" for ch in sig["symbol"])
-    path = f"/tmp/chart_{safe_symbol}_{sig['time']}.png"
-    fig.savefig(path, facecolor=BG, edgecolor="none")
-    plt.close(fig)
-    return path
+    ax.grid(axis="y", color=GRID, linewidth=.6); ax.grid(axis="x", color=GRID, linewidth=.4, alpha=.5)
+    for side in ["top","left","bottom"]: ax.spines[side].set_visible(False)
+    ax.spines["right"].set_color("#cfd3d7")
+    step=max(1,n//7); ticks=list(range(0,n,step))
+    if ticks[-1] != n-1: ticks.append(n-1)
+    ax.set_xticks(ticks); ax.set_xticklabels([datetime.fromtimestamp(rows[i]["time"], tz=timezone.utc).strftime("%d\\n%H:%M") for i in ticks])
+    all_lows=[r["low"] for r in rows]+[sl,tp3,ob["low"],fvg["low"]]
+    all_highs=[r["high"] for r in rows]+[sl,tp3,ob["high"],fvg["high"]]
+    ymin,ymax=min(all_lows),max(all_highs); span=max(ymax-ymin,abs(rows[-1]["close"])*.012)
+    ax.set_ylim(ymin-span*.06,ymax+span*.12); ax.set_xlim(-1,right+8)
+    fig.subplots_adjust(left=.035,right=.86,top=.89,bottom=.09)
+    safe="".join(ch if ch.isalnum() else "_" for ch in sig["symbol"])
+    path=f"/tmp/chart_{safe}_{sig['time']}.png"; fig.savefig(path,facecolor=BG,edgecolor="none"); plt.close(fig); return path
 
 
 def telegram_url(method):
@@ -873,16 +742,13 @@ def status_text():
             "BOT STATUS: ONLINE\n"
             f"Scanner: {'RUNNING' if scanner_running else 'STOPPED'}\n"
             "Market: Bitget USDT Perpetual Futures (full eligible market)\n"
-            "Strategy: AI Market Radar + A++ Confirmation\n"
+            "Strategy: ICT 2022 Model\n"
+            "Model: Liquidity Sweep + MSS + FVG + OB + CHOCH\n"
             "Data source: Bitget Futures market data\n"
-            "Scan: 15m only\n"
+            "Scan: 15m closed candles only\n"
             f"Pending signals: {len(pending_signals)}\n"
             f"Tracked signals: {len(active_signals)}\n"
-            "Signal cooldown: 10 minutes\n"
-            "TPs: 1.5R / 2.5R / 4R\n"
-            f"Radar threshold: {RADAR_MIN_SCORE}/100\n"
-            "Leverage: dynamic 2x-5x (informational)\n"
-            "Chart: ENABLED\n"
+            "Chart: ICT components annotated\n"
             "TradingView: chart link only"
         )
 
@@ -971,34 +837,17 @@ def scan_once():
 
 def signal_caption(sig):
     d = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
-    checks_text = "\n".join(f"• {name}: {'YES' if ok else 'NO'}" for name, ok in sig["checks"].items())
     return (
-        f"🚀 NEW CONFIRMED SIGNAL\n\n{d}\n"
-        f"⭐ {sig['symbol']} (Bitget Futures)\n"
-        f"⏱ Timeframe: 15m\n"
-        f"📊 Analysis: AI Market Radar + Structure + Momentum\n"
-        f"🔗 Data: Bitget Futures • TradingView chart\n\n"
-        f"📈 ANALYSIS\n"
-        f"• Trend: {sig['trend15']}\n"
-        f"• Structure: {sig['structure']}\n"
-        f"• Setup: {'RETEST + HOLD' if sig.get('retest_ok') else ('ZONE REJECTION' if sig.get('rejection_ok') else 'BREAK + CLOSE')}\n"
-        f"• RSI: {sig['rsi']:.1f}\n"
-        f"• Volatility: {sig['volatility']}\n"
-        f"• Volume: {sig['volume_ratio']:.2f}x\n"
-        f"• Bias: {sig['direction']}\n"
-        f"• Market Radar: {sig['radar_score']}/100\n"
-        f"• Suggested Leverage: {sig['suggested_leverage']}x\n"
-        f"• Entry Zone: {fmt_price(sig.get('entry_zone_low', sig['entry']))} – {fmt_price(sig.get('entry_zone_high', sig['entry']))}\n"
-        f"• Confirmation: {fmt_price(sig.get('trigger_level', sig['entry']))}\n"
-        f"• Stop Loss: {fmt_price(sig['sl'])}\n"
-        f"• Take Profit 1: {fmt_price(sig['tp1'])} (R:R 1:1.5)\n"
-        f"• Take Profit 2: {fmt_price(sig['tp2'])} (R:R 1:2.5)\n"
-        f"• Take Profit 3: {fmt_price(sig['tp3'])} (R:R 1:4)\n\n"
-        f"📋 SCORE: {sig['score']}/{sig['max_score']}\n"
-        f"🎯 CONFIDENCE: {sig['confidence']}%\n\n"
-        f"Checks:\n{checks_text}\n\n"
-        "⚠️ Signal only — no automatic trading.\n"
-        "⚙️ Leverage is a risk-based suggestion, not a guarantee."
+        f"🚀 ICT 2022 SIGNAL\n\n{d}\n"
+        f"⭐ {sig['symbol']} · Bitget Futures\n"
+        f"⏱ 15m\n\n"
+        "Liquidity Sweep ✓  ·  MSS ✓  ·  CHOCH ✓  ·  FVG ✓  ·  OB ✓\n"
+        f"Entry: {fmt_price(sig['entry'])}\n"
+        f"SL: {fmt_price(sig['sl'])}\n"
+        f"TP1: {fmt_price(sig['tp1'])}\n"
+        f"TP2: {fmt_price(sig['tp2'])}\n"
+        f"TP3: {fmt_price(sig['tp3'])}\n\n"
+        "⚠️ Signal only — no automatic trading."
     )
 
 def scanner_loop():
@@ -1165,28 +1014,23 @@ def poll_updates():
                 active_chat_id = chat["id"]
                 if text.startswith("/start"):
                     send_message(active_chat_id,
-                        "🚀 Bitget A+ Structure + Breakout Scanner\n\n"
+                        "🚀 SAIWAN · ICT 2022 MODEL\n\n"
                         "/scan - Start scanner\n"
                         "/stop - Stop scanner\n"
                         "/status - Bot status\n\n"
-                        "Market: Bitget USDT Perpetual Futures (full eligible market)\n"
-                        "Scan timeframe: 15m only\n"
-                        "Confirmation: 15m CLOSED candle + Structure + Breakout + Volume\n"
-                        "TPs: 1.5R / 2.5R / 4R\n"
-                        "Signal cooldown: 10 minutes\n"
-                        "TP/SL hit replies: ENABLED\n"
-                        "Signal gate: A+ closed-candle confirmation")
+                        "Market: Bitget USDT Perpetual Futures\n"
+                        "Timeframe: 15m closed candles only\n"
+                        "Model: Liquidity Sweep + MSS + FVG + OB + CHOCH\n"
+                        "Chart: all ICT components are annotated\n"
+                        "TP/SL monitoring: ENABLED")
                 elif text.startswith("/scan"):
                     start_scanner(active_chat_id)
                     send_message(active_chat_id,
-                        "🚀 BITGET A+ CONFIRMED SIGNAL SCANNER STARTED\n\n"
-                        "Only 15m is scanned.\n"
-                        "No early/radar-only alerts will be sent.\n"
-                        "A signal is sent only after 15m CLOSED candle + structure + breakout + volume confirmation.\n"
-                        "TP1 1.5R • TP2 2.5R • TP3 4R.\n"
-                        "New signal cooldown: 10 minutes.\n"
-                        "TP/SL hit replies are enabled.\n"
-                        "Suggested leverage: dynamic 2x-5x (informational).")
+                        "🚀 ICT 2022 SCANNER STARTED\n\n"
+                        "15m closed candles only.\n"
+                        "Signal requires: Liquidity Sweep + MSS + FVG + OB + CHOCH.\n"
+                        "The chart will mark every ICT component used.\n"
+                        "TP/SL monitoring is enabled.")
                 elif text.startswith("/stop"):
                     stop_scanner(); send_message(active_chat_id, "🛑 Scanner stopped.")
                 elif text.startswith("/status"):
