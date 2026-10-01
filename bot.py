@@ -7,6 +7,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import requests
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -31,6 +36,12 @@ CHART_CANDLES = 70
 HTTP_TIMEOUT = 15
 MIN_SCORE = 5
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-6-luna")
+AI_REQUIRED = os.getenv("AI_REQUIRED", "true").strip().lower() not in {"0", "false", "no", "off"}
+AI_TIMEOUT = 12
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if (OpenAI is not None and OPENAI_API_KEY) else None
+
 # SAIWAN AI Market Radar / risk-aware leverage (informational only)
 RADAR_MIN_SCORE = 72
 MAX_SUGGESTED_LEVERAGE = 5
@@ -53,6 +64,8 @@ seen_order = []
 next_send_at = 0
 offset = None
 active_signals = {}  # key -> tracked signal state for TP/SL notifications
+signal_history = []  # sent signal summaries for /search
+MAX_SIGNAL_HISTORY = 500
 monitor_thread = None
 
 session = requests.Session()
@@ -555,23 +568,49 @@ def _move_setup(rows, direction):
 
         entry = cur["close"]
         if direction == "LONG":
-            sl = min(liquidity, ob["low"]) * 0.9995
+            # Keep the stop behind the nearest valid setup structure.
+            # The old version used the original liquidity sweep itself, which
+            # could place SL far away after a large displacement.
+            stop_anchor = max(liquidity, ob["low"], zone["low"])
+            sl = stop_anchor * 0.9995
             if sl >= entry: continue
             risk = entry - sl
+
+            # TP1 is the nearest opposing liquidity/swing above entry.
+            # Do NOT force TP1 to 1.5R when that would push it much farther
+            # away than the actual market structure (e.g. USUSDT ~0.029).
             highs, _ = swing_points(rows[:-1], 2, 2)
-            targets = sorted({p for _, p in highs if p > entry})
-            tp1 = max(targets[0] if targets else entry + risk*1.5, entry + risk*1.5)
-            tp2 = max(targets[1] if len(targets)>1 else entry + risk*2.5, tp1 + risk*.5)
-            tp3 = max(targets[2] if len(targets)>2 else entry + risk*4.0, tp2 + risk*.5)
+            targets = sorted({p for _, p in highs if p > entry * 1.002})
+            if targets:
+                tp1 = targets[0]
+                remaining = [p for p in targets[1:] if p > tp1 * 1.002]
+                tp2 = remaining[0] if remaining else max(tp1 + risk, entry + risk*2.0)
+                remaining2 = [p for p in remaining[1:] if p > tp2 * 1.002]
+                tp3 = remaining2[0] if remaining2 else max(tp2 + risk, entry + risk*3.0)
+            else:
+                tp1 = entry + risk*1.5
+                tp2 = entry + risk*2.5
+                tp3 = entry + risk*4.0
         else:
-            sl = max(liquidity, ob["high"]) * 1.0005
+            # Same principle for shorts: use the nearest structural
+            # invalidation, not the distant original sweep.
+            stop_anchor = min(liquidity, ob["high"], zone["high"])
+            sl = stop_anchor * 1.0005
             if sl <= entry: continue
             risk = sl - entry
+
             _, lows = swing_points(rows[:-1], 2, 2)
-            targets = sorted({p for _, p in lows if p < entry}, reverse=True)
-            tp1 = min(targets[0] if targets else entry - risk*1.5, entry - risk*1.5)
-            tp2 = min(targets[1] if len(targets)>1 else entry - risk*2.5, tp1 - risk*.5)
-            tp3 = min(targets[2] if len(targets)>2 else entry - risk*4.0, tp2 - risk*.5)
+            targets = sorted({p for _, p in lows if p < entry * 0.998}, reverse=True)
+            if targets:
+                tp1 = targets[0]
+                remaining = [p for p in targets[1:] if p < tp1 * 0.998]
+                tp2 = remaining[0] if remaining else min(tp1 - risk, entry - risk*2.0)
+                remaining2 = [p for p in remaining[1:] if p < tp2 * 0.998]
+                tp3 = remaining2[0] if remaining2 else min(tp2 - risk, entry - risk*3.0)
+            else:
+                tp1 = entry - risk*1.5
+                tp2 = entry - risk*2.5
+                tp3 = entry - risk*4.0
 
         return {
             "symbol": "", "direction": direction,
@@ -590,6 +629,102 @@ def _move_setup(rows, direction):
     return None
 
 
+
+def _compact_candles(rows, count=36):
+    """Keep the AI prompt small: recent closed candles only."""
+    out = []
+    for r in rows[-count:]:
+        out.append({
+            "t": r["time"],
+            "o": round(r["open"], 10),
+            "h": round(r["high"], 10),
+            "l": round(r["low"], 10),
+            "c": round(r["close"], 10),
+        })
+    return out
+
+
+def _ai_json(text):
+    """Extract a JSON object from the model's text response."""
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        start, end = text.find("{"), text.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(text[start:end + 1])
+    raise ValueError("AI returned invalid JSON")
+
+
+def ai_review_setup(sig, rows5, rows15):
+    """AI is a timing/filter layer; it never creates a setup without ICT evidence."""
+    if openai_client is None:
+        if AI_REQUIRED:
+            return None, "AI unavailable: OPENAI_API_KEY is missing or openai package is not installed"
+        return {"decision": "CONFIRM", "timing": "ICT_ONLY", "reason": "AI disabled"}, None
+
+    payload = {
+        "symbol": sig["symbol"],
+        "candidate_direction": sig["direction"],
+        "timeframe": "5m entry / 15m context",
+        "ict": {
+            "liquidity_sweep": True,
+            "mss": True,
+            "choch": True,
+            "fvg": sig.get("fvg"),
+            "ob": sig.get("ob"),
+            "entry_zone": sig.get("entry_zone"),
+            "entry": sig.get("entry"),
+            "sl": sig.get("sl"),
+            "tp1": sig.get("tp1"),
+            "tp2": sig.get("tp2"),
+            "tp3": sig.get("tp3"),
+            "context15": sig.get("context15"),
+        },
+        "recent_5m": _compact_candles(rows5, 42),
+        "recent_15m": _compact_candles(rows15, 20),
+    }
+    system = (
+        "You are SAIWAN's ICT timing analyst. You do not predict prices and you do not invent setups. "
+        "The deterministic engine has already found Liquidity Sweep + MSS + CHOCH + FVG + OB. "
+        "Your job is only to decide whether the candidate is timely enough to alert now. "
+        "Prefer early entries near the start of a move, but reject setups that are already clearly extended, "
+        "invalidated, or contradicted by the supplied closed candles. Never use RSI, volume, MACD, Fibonacci, ATR, "
+        "EMA, indicators, scores, or confidence. Return JSON only with keys: decision (CONFIRM/WAIT/REJECT), "
+        "timing (EARLY/READY/LATE/INVALID), direction (LONG/SHORT), reason (short string), "
+        "reversal_watch (true/false). Do not change the direction unless the supplied ICT structure itself is invalid; "
+        "if invalid, use REJECT."
+    )
+    try:
+        response = openai_client.responses.create(
+            model=OPENAI_MODEL,
+            reasoning={"effort": "low"},
+            input=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
+            ],
+            timeout=AI_TIMEOUT,
+        )
+        result = _ai_json(response.output_text)
+        decision = str(result.get("decision", "REJECT")).upper()
+        timing = str(result.get("timing", "INVALID")).upper()
+        direction = str(result.get("direction", sig["direction"])).upper()
+        if decision not in {"CONFIRM", "WAIT", "REJECT"}:
+            decision = "REJECT"
+        if timing not in {"EARLY", "READY", "LATE", "INVALID"}:
+            timing = "INVALID"
+        if direction != sig["direction"]:
+            decision = "REJECT"
+        result.update({"decision": decision, "timing": timing, "direction": direction})
+        return result, None
+    except Exception as e:
+        return None, f"AI review failed: {type(e).__name__}: {e}"
+
+
 def analyze(symbol, rows5, rows15=None):
     """SAIWAN Move Hunter: 5m entry hunting with 15m context, price action only."""
     if len(rows5) < 120:
@@ -602,11 +737,20 @@ def analyze(symbol, rows5, rows15=None):
             sig["symbol"] = symbol
             sig["context15"] = _context_15m(rows15, direction)
             sig["timeframe"] = "5m Entry · 15m Context"
+            ai, err = ai_review_setup(sig, rows5, rows15 or [])
+            if err:
+                print(f"AI REVIEW {symbol} {direction}: {err}")
+                continue
+            if not ai or ai.get("decision") != "CONFIRM":
+                continue
+            sig["ai_timing"] = ai.get("timing", "READY")
+            sig["ai_reason"] = ai.get("reason", "ICT setup confirmed")
+            sig["ai_reversal_watch"] = bool(ai.get("reversal_watch", False))
             candidates.append(sig)
     return max(candidates, key=lambda x: x["time"]) if candidates else None
 
 def make_chart(sig):
-    """Render the ICT 2022 setup with every signal component annotated."""
+    """Render the SAIWAN Move Hunter setup with every ICT component annotated."""
     rows = sig["rows"]
     n = len(rows)
     direction = sig["direction"]
@@ -721,6 +865,27 @@ def send_photo(chat_id, photo_path, caption, reply_markup=None):
     return (payload.get("result") or {}).get("message_id")
 
 
+def search_signals(query):
+    q = (query or "").strip().upper().replace("/SEARCH", "").strip()
+    if not q:
+        return "Usage: /search SYMBOL\nExample: /search XRP"
+    with state_lock:
+        matches = [x.copy() for x in signal_history if q in x["symbol"].upper()]
+    if not matches:
+        return f"🔎 No saved SAIWAN signal found for {q}."
+    matches = matches[-8:][::-1]
+    lines = [f"🔎 SAIWAN SIGNAL SEARCH: {q}", ""]
+    for x in matches:
+        dt = datetime.fromtimestamp(x["time"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        arrow = "🟢 LONG" if x["direction"] == "LONG" else "🔴 SHORT"
+        lines.append(f"{arrow} {x['symbol']} · {dt}")
+        lines.append(f"Entry {fmt_price(x['entry'])} · SL {fmt_price(x['sl'])} · TP1 {fmt_price(x['tp1'])}")
+        if x.get("ai_reason"):
+            lines.append(f"AI: {x['ai_reason']}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 def status_text():
     with state_lock:
         return (
@@ -733,6 +898,7 @@ def status_text():
             "Scan: 5m closed candles + 15m context\n"
             f"Pending signals: {len(pending_signals)}\n"
             f"Tracked signals: {len(active_signals)}\n"
+            f"AI: {OPENAI_MODEL if openai_client else 'NOT CONNECTED'}\n"
             "Chart: ICT components annotated\n"
             "TradingView: chart link only"
         )
@@ -834,6 +1000,8 @@ def signal_caption(sig):
         f"TP1: {fmt_price(sig['tp1'])}\n"
         f"TP2: {fmt_price(sig['tp2'])}\n"
         f"TP3: {fmt_price(sig['tp3'])}\n\n"
+        f"🧠 AI timing: {sig.get('ai_timing', 'READY')}\n"
+        f"AI note: {sig.get('ai_reason', 'ICT setup confirmed')}\n\n"
         "⚡ Early move setup — closed candles only.\n"
         "⚠️ Signal only — no automatic trading."
     )
@@ -852,6 +1020,7 @@ def scanner_loop():
 
 
 def track_sent_signal(sig, chat_id, message_id):
+    global signal_history
     if not message_id:
         return
     with state_lock:
@@ -871,6 +1040,14 @@ def track_sent_signal(sig, chat_id, message_id):
             "tp3_hit": False,
             "closed": False,
         }
+        signal_history.append({
+            "key": sig["key"], "symbol": sig["symbol"], "direction": sig["direction"],
+            "time": sig["time"], "entry": sig["entry"], "sl": sig["sl"],
+            "tp1": sig["tp1"], "tp2": sig["tp2"], "tp3": sig["tp3"],
+            "ai_timing": sig.get("ai_timing", "READY"), "ai_reason": sig.get("ai_reason", ""),
+        })
+        if len(signal_history) > MAX_SIGNAL_HISTORY:
+            del signal_history[:-MAX_SIGNAL_HISTORY]
 
 def _hit_level(direction, price, level):
     return price >= level if direction == "LONG" else price <= level
@@ -1005,7 +1182,8 @@ def poll_updates():
                         "🚀 SAIWAN CRYPTO SIGNAL\n\n"
                         "/scan - Start scanner\n"
                         "/stop - Stop scanner\n"
-                        "/status - Bot status\n\n"
+                        "/status - Bot status\n"
+                        "/search SYMBOL - Find saved signals\n\n"
                         "Market: Bitget USDT Perpetual Futures\n"
                         "Timeframe: 5m entry + 15m context\n"
                         "Model: SAIWAN Move Hunter — Liquidity Sweep + MSS + CHOCH + FVG + OB\n"
@@ -1023,6 +1201,8 @@ def poll_updates():
                     stop_scanner(); send_message(active_chat_id, "🛑 Scanner stopped.")
                 elif text.startswith("/status"):
                     send_message(active_chat_id, status_text())
+                elif text.startswith("/search"):
+                    send_message(active_chat_id, search_signals(text))
         except Exception as e:
             print(f"TELEGRAM ERROR {type(e).__name__}: {e}")
             time.sleep(3)
