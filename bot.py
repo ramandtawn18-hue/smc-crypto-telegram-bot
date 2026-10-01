@@ -417,240 +417,195 @@ def suggested_leverage(radar, volatility, risk_pct):
     return 3
 
 def analyze(symbol, rows15):
-    """15m closed-candle setup engine.
+    """15m-only SAIWAN structure/zone engine.
 
-    Two valid setup paths are allowed:
-      1) breakout -> confirmation/retest -> continuation
-      2) fresh demand/supply rejection with structure and momentum
-
-    The engine is intentionally selective, but it does not require every
-    optional confirmation at the same time. That was the main reason the old
-    version could scan hundreds of contracts and still return zero signals.
+    The signal is built around the reference bot's visible workflow:
+    structure -> supply/demand -> break -> close -> retest/rejection ->
+    volume/momentum -> entry, with late entries rejected.
     """
     if len(rows15) < 120:
         return None
-
-    r = rows15
-    cur, prev = r[-1], r[-2]
-    closes = [x["close"] for x in r]
-    a = atr(r, 14)
+    r15 = rows15  # get_klines() already removed the forming candle.
+    cur, prev = r15[-1], r15[-2]
+    closes = [r["close"] for r in r15]
+    a = atr(r15, 14)
     rv = rsi(closes, 14)
-    if not a or not rv or cur["close"] <= 0:
+    if not a or not rv:
         return None
 
-    trend, ema20, ema50, ema200 = trend_context(r)
-    vol_score, volatility = volatility_score(r)
-
+    trend, ema20_now, ema50_now, ema200_now = trend_context(r15)
+    vol_score, volatility = volatility_score(r15)
     body = abs(cur["close"] - cur["open"])
     rng = max(cur["high"] - cur["low"], 1e-12)
-    body_ratio = body / rng
     close_pos = (cur["close"] - cur["low"]) / rng
+    momentum_long = cur["close"] > cur["open"] and body >= 0.40*a and close_pos >= 0.66
+    momentum_short = cur["close"] < cur["open"] and body >= 0.40*a and close_pos <= 0.34
+    long_rsi, short_rsi = 52 <= rv <= 68, 32 <= rv <= 48
 
-    # Volume is deliberately softer than the previous 1.15x hard gate.
-    # A 1.00x candle can still be valid when structure + retest are strong.
-    avg_vol = sum(x["vol"] for x in r[-21:-1]) / 20.0
+    long_trendline, long_line = trendline_signal(r15, "LONG")
+    short_trendline, short_line = trendline_signal(r15, "SHORT")
+    long_structure, short_structure = structure_bias(r15, "LONG"), structure_bias(r15, "SHORT")
+
+    avg_vol = sum(x["vol"] for x in r15[-21:-1]) / 20.0
     vol_ratio = cur["vol"] / avg_vol if avg_vol else 0.0
-    volume_ok = vol_ratio >= 1.00
-    volume_strong = vol_ratio >= 1.15
+    volume_ok = vol_ratio >= 1.15
 
-    resistance = max(x["high"] for x in r[-21:-1])
-    support = min(x["low"] for x in r[-21:-1])
+    resistance = max(x["high"] for x in r15[-21:-1])
+    support = min(x["low"] for x in r15[-21:-1])
     long_break = cur["close"] > resistance and prev["close"] <= resistance and cur["close"] > cur["open"]
     short_break = cur["close"] < support and prev["close"] >= support and cur["close"] < cur["open"]
 
-    # Recent breakout/retest detection. A retest can occur up to 4 closed
-    # candles after the break; entry is only allowed after the hold/rejection.
+    # A retest is a break that happened recently, followed by a test-and-hold.
     retest_long = retest_short = False
-    retest_level_long, retest_level_short = resistance, support
-    for j in range(max(1, len(r)-6), len(r)-1):
-        prior_res = max(x["high"] for x in r[max(0, j-20):j])
-        prior_sup = min(x["low"] for x in r[max(0, j-20):j])
-        if r[j]["close"] > prior_res and r[j]["close"] > r[j]["open"]:
-            touched = min(x["low"] for x in r[j+1:]) <= prior_res + 0.22*a
-            held = cur["close"] > prior_res and cur["close"] > cur["open"]
+    retest_level_long = resistance
+    retest_level_short = support
+    for j in range(max(1, len(r15)-5), len(r15)-1):
+        prior_res = max(x["high"] for x in r15[max(0,j-20):j]) if j >= 20 else resistance
+        prior_sup = min(x["low"] for x in r15[max(0,j-20):j]) if j >= 20 else support
+        if r15[j]["close"] > prior_res and r15[j]["close"] > r15[j]["open"]:
+            lvl = prior_res
+            touched = min(r["low"] for r in r15[j+1:]) <= lvl + 0.18*a
+            held = cur["close"] > lvl and cur["close"] > cur["open"]
             if touched and held:
-                retest_long, retest_level_long = True, prior_res
-        if r[j]["close"] < prior_sup and r[j]["close"] < r[j]["open"]:
-            touched = max(x["high"] for x in r[j+1:]) >= prior_sup - 0.22*a
-            held = cur["close"] < prior_sup and cur["close"] < cur["open"]
+                retest_long, retest_level_long = True, lvl
+        if r15[j]["close"] < prior_sup and r15[j]["close"] < r15[j]["open"]:
+            lvl = prior_sup
+            touched = max(r["high"] for r in r15[j+1:]) >= lvl - 0.18*a
+            held = cur["close"] < lvl and cur["close"] < cur["open"]
             if touched and held:
-                retest_short, retest_level_short = True, prior_sup
+                retest_short, retest_level_short = True, lvl
 
-    demand, supply = _zone_candidates(r, a)
-    demand_zone = demand[-1] if demand else {"low": support-0.30*a, "high": support+0.30*a}
-    supply_zone = supply[-1] if supply else {"low": resistance-0.30*a, "high": resistance+0.30*a}
-    long_rejection = _zone_rejection(cur, demand_zone, "LONG")
-    short_rejection = _zone_rejection(cur, supply_zone, "SHORT")
+    demand, supply = _zone_candidates(r15, a)
+    latest_demand = demand[-1] if demand else None
+    latest_supply = supply[-1] if supply else None
+    zone_tolerance = 0.20*a
+
+    # If a confirmed breakout is present, the broken level becomes the entry
+    # trigger. Otherwise a fresh rejection from a detected zone may qualify.
+    long_zone = latest_demand or {"low": support-0.25*a, "high": support+0.25*a}
+    short_zone = latest_supply or {"low": resistance-0.25*a, "high": resistance+0.25*a}
+    long_rejection = _zone_rejection(cur, long_zone, "LONG")
+    short_rejection = _zone_rejection(cur, short_zone, "SHORT")
 
     long_trigger = retest_level_long if retest_long else resistance
     short_trigger = retest_level_short if retest_short else support
-    long_confirm = long_break or retest_long
-    short_confirm = short_break or retest_short
+    long_break_confirm = long_break or retest_long
+    short_break_confirm = short_break or retest_short
 
-    # Structure is based on the last confirmed swings, but we also accept an
-    # aligned EMA structure when the market has not printed a perfect swing pair.
-    long_structure = structure_bias(r, "LONG")
-    short_structure = structure_bias(r, "SHORT")
-    ema_long = ema20 > ema50 and ema20 >= ema20 if ema20 and ema50 else False
-    ema_short = ema20 < ema50 and ema20 <= ema20 if ema20 and ema50 else False
-    # Use actual EMA slopes instead of the tautological expression above.
-    e20 = ema([x["close"] for x in r], 20)
-    e50 = ema([x["close"] for x in r], 50)
-    ema_long = e20[-1] > e50[-1] and e20[-1] > e20[-5]
-    ema_short = e20[-1] < e50[-1] and e20[-1] < e20[-5]
-
-    # Momentum must be directional, but does not need to be a huge candle.
-    momentum_long = cur["close"] > cur["open"] and body_ratio >= 0.45 and close_pos >= 0.60
-    momentum_short = cur["close"] < cur["open"] and body_ratio >= 0.45 and close_pos <= 0.40
-    follow_long = cur["close"] > prev["close"] and close_pos >= 0.55
-    follow_short = cur["close"] < prev["close"] and close_pos <= 0.45
-
-    # RSI is a directional filter, not an absolute requirement. This avoids
-    # rejecting good trend continuation setups simply because RSI is 50.5/49.5.
-    long_rsi = 50 <= rv <= 70
-    short_rsi = 30 <= rv <= 50
-
-    # Avoid chasing a candle that has already travelled too far from its trigger.
     long_extension = (cur["close"] - long_trigger) / a
     short_extension = (short_trigger - cur["close"]) / a
-    not_extended_long = -0.15 <= long_extension <= 0.90
-    not_extended_short = -0.15 <= short_extension <= 0.90
+    not_extended_long = -0.20 <= long_extension <= 0.85
+    not_extended_short = -0.20 <= short_extension <= 0.85
 
-    # The current price should still be reasonably connected to the setup zone.
-    long_zone_ok = long_rejection or retest_long or abs(cur["close"] - demand_zone["high"]) <= 1.25*a
-    short_zone_ok = short_rejection or retest_short or abs(cur["close"] - supply_zone["low"]) <= 1.25*a
+    # The zone must be relevant: either price is testing/holding it or the
+    # trigger is close enough to the latest detected demand/supply.
+    long_zone_ok = long_rejection or retest_long or abs(cur["close"]-long_zone["high"]) <= 1.10*a
+    short_zone_ok = short_rejection or retest_short or abs(cur["close"]-short_zone["low"]) <= 1.10*a
 
-    # Reject extreme volatility. Healthy/high volatility can be traded if the
-    # structural checks are clean.
-    volatility_ok = volatility in ("HEALTHY", "HIGH") and vol_score >= 5.0
-
-    # Score each side instead of requiring every single optional flag.
-    def side_score(direction):
-        if direction == "LONG":
-            trend_ok = trend == "BULLISH" or ema_long
-            structure_ok = long_structure or ema_long
-            confirm_ok = long_confirm or long_rejection
-            momentum_ok = momentum_long or (retest_long and follow_long)
-            rsi_ok = long_rsi
-            extension_ok = not_extended_long
-            zone_ok = long_zone_ok
-            score = sum([
-                18 if trend == "BULLISH" else (12 if ema_long else 0),
-                16 if long_structure else (10 if ema_long else 0),
-                20 if long_confirm else (14 if long_rejection else 0),
-                12 if momentum_long else (8 if follow_long else 0),
-                8 if rsi_ok else 0,
-                10 if volume_strong else (6 if volume_ok else 0),
-                8 if extension_ok else 0,
-                5 if volatility_ok else 0,
-                3 if zone_ok else 0,
-            ])
-            return score, trend_ok, structure_ok, confirm_ok, momentum_ok, rsi_ok, extension_ok, zone_ok
-        trend_ok = trend == "BEARISH" or ema_short
-        structure_ok = short_structure or ema_short
-        confirm_ok = short_confirm or short_rejection
-        momentum_ok = momentum_short or (retest_short and follow_short)
-        rsi_ok = short_rsi
-        extension_ok = not_extended_short
-        zone_ok = short_zone_ok
-        score = sum([
-            18 if trend == "BEARISH" else (12 if ema_short else 0),
-            16 if short_structure else (10 if ema_short else 0),
-            20 if short_confirm else (14 if short_rejection else 0),
-            12 if momentum_short else (8 if follow_short else 0),
-            8 if rsi_ok else 0,
-            10 if volume_strong else (6 if volume_ok else 0),
-            8 if extension_ok else 0,
-            5 if volatility_ok else 0,
-            3 if zone_ok else 0,
-        ])
-        return score, trend_ok, structure_ok, confirm_ok, momentum_ok, rsi_ok, extension_ok, zone_ok
-
-    ls = side_score("LONG")
-    ss = side_score("SHORT")
-    if ls[0] == ss[0] or max(ls[0], ss[0]) < 72:
+    long_ready = (
+        trend == "BULLISH" and long_rsi and long_structure and long_break_confirm
+        and (momentum_long or long_rejection) and volume_ok and not_extended_long
+        and vol_score >= 4.5 and long_zone_ok
+    )
+    short_ready = (
+        trend == "BEARISH" and short_rsi and short_structure and short_break_confirm
+        and (momentum_short or short_rejection) and volume_ok and not_extended_short
+        and vol_score >= 4.5 and short_zone_ok
+    )
+    if long_ready == short_ready:
         return None
-    direction = "LONG" if ls[0] > ss[0] else "SHORT"
-    vals = ls if direction == "LONG" else ss
-    score, trend_ok, structure_ok, confirm_ok, momentum_ok, rsi_ok, extension_ok, zone_ok = vals
-
-    # A signal must have a real confirmation event. This is the one hard gate:
-    # breakout/retest or a fresh zone rejection; no radar-only alerts.
-    if not confirm_ok or not trend_ok or not structure_ok or not extension_ok or not volatility_ok:
-        return None
-    if not volume_ok or not momentum_ok or not rsi_ok:
-        return None
-
-    trigger = long_trigger if direction == "LONG" else short_trigger
-    zone = demand_zone if direction == "LONG" else supply_zone
-    retest_ok = retest_long if direction == "LONG" else retest_short
-    rejection_ok = long_rejection if direction == "LONG" else short_rejection
-    trendline_ok = trendline_signal(r, direction)[0]
-
-    # Risk is based on the setup structure. Reject impractically wide stops.
-    if direction == "LONG":
-        recent_lows = [x["low"] for x in r[-16:]]
-        sl = min(min(recent_lows), zone["low"] - 0.10*a)
-        risk = cur["close"] - sl
-        if risk <= 0 or risk > 3.0*a:
-            return None
-        higher = sorted(set(round(x[1], 12) for x in swing_points(r[-100:], 2, 2)[0] if x[1] > cur["close"]))
-        tp1 = next((x for x in higher if x >= cur["close"] + 1.2*risk), cur["close"] + 1.5*risk)
-        tp2 = next((x for x in higher if x > tp1), cur["close"] + 2.5*risk)
-        tp3 = next((x for x in higher if x > tp2), cur["close"] + 4.0*risk)
-        structure = "Breakout + higher-low" if confirm_ok else "Demand rejection"
-    else:
-        recent_highs = [x["high"] for x in r[-16:]]
-        sl = max(max(recent_highs), zone["high"] + 0.10*a)
-        risk = sl - cur["close"]
-        if risk <= 0 or risk > 3.0*a:
-            return None
-        lower = sorted(set(round(x[1], 12) for x in swing_points(r[-100:], 2, 2)[1] if x[1] < cur["close"]), reverse=True)
-        tp1 = next((x for x in lower if x <= cur["close"] - 1.2*risk), cur["close"] - 1.5*risk)
-        tp2 = next((x for x in lower if x < tp1), cur["close"] - 2.5*risk)
-        tp3 = next((x for x in lower if x < tp2), cur["close"] - 4.0*risk)
-        structure = "Breakdown + lower-high" if confirm_ok else "Supply rejection"
+    direction = "LONG" if long_ready else "SHORT"
 
     if direction == "LONG":
-        tp1 = max(tp1, cur["close"] + 1.2*risk)
-        tp2 = max(tp2, tp1 + 0.25*risk)
-        tp3 = max(tp3, tp2 + 0.25*risk)
+        breakout_ok, trendline_ok, structure_ok = long_break_confirm, long_trendline, long_structure
+        momentum_ok, extension_ok = momentum_long or long_rejection, not_extended_long
+        zone_ok, retest_ok, rejection_ok = long_zone_ok, retest_long, long_rejection
+        trigger = long_trigger
+        zone = long_zone
+        checks = {
+            "Trend bullish": trend == "BULLISH",
+            "Higher-low structure": long_structure,
+            "Break + close confirmed": long_break_confirm,
+            "Demand zone respected": long_zone_ok,
+            "Retest / rejection": retest_long or long_rejection,
+            "Closed momentum candle": momentum_ok,
+            "Volume expansion": volume_ok,
+            "Not overextended": not_extended_long,
+        }
     else:
-        tp1 = min(tp1, cur["close"] - 1.2*risk)
-        tp2 = min(tp2, tp1 - 0.25*risk)
-        tp3 = min(tp3, tp2 - 0.25*risk)
+        breakout_ok, trendline_ok, structure_ok = short_break_confirm, short_trendline, short_structure
+        momentum_ok, extension_ok = momentum_short or short_rejection, not_extended_short
+        zone_ok, retest_ok, rejection_ok = short_zone_ok, retest_short, short_rejection
+        trigger = short_trigger
+        zone = short_zone
+        checks = {
+            "Trend bearish": trend == "BEARISH",
+            "Lower-high structure": short_structure,
+            "Break + close confirmed": short_break_confirm,
+            "Supply zone respected": short_zone_ok,
+            "Retest / rejection": retest_short or short_rejection,
+            "Closed momentum candle": momentum_ok,
+            "Volume expansion": volume_ok,
+            "Not overextended": not_extended_short,
+        }
 
-    # Confidence is a setup-quality score, not a probability of profit.
-    confidence = min(95, int(70 + (score-72)*0.7 + (4 if retest_ok else 0) + (3 if volume_strong else 0) + (2 if trendline_ok else 0)))
-    radar = int(min(100, round(score + (5 if retest_ok else 0) + (3 if trendline_ok else 0))))
-    risk_pct = abs(cur["close"] - sl) / cur["close"] * 100
+    radar = radar_score(direction, trend, rv, vol_ratio, vol_score, structure_ok,
+                        breakout_ok, trendline_ok, momentum_ok, extension_ok,
+                        zone_ok, retest_ok, rejection_ok)
+    if radar < RADAR_MIN_SCORE:
+        return None
+
+    entry = cur["close"]
+    # Structure-based invalidation: use the relevant demand/supply plus recent
+    # swing extreme, rather than a blind ATR-only stop.
+    if direction == "LONG":
+        recent_lows = [x["low"] for x in r15[-16:]]
+        sl = min(min(recent_lows), zone["low"] - 0.12*a)
+        risk = entry - sl
+        if risk <= 0 or risk > 3.2*a:
+            return None
+        # First target is the nearest meaningful resistance; farther targets
+        # fall back to R multiples only when no clean level exists.
+        resistances = sorted(set(round(x[1], 12) for x in swing_points(r15[-100:],2,2)[0] if x[1] > entry))
+        tp1 = resistances[0] if resistances and resistances[0] > entry + 0.8*risk else entry + 1.5*risk
+        tp2 = resistances[1] if len(resistances)>1 and resistances[1] > tp1 else entry + 2.5*risk
+        tp3 = resistances[2] if len(resistances)>2 and resistances[2] > tp2 else entry + 4.0*risk
+        structure = "Breakout + higher-low + demand" if not retest_ok else "Retest hold + higher-low + demand"
+    else:
+        recent_highs = [x["high"] for x in r15[-16:]]
+        sl = max(max(recent_highs), zone["high"] + 0.12*a)
+        risk = sl - entry
+        if risk <= 0 or risk > 3.2*a:
+            return None
+        supports = sorted(set(round(x[1], 12) for x in swing_points(r15[-100:],2,2)[1] if x[1] < entry), reverse=True)
+        tp1 = supports[0] if supports and supports[0] < entry - 0.8*risk else entry - 1.5*risk
+        tp2 = supports[1] if len(supports)>1 and supports[1] < tp1 else entry - 2.5*risk
+        tp3 = supports[2] if len(supports)>2 and supports[2] < tp2 else entry - 4.0*risk
+        structure = "Breakdown + lower-high + supply" if not retest_ok else "Retest rejection + lower-high + supply"
+
+    # Keep targets in the correct order and never put a TP on the wrong side.
+    if direction == "LONG":
+        tp1, tp2, tp3 = max(tp1, entry+0.8*risk), max(tp2, tp1+0.2*risk), max(tp3, tp2+0.2*risk)
+    else:
+        tp1, tp2, tp3 = min(tp1, entry-0.8*risk), min(tp2, tp1-0.2*risk), min(tp3, tp2-0.2*risk)
+
+    score = sum(checks.values())
+    confidence = min(95, 68 + score*3 + min(vol_score,8) + (4 if retest_ok else 0) + (2 if rejection_ok else 0))
+    risk_pct = abs(entry-sl)/entry*100 if entry else 99.0
     leverage = suggested_leverage(radar, volatility, risk_pct)
-
-    checks = {
-        "Trend aligned": trend_ok,
-        "Structure aligned": structure_ok,
-        "Closed breakout/retest or rejection": confirm_ok,
-        "Momentum": momentum_ok,
-        "RSI aligned": rsi_ok,
-        "Volume >= 1.0x": volume_ok,
-        "Volatility usable": volatility_ok,
-        "Not overextended": extension_ok,
-    }
     return {
         "symbol": symbol, "direction": direction, "structure": structure,
-        "entry": cur["close"], "trigger_level": trigger, "sl": sl,
-        "tp1": tp1, "tp2": tp2, "tp3": tp3,
+        "entry": entry, "trigger_level": trigger, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
         "entry_zone_low": zone["low"], "entry_zone_high": zone["high"],
-        "score": sum(checks.values()), "max_score": len(checks),
-        "trend15": trend, "rsi": rv, "volatility": volatility,
-        "volatility_score": vol_score, "volume_ratio": vol_ratio,
-        "confidence": confidence, "radar_score": radar, "risk_pct": risk_pct,
-        "suggested_leverage": leverage, "trendline": trendline_signal(r, direction)[1],
-        "ema20": ema20, "ema50": ema50, "ema200": ema200,
-        "time": cur["time"], "rows": r[-CHART_CANDLES:], "checks": checks,
-        "retest_ok": retest_ok, "rejection_ok": rejection_ok,
-        "demand_zones": demand[-3:], "supply_zones": supply[-3:],
+        "score": score, "max_score": len(checks), "trend15": trend, "rsi": rv,
+        "volatility": volatility, "volatility_score": vol_score, "volume_ratio": vol_ratio,
+        "confidence": int(confidence), "radar_score": radar, "risk_pct": risk_pct,
+        "suggested_leverage": leverage, "trendline": long_line if direction=="LONG" else short_line,
+        "ema20": ema20_now, "ema50": ema50_now, "ema200": ema200_now, "time": cur["time"],
+        "rows": r15[-CHART_CANDLES:], "checks": checks, "retest_ok": retest_ok,
+        "rejection_ok": rejection_ok, "demand_zones": demand[-3:], "supply_zones": supply[-3:],
     }
+
 
 def make_chart(sig):
     """TradingView-style chart for the conservative A+ setup scanner.
@@ -1015,10 +970,36 @@ def scan_once():
 
 
 def signal_caption(sig):
-    # Telegram signal is intentionally minimal: chart + coin + direction.
-    direction = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
-    return f"{sig['symbol']}\n{direction}"
-
+    d = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
+    checks_text = "\n".join(f"• {name}: {'YES' if ok else 'NO'}" for name, ok in sig["checks"].items())
+    return (
+        f"🚀 NEW CONFIRMED SIGNAL\n\n{d}\n"
+        f"⭐ {sig['symbol']} (Bitget Futures)\n"
+        f"⏱ Timeframe: 15m\n"
+        f"📊 Analysis: AI Market Radar + Structure + Momentum\n"
+        f"🔗 Data: Bitget Futures • TradingView chart\n\n"
+        f"📈 ANALYSIS\n"
+        f"• Trend: {sig['trend15']}\n"
+        f"• Structure: {sig['structure']}\n"
+        f"• Setup: {'RETEST + HOLD' if sig.get('retest_ok') else ('ZONE REJECTION' if sig.get('rejection_ok') else 'BREAK + CLOSE')}\n"
+        f"• RSI: {sig['rsi']:.1f}\n"
+        f"• Volatility: {sig['volatility']}\n"
+        f"• Volume: {sig['volume_ratio']:.2f}x\n"
+        f"• Bias: {sig['direction']}\n"
+        f"• Market Radar: {sig['radar_score']}/100\n"
+        f"• Suggested Leverage: {sig['suggested_leverage']}x\n"
+        f"• Entry Zone: {fmt_price(sig.get('entry_zone_low', sig['entry']))} – {fmt_price(sig.get('entry_zone_high', sig['entry']))}\n"
+        f"• Confirmation: {fmt_price(sig.get('trigger_level', sig['entry']))}\n"
+        f"• Stop Loss: {fmt_price(sig['sl'])}\n"
+        f"• Take Profit 1: {fmt_price(sig['tp1'])} (R:R 1:1.5)\n"
+        f"• Take Profit 2: {fmt_price(sig['tp2'])} (R:R 1:2.5)\n"
+        f"• Take Profit 3: {fmt_price(sig['tp3'])} (R:R 1:4)\n\n"
+        f"📋 SCORE: {sig['score']}/{sig['max_score']}\n"
+        f"🎯 CONFIDENCE: {sig['confidence']}%\n\n"
+        f"Checks:\n{checks_text}\n\n"
+        "⚠️ Signal only — no automatic trading.\n"
+        "⚙️ Leverage is a risk-based suggestion, not a guarantee."
+    )
 
 def scanner_loop():
     global scanner_running
@@ -1215,16 +1196,38 @@ def poll_updates():
             time.sleep(3)
 
 
+_services_started = False
+_services_start_lock = threading.Lock()
+
+def start_background_services():
+    """Start Telegram/monitor services once, including when Gunicorn imports bot:app."""
+    global _services_started
+    if _services_started:
+        return
+    with _services_start_lock:
+        if _services_started:
+            return
+        if not TOKEN:
+            raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+        try:
+            requests.post(telegram_url("deleteWebhook"), data={"drop_pending_updates": "false"}, timeout=10)
+        except Exception as e:
+            print(f"TELEGRAM WEBHOOK CLEANUP WARNING: {type(e).__name__}: {e}")
+        threading.Thread(target=poll_updates, name="telegram-poller", daemon=True).start()
+        threading.Thread(target=sender_loop, name="signal-sender", daemon=True).start()
+        threading.Thread(target=monitor_active_signals, name="tp-sl-monitor", daemon=True).start()
+        _services_started = True
+        print("SAIWAN services started: Telegram poller + signal sender + TP/SL monitor")
+
+
+# Gunicorn imports bot:app instead of executing `python bot.py`.
+# Start the background services during the worker's module import so Telegram
+# commands and monitoring work in the Railway/Gunicorn deployment.
+start_background_services()
+
+
 def main():
-    if not TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
-    try:
-        requests.post(telegram_url("deleteWebhook"), data={"drop_pending_updates": "false"}, timeout=10)
-    except Exception as e:
-        print(f"TELEGRAM WEBHOOK CLEANUP WARNING: {type(e).__name__}: {e}")
-    threading.Thread(target=poll_updates, daemon=True).start()
-    threading.Thread(target=sender_loop, daemon=True).start()
-    threading.Thread(target=monitor_active_signals, daemon=True).start()
+    start_background_services()
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
