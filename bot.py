@@ -680,17 +680,10 @@ def _groq_chat_json(system, user_payload, schema_name="saiwan_ai_review", schema
         "temperature": 0.2,
         "max_tokens": max_tokens,
     }
-    if schema is not None:
-        body["response_format"] = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": schema_name,
-                "strict": True,
-                "schema": schema,
-            },
-        }
-    else:
-        body["response_format"] = {"type": "json_object"}
+    # Groq's JSON-schema validation can reject an otherwise valid generation
+    # on some model/runtime combinations. Use JSON Object Mode for reliability;
+    # the prompt + local validation below still enforce the expected fields.
+    body["response_format"] = {"type": "json_object"}
 
     # One AI request at a time. This is the important fix for the 8K TPM
     # organization limit seen during the 466-symbol scan.
@@ -791,7 +784,7 @@ def ai_review_setup(sig, rows5, rows15):
         "Your job is only to decide whether the candidate is timely enough to alert now. "
         "Prefer early entries near the start of a move, but reject setups that are already clearly extended, "
         "invalidated, or contradicted by the supplied closed candles. Never use RSI, volume, MACD, Fibonacci, ATR, "
-        "EMA, indicators, scores, or confidence. Return JSON only with keys: decision (CONFIRM/WAIT/REJECT), "
+        "EMA, indicators, scores, or confidence. Return exactly one valid JSON object and nothing else. The object must contain these keys: decision (CONFIRM/WAIT/REJECT), "
         "timing (EARLY/READY/LATE/INVALID), direction (LONG/SHORT), reason (short string), "
         "reversal_watch (true/false). Do not change the direction unless the supplied ICT structure itself is invalid; "
         "if invalid, use REJECT."
