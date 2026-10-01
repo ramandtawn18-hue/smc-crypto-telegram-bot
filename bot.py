@@ -1,0 +1,408 @@
+"""
+Crypto Signal Bot (Bitget USDT Futures, public data only, signal-only)
+
+Features:
+- Closed-candle signals only (no repainting)
+- Higher-timeframe (1h) trend filter + BTC filter
+- LONG and SHORT, ATR-based stop loss (adapts to volatility)
+- Honest scoring (no fake "confidence %")
+- Every signal saved to SQLite; outcomes tracked automatically (TP1/TP2/TP3/SL)
+- /stats shows REAL win rate and R results
+- Cooldown per symbol, max open signals
+"""
+import os
+import time
+import math
+import sqlite3
+import logging
+import threading
+import requests
+import pandas as pd
+
+# ---------------- CONFIG (env variables) ----------------
+TOKEN = os.environ["TELEGRAM_TOKEN"]
+CHAT_ID = str(os.environ["CHAT_ID"])
+DB_PATH = os.getenv("DB_PATH", "signals.db")      # on Railway: mount a volume, e.g. /data/signals.db
+TF = os.getenv("TF", "15m")                       # signal timeframe
+HTF = os.getenv("HTF", "1h")                      # trend timeframe
+TOP_N = int(os.getenv("TOP_N", "40"))             # scan top N coins by volume
+MIN_24H_VOLUME = float(os.getenv("MIN_24H_VOLUME", "5000000"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "5"))      # out of 6 extra checks
+ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.5"))
+MAX_LEV = int(os.getenv("MAX_LEV", "3"))
+COOLDOWN_H = int(os.getenv("COOLDOWN_H", "8"))
+MAX_OPEN = int(os.getenv("MAX_OPEN", "5"))
+EXPIRE_H = int(os.getenv("EXPIRE_H", "48"))
+
+BASE = "https://api.bitget.com"
+TF_MS = {"5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000}
+PRODUCT = "USDT-FUTURES"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("bot")
+db_lock = threading.Lock()
+
+
+# ---------------- DATABASE ----------------
+def db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+conn = db()
+conn.execute("""CREATE TABLE IF NOT EXISTS signals(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER, symbol TEXT, side TEXT,
+    entry REAL, sl REAL, tp1 REAL, tp2 REAL, tp3 REAL,
+    score INTEGER, rsi REAL, vol REAL,
+    status TEXT DEFAULT 'OPEN', tp_hit INTEGER DEFAULT 0,
+    stop REAL, last_ts INTEGER, closed_ts INTEGER, r REAL)""")
+try:
+    conn.execute("ALTER TABLE signals ADD COLUMN msg_id INTEGER")
+except sqlite3.OperationalError:
+    pass  # column already exists
+conn.commit()
+
+
+def q(sql, args=(), commit=False):
+    with db_lock:
+        cur = conn.execute(sql, args)
+        if commit:
+            conn.commit()
+        return cur.fetchall()
+
+
+# ---------------- TELEGRAM ----------------
+def tg(method, **payload):
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TOKEN}/{method}", json=payload, timeout=40)
+        return r.json()
+    except Exception as e:
+        log.warning("telegram error: %s", e)
+        return {}
+
+
+def send(text, symbol=None, reply_to=None):
+    """Sends a message; if reply_to is given, replies to that original signal message."""
+    payload = dict(chat_id=CHAT_ID, text=text, parse_mode="HTML", disable_web_page_preview=True)
+    if symbol:
+        url = f"https://www.tradingview.com/chart/?symbol=BITGET:{symbol}.P"
+        payload["reply_markup"] = {"inline_keyboard": [[{"text": "📈 TradingView", "url": url}]]}
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+        payload["allow_sending_without_reply"] = True
+    res = tg("sendMessage", **payload)
+    return (res.get("result") or {}).get("message_id")
+
+
+def fmt(p):
+    dec = max(2, 4 - int(math.floor(math.log10(abs(p)))))
+    return f"{p:.{dec}f}"
+
+
+# ---------------- DATA ----------------
+def get_json(path, params):
+    for _ in range(3):
+        try:
+            r = requests.get(BASE + path, params=params, timeout=15)
+            d = r.json()
+            if d.get("code") == "00000":
+                return d["data"]
+        except Exception as e:
+            log.debug("api error %s", e)
+        time.sleep(1)
+    return None
+
+
+def candles(symbol, tf, limit=250, closed_only=True):
+    data = get_json("/api/v2/mix/market/candles",
+                    {"symbol": symbol, "productType": PRODUCT, "granularity": tf, "limit": limit})
+    if not data:
+        return None
+    df = pd.DataFrame(data).iloc[:, :6]
+    df.columns = ["ts", "o", "h", "l", "c", "v"]
+    df = df.astype(float).sort_values("ts").reset_index(drop=True)
+    df["ts"] = df["ts"].astype("int64")
+    if closed_only:
+        df = df[df["ts"] + TF_MS[tf] <= time.time() * 1000].reset_index(drop=True)
+    return df if len(df) > 210 else None
+
+
+def top_symbols():
+    data = get_json("/api/v2/mix/market/tickers", {"productType": PRODUCT})
+    if not data:
+        return []
+    rows = []
+    for t in data:
+        vol = float(t.get("usdtVolume") or t.get("quoteVolume") or 0)
+        if t["symbol"].endswith("USDT") and vol >= MIN_24H_VOLUME:
+            rows.append((vol, t["symbol"]))
+    rows.sort(reverse=True)
+    return [s for _, s in rows[:TOP_N]]
+
+
+# ---------------- INDICATORS ----------------
+def ema(s, n):
+    return s.ewm(span=n, adjust=False).mean()
+
+
+def rsi(s, n=14):
+    d = s.diff()
+    g = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    l = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    return 100 - 100 / (1 + g / l.replace(0, 1e-12))
+
+
+def atr(df, n=14):
+    pc = df["c"].shift()
+    tr = pd.concat([df["h"] - df["l"], (df["h"] - pc).abs(), (df["l"] - pc).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / n, adjust=False).mean()
+
+
+def htf_bias(df):
+    """+1 bullish, -1 bearish, 0 neutral (EMA50 vs EMA200 and price)"""
+    c = df["c"]
+    e50, e200 = ema(c, 50).iloc[-1], ema(c, 200).iloc[-1]
+    if c.iloc[-1] > e200 and e50 > e200:
+        return 1
+    if c.iloc[-1] < e200 and e50 < e200:
+        return -1
+    return 0
+
+
+# ---------------- STRATEGY ----------------
+def analyze(symbol, btc_bias):
+    df = candles(symbol, TF)
+    if df is None:
+        return None
+    hdf = candles(symbol, HTF)
+    if hdf is None:
+        return None
+    bias = htf_bias(hdf)
+    if bias == 0:
+        return None
+    side = "LONG" if bias == 1 else "SHORT"
+    d = bias
+
+    c, h, l, o, v = df["c"], df["h"], df["l"], df["o"], df["v"]
+    e20, e50 = ema(c, 20), ema(c, 50)
+    r = rsi(c)
+    a = atr(df)
+    price, a_now = c.iloc[-1], a.iloc[-1]
+    rng = h.iloc[-1] - l.iloc[-1]
+    if rng <= 0:
+        return None
+    vol_ratio = v.iloc[-1] / v.iloc[-21:-1].mean()
+
+    # ---- hard gates (all required) ----
+    if side == "LONG":
+        breakout = price > h.iloc[-21:-1].max()
+        strong = price > o.iloc[-1] and (price - l.iloc[-1]) / rng >= 0.7
+    else:
+        breakout = price < l.iloc[-21:-1].min()
+        strong = price < o.iloc[-1] and (h.iloc[-1] - price) / rng >= 0.7
+    if not (breakout and strong and vol_ratio >= 1.5):
+        return None
+
+    # ---- scored checks ----
+    if side == "LONG":
+        checks = {
+            "EMA alignment (20>50)": e20.iloc[-1] > e50.iloc[-1],
+            "RSI 50-68": 50 <= r.iloc[-1] <= 68,
+            "Higher-low structure": l.iloc[-5:].min() > l.iloc[-15:-5].min(),
+        }
+    else:
+        checks = {
+            "EMA alignment (20<50)": e20.iloc[-1] < e50.iloc[-1],
+            "RSI 32-50": 32 <= r.iloc[-1] <= 50,
+            "Lower-high structure": h.iloc[-5:].max() < h.iloc[-15:-5].max(),
+        }
+    checks["Not overextended (<2 ATR from EMA20)"] = abs(price - e20.iloc[-1]) < 2 * a_now
+    checks["No spike candle (<2.5 ATR)"] = rng < 2.5 * a_now
+    checks["BTC not against"] = btc_bias in (0, d)
+    score = sum(checks.values())
+    if score < MIN_SCORE:
+        return None
+
+    sl_dist = ATR_SL_MULT * a_now
+    entry = price
+    sl = entry - d * sl_dist
+    tps = [entry + d * sl_dist * m for m in (1.0, 2.0, 3.0)]
+    sl_pct = sl_dist / entry
+    lev = max(1, min(MAX_LEV, int(0.5 / sl_pct)))
+    return dict(symbol=symbol, side=side, entry=entry, sl=sl, tp=tps, score=score,
+                rsi=float(r.iloc[-1]), vol=float(vol_ratio), sl_pct=sl_pct, lev=lev,
+                checks=checks, candle_ts=int(df["ts"].iloc[-1]))
+
+
+def format_signal(s):
+    icon = "🟢" if s["side"] == "LONG" else "🔴"
+    ck = "\n".join(f"{'✅' if ok else '❌'} {k}" for k, ok in s["checks"].items())
+    wr = stats_text(short=True)
+    return (
+        f"🚀 <b>NEW SIGNAL</b>\n\n"
+        f"{icon} <b>{s['side']}</b>  {s['symbol']} (Bitget Futures)\n"
+        f"⏱ {TF}  |  Trend filter: {HTF}\n\n"
+        f"Entry: <code>{fmt(s['entry'])}</code>  (only if price is still near)\n"
+        f"Stop Loss: <code>{fmt(s['sl'])}</code>  ({s['sl_pct']*100:.2f}%)\n"
+        f"TP1: <code>{fmt(s['tp'][0])}</code>  (1R) → move SL to entry\n"
+        f"TP2: <code>{fmt(s['tp'][1])}</code>  (2R)\n"
+        f"TP3: <code>{fmt(s['tp'][2])}</code>  (3R)\n\n"
+        f"RSI {s['rsi']:.1f} | Volume {s['vol']:.2f}x\n"
+        f"Score: {s['score']}/6\n{ck}\n\n"
+        f"💰 Risk max 1% of account. Max leverage: {s['lev']}x\n"
+        f"📊 {wr}\n\n"
+        f"⚠️ Signal only. Not financial advice. No win is guaranteed."
+    )
+
+
+# ---------------- OUTCOME TRACKING ----------------
+R_BY_TP_ON_STOP = {0: -1.0, 1: 0.33, 2: 1.0}   # 1/3 closed at each TP, rest stopped at breakeven
+
+
+def track():
+    rows = q("SELECT * FROM signals WHERE status='OPEN'")
+    for s in rows:
+        df = candles(s["symbol"], TF, limit=300, closed_only=True)
+        time.sleep(0.15)
+        if df is None:
+            continue
+        d = 1 if s["side"] == "LONG" else -1
+        stop, tp_hit, last_ts = s["stop"], s["tp_hit"], s["last_ts"]
+        tps = [s["tp1"], s["tp2"], s["tp3"]]
+        final = None
+        for _, k in df[df["ts"] > last_ts].iterrows():
+            last_ts = int(k["ts"])
+            # conservative: stop is checked first inside the same candle
+            hit_stop = k["l"] <= stop if d == 1 else k["h"] >= stop
+            if hit_stop:
+                final = ("SL" if tp_hit == 0 else "BE", R_BY_TP_ON_STOP[tp_hit])
+                break
+            while tp_hit < 3 and ((k["h"] >= tps[tp_hit]) if d == 1 else (k["l"] <= tps[tp_hit])):
+                tp_hit += 1
+                send(f"🎯 <b>TP{tp_hit} HIT</b> — {s['symbol']} {s['side']}"
+                     + ("\nMove SL to entry." if tp_hit == 1 else ""),
+                     reply_to=s["msg_id"])
+                if tp_hit == 1:
+                    stop = s["entry"]
+            if tp_hit == 3:
+                final = ("TP3", 2.0)
+                break
+        if final is None and (time.time() * 1000 - s["ts"]) > EXPIRE_H * 3_600_000:
+            final = ("EXPIRED", R_BY_TP_ON_STOP.get(tp_hit, 0.0) if tp_hit else 0.0)
+        if final:
+            status, rr = final
+            q("UPDATE signals SET status=?, tp_hit=?, stop=?, last_ts=?, closed_ts=?, r=? WHERE id=?",
+              (status, tp_hit, stop, last_ts, int(time.time() * 1000), rr, s["id"]), commit=True)
+            if status == "SL":
+                send(f"🛑 <b>SL HIT</b> — {s['symbol']} {s['side']}  ({rr:+.2f}R)", reply_to=s["msg_id"])
+            elif status == "BE":
+                send(f"⚪ <b>Closed at breakeven after TP{tp_hit}</b> — {s['symbol']} ({rr:+.2f}R)", reply_to=s["msg_id"])
+            elif status == "TP3":
+                send(f"🏆 <b>ALL TARGETS HIT</b> — {s['symbol']} {s['side']} ({rr:+.2f}R)", reply_to=s["msg_id"])
+            else:
+                send(f"⌛ Signal expired — {s['symbol']}", reply_to=s["msg_id"])
+        else:
+            q("UPDATE signals SET tp_hit=?, stop=?, last_ts=? WHERE id=?",
+              (tp_hit, stop, last_ts, s["id"]), commit=True)
+
+
+# ---------------- STATS ----------------
+def stats_text(short=False):
+    rows = q("SELECT * FROM signals WHERE status!='OPEN' AND status!='EXPIRED'")
+    n = len(rows)
+    if n < 20:
+        return f"Real stats: not enough data yet ({n}/20 closed signals)"
+    wins = sum(1 for r in rows if r["r"] > 0)
+    tot = sum(r["r"] for r in rows)
+    base = f"Real win rate: {wins/n*100:.0f}% ({n} signals) | Avg {tot/n:+.2f}R"
+    if short:
+        return base
+    longs = [r for r in rows if r["side"] == "LONG"]
+    shorts = [r for r in rows if r["side"] == "SHORT"]
+
+    def part(name, lst):
+        if not lst:
+            return ""
+        w = sum(1 for r in lst if r["r"] > 0)
+        return f"\n{name}: {w}/{len(lst)} wins, {sum(r['r'] for r in lst):+.1f}R"
+    sl = sum(1 for r in rows if r["status"] == "SL")
+    tp3 = sum(1 for r in rows if r["status"] == "TP3")
+    return (f"📊 <b>REAL STATS</b>\n{base}\nTotal: {tot:+.1f}R\n"
+            f"SL: {sl} | Full TP3: {tp3}" + part("LONG", longs) + part("SHORT", shorts))
+
+
+# ---------------- SCANNER ----------------
+def scan():
+    open_n = q("SELECT COUNT(*) c FROM signals WHERE status='OPEN'")[0]["c"]
+    if open_n >= MAX_OPEN:
+        log.info("max open reached")
+        return
+    btc = candles("BTCUSDT", HTF)
+    btc_b = htf_bias(btc) if btc is not None else 0
+    for sym in top_symbols():
+        if open_n >= MAX_OPEN:
+            break
+        recent = q("SELECT 1 FROM signals WHERE symbol=? AND ts>?",
+                   (sym, int((time.time() - COOLDOWN_H * 3600) * 1000)))
+        if recent:
+            continue
+        try:
+            s = analyze(sym, btc_b)
+        except Exception as e:
+            log.warning("%s analyze error: %s", sym, e)
+            continue
+        time.sleep(0.2)
+        if not s:
+            continue
+        q("""INSERT INTO signals(ts,symbol,side,entry,sl,tp1,tp2,tp3,score,rsi,vol,stop,last_ts)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (int(time.time() * 1000), sym, s["side"], s["entry"], s["sl"], *s["tp"],
+           s["score"], s["rsi"], s["vol"], s["sl"], s["candle_ts"]), commit=True)
+        mid = send(format_signal(s), symbol=sym)
+        q("UPDATE signals SET msg_id=? WHERE id=(SELECT MAX(id) FROM signals WHERE symbol=?)",
+          (mid, sym), commit=True)
+        open_n += 1
+        log.info("signal %s %s", sym, s["side"])
+
+
+def scanner_loop():
+    step = TF_MS[TF] / 1000
+    while True:
+        try:
+            time.sleep(step - (time.time() % step) + 8)   # wait for candle close
+            track()
+            scan()
+        except Exception as e:
+            log.exception("loop error: %s", e)
+            time.sleep(30)
+
+
+# ---------------- COMMANDS ----------------
+def commands_loop():
+    offset = 0
+    while True:
+        res = tg("getUpdates", offset=offset, timeout=30)
+        for u in res.get("result", []):
+            offset = u["update_id"] + 1
+            m = u.get("message") or {}
+            if str(m.get("chat", {}).get("id")) != CHAT_ID:
+                continue
+            t = (m.get("text") or "").split("@")[0].strip().lower()
+            if t == "/stats":
+                send(stats_text())
+            elif t == "/open":
+                rows = q("SELECT * FROM signals WHERE status='OPEN'")
+                send("\n".join(f"{r['symbol']} {r['side']} entry {fmt(r['entry'])} TP hit: {r['tp_hit']}"
+                               for r in rows) or "No open signals.")
+            elif t in ("/start", "/help"):
+                send("Commands:\n/stats — real results\n/open — open signals")
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    log.info("Bot started")
+    send("✅ Bot started.")
+    threading.Thread(target=commands_loop, daemon=True).start()
+    scanner_loop()
