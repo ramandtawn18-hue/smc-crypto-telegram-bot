@@ -19,8 +19,9 @@ BITGET_PRODUCT = "USDT-FUTURES"
 TELEGRAM_API = "https://api.telegram.org/bot"
 
 TF_15M = "15m"
-TIMEFRAME = TF_15M
-CANDLE_LIMIT = 220
+TF_5M = "5m"
+TIMEFRAME = TF_5M
+CANDLE_LIMIT = 260
 # 0 = scan every eligible Bitget USDT perpetual contract (no top-N cap)
 MAX_PAIRS = 0
 SCAN_WORKERS = 6
@@ -55,7 +56,7 @@ active_signals = {}  # key -> tracked signal state for TP/SL notifications
 monitor_thread = None
 
 session = requests.Session()
-session.headers.update({"User-Agent": "Trend-RSI-Volatility-Telegram-Bot/4.0", "Accept": "application/json"})
+session.headers.update({"User-Agent": "SAIWAN-Crypto-Signal-Move-Hunter/5.0", "Accept": "application/json"})
 bitget_rate_lock = threading.Lock()
 bitget_last_request = 0.0
 BITGET_MIN_REQUEST_INTERVAL = 0.06  # ~16.7 requests/sec, below Bitget's 20 req/sec/IP limit
@@ -134,38 +135,26 @@ def get_tickers():
     return payload.get("data") or []
 
 
-def get_klines(symbol, interval="15m", limit=CANDLE_LIMIT):
+def get_klines(symbol, interval=TIMEFRAME, limit=CANDLE_LIMIT):
     payload = bitget_get(
         "/api/v2/mix/market/candles",
-        {
-            "symbol": symbol,
-            "productType": BITGET_PRODUCT,
-            "granularity": interval,
-            "limit": min(limit, 1000),
-            "kLineType": "market",
-        },
+        {"symbol": symbol, "productType": BITGET_PRODUCT, "granularity": interval,
+         "limit": min(limit, 1000), "kLineType": "market"},
     )
     raw = payload.get("data") or []
     now_ms = int(time.time() * 1000)
-    candle_ms = 15 * 60 * 1000
+    candle_ms = (5 if interval == TF_5M else 15) * 60 * 1000
     rows = []
     for v in raw:
         try:
             if len(v) < 6:
                 continue
             ts = int(v[0])
-            # Exclude the currently forming 15m candle.
             if ts + candle_ms > now_ms:
                 continue
-            rows.append({
-                "time": ts // 1000,
-                "open": float(v[1]),
-                "high": float(v[2]),
-                "low": float(v[3]),
-                "close": float(v[4]),
-                "vol": float(v[5]),
-                "turnover": float(v[6]) if len(v) > 6 else 0.0,
-            })
+            rows.append({"time": ts // 1000, "open": float(v[1]), "high": float(v[2]),
+                         "low": float(v[3]), "close": float(v[4]), "vol": float(v[5]),
+                         "turnover": float(v[6]) if len(v) > 6 else 0.0})
         except (TypeError, ValueError, IndexError):
             continue
     rows.sort(key=lambda x: x["time"])
@@ -520,53 +509,45 @@ def _sweep_candidates(rows):
     return out
 
 
-def analyze(symbol, rows15):
-    """ICT 2022 price-action model: Liquidity Sweep -> MSS/CHOCH -> FVG/OB retest."""
-    if len(rows15) < 100:
-        return None
-    rows = rows15
-    candidates = _sweep_candidates(rows)
-    if not candidates:
-        return None
+def _context_15m(rows15, direction):
+    if not rows15 or len(rows15) < 20:
+        return "UNKNOWN"
+    recent = rows15[-8:]
+    hi = max(r["high"] for r in recent)
+    lo = min(r["low"] for r in recent)
+    mid = (hi + lo) / 2
+    return ("BULLISH CONTEXT" if rows15[-1]["close"] >= mid else "MIXED CONTEXT") if direction == "LONG" else ("BEARISH CONTEXT" if rows15[-1]["close"] <= mid else "MIXED CONTEXT")
 
-    # Prefer the most recent valid sweep whose full sequence is now confirmed.
-    for direction, sweep_idx, liquidity in reversed(candidates):
-        if sweep_idx >= len(rows) - 1:
+
+def _move_setup(rows, direction):
+    """Early move hunter: sweep -> MSS/CHOCH -> FVG + OB. No retest wait."""
+    if len(rows) < 120:
+        return None
+    candidates = _sweep_candidates(rows)
+    for direction0, sweep_idx, liquidity in reversed(candidates):
+        if direction0 != direction or sweep_idx >= len(rows) - 1:
             continue
         structure = _structure_break(rows, direction, sweep_idx, len(rows) - 1)
         if not structure:
             continue
         mss_idx = structure["index"]
-        fvg = _find_fvg(rows, direction, mss_idx - 1, len(rows))
-        if not fvg or fvg["index"] <= mss_idx:
+        # FVG is allowed on the MSS candle or within the next few closed candles.
+        fvg = _find_fvg(rows, direction, max(2, mss_idx - 1), min(len(rows), mss_idx + 5))
+        if not fvg:
             continue
-        ob = _find_order_block(rows, direction, fvg["index"])
+        ob = _find_order_block(rows, direction, fvg["index"] + 1)
         if not ob:
             continue
         zone = _overlap(fvg, ob) or fvg
+        trigger_idx = max(mss_idx, fvg["index"])
+        if len(rows) - 1 - trigger_idx > 4:
+            continue
+        trigger = rows[trigger_idx]
+        if direction == "LONG" and not _candle_bull(trigger):
+            continue
+        if direction == "SHORT" and not _candle_bear(trigger):
+            continue
         cur = rows[-1]
-        # Signal only when the latest CLOSED candle returns to the FVG/OB area
-        # and reacts in the expected direction.
-        touched = cur["low"] <= zone["high"] and cur["high"] >= zone["low"]
-        if not touched:
-            # Allow the immediately previous closed candle to make the touch,
-            # with the current candle confirming the rejection.
-            if len(rows) < 2:
-                continue
-            prev = rows[-2]
-            prev_touched = prev["low"] <= zone["high"] and prev["high"] >= zone["low"]
-            if not prev_touched:
-                continue
-            confirm = _candle_bull(cur) if direction == "LONG" else _candle_bear(cur)
-            if not confirm:
-                continue
-        else:
-            confirm = _candle_bull(cur) if direction == "LONG" else _candle_bear(cur)
-            if not confirm:
-                continue
-
-        # CHOCH/MSS must remain valid: the current close cannot invalidate the
-        # displacement structure before entry.
         if direction == "LONG" and cur["close"] <= structure["level"]:
             continue
         if direction == "SHORT" and cur["close"] >= structure["level"]:
@@ -575,35 +556,25 @@ def analyze(symbol, rows15):
         entry = cur["close"]
         if direction == "LONG":
             sl = min(liquidity, ob["low"]) * 0.9995
-            if sl >= entry:
-                continue
-            future_highs = [p for _, p in swing_points(rows[max(0, mss_idx-10):], 2, 2)[0] if p > entry]
-            targets = sorted(set(future_highs))
-            # Prefer external liquidity above entry.
-            tp1 = targets[0] if targets else entry + (entry - sl) * 2.0
-            tp2 = targets[1] if len(targets) > 1 else entry + (entry - sl) * 3.0
-            tp3 = targets[2] if len(targets) > 2 else entry + (entry - sl) * 4.0
+            if sl >= entry: continue
+            risk = entry - sl
+            highs, _ = swing_points(rows[:-1], 2, 2)
+            targets = sorted({p for _, p in highs if p > entry})
+            tp1 = max(targets[0] if targets else entry + risk*1.5, entry + risk*1.5)
+            tp2 = max(targets[1] if len(targets)>1 else entry + risk*2.5, tp1 + risk*.5)
+            tp3 = max(targets[2] if len(targets)>2 else entry + risk*4.0, tp2 + risk*.5)
         else:
             sl = max(liquidity, ob["high"]) * 1.0005
-            if sl <= entry:
-                continue
-            future_lows = [p for _, p in swing_points(rows[max(0, mss_idx-10):], 2, 2)[1] if p < entry]
-            targets = sorted(set(future_lows), reverse=True)
-            tp1 = targets[0] if targets else entry - (sl - entry) * 2.0
-            tp2 = targets[1] if len(targets) > 1 else entry - (sl - entry) * 3.0
-            tp3 = targets[2] if len(targets) > 2 else entry - (sl - entry) * 4.0
-
-        if direction == "LONG":
-            tp1 = max(tp1, entry + (entry-sl)*1.5)
-            tp2 = max(tp2, tp1 + (entry-sl)*0.5)
-            tp3 = max(tp3, tp2 + (entry-sl)*0.5)
-        else:
-            tp1 = min(tp1, entry - (sl-entry)*1.5)
-            tp2 = min(tp2, tp1 - (sl-entry)*0.5)
-            tp3 = min(tp3, tp2 - (sl-entry)*0.5)
+            if sl <= entry: continue
+            risk = sl - entry
+            _, lows = swing_points(rows[:-1], 2, 2)
+            targets = sorted({p for _, p in lows if p < entry}, reverse=True)
+            tp1 = min(targets[0] if targets else entry - risk*1.5, entry - risk*1.5)
+            tp2 = min(targets[1] if len(targets)>1 else entry - risk*2.5, tp1 - risk*.5)
+            tp3 = min(targets[2] if len(targets)>2 else entry - risk*4.0, tp2 - risk*.5)
 
         return {
-            "symbol": symbol, "direction": direction,
+            "symbol": "", "direction": direction,
             "structure": "Liquidity Sweep + MSS + CHOCH + FVG + OB",
             "entry": entry, "trigger_level": structure["level"], "sl": sl,
             "tp1": tp1, "tp2": tp2, "tp3": tp3,
@@ -612,13 +583,27 @@ def analyze(symbol, rows15):
             "liquidity": liquidity, "sweep_index": sweep_idx,
             "mss_index": mss_idx, "mss_level": structure["level"],
             "fvg": fvg, "ob": ob, "entry_zone": zone,
-            "rows": rows[max(0, min(sweep_idx - 10, len(rows) - 110)):],
-            "full_len": len(rows),
+            "rows": rows[max(0, sweep_idx-18):], "full_len": len(rows),
             "checks": {"Liquidity Sweep": True, "MSS": True, "FVG": True, "OB": True, "CHOCH": True},
-            "retest_ok": True, "rejection_ok": True,
+            "retest_ok": False, "rejection_ok": True, "early_entry": True,
         }
     return None
 
+
+def analyze(symbol, rows5, rows15=None):
+    """SAIWAN Move Hunter: 5m entry hunting with 15m context, price action only."""
+    if len(rows5) < 120:
+        return None
+    for r in rows5: r["symbol"] = symbol
+    candidates = []
+    for direction in ("LONG", "SHORT"):
+        sig = _move_setup(rows5, direction)
+        if sig:
+            sig["symbol"] = symbol
+            sig["context15"] = _context_15m(rows15, direction)
+            sig["timeframe"] = "5m Entry · 15m Context"
+            candidates.append(sig)
+    return max(candidates, key=lambda x: x["time"]) if candidates else None
 
 def make_chart(sig):
     """Render the ICT 2022 setup with every signal component annotated."""
@@ -683,10 +668,10 @@ def make_chart(sig):
     arrow_color = UP if direction == "LONG" else DOWN
     ax.scatter([n-1], [entry], s=42, color=arrow_color, edgecolor="white", linewidth=.8, zorder=9)
     ax.annotate(direction, xy=(n-1, entry), xytext=(max(0,n-15), entry), arrowprops=dict(arrowstyle="->", color=arrow_color, lw=1.7), color=arrow_color, fontsize=10, fontweight="bold")
-    ax.text(.01, 1.055, f"{sig['symbol']} · SAIWAN CRYPTO SIGNAL · 15m · Bitget Futures", transform=ax.transAxes, fontsize=15, color=TEXT, fontweight="bold")
+    ax.text(.01, 1.055, f"{sig['symbol']} · SAIWAN CRYPTO SIGNAL · 5m ENTRY · Bitget Futures", transform=ax.transAxes, fontsize=15, color=TEXT, fontweight="bold")
     ax.text(.01, 1.018, "LIQUIDITY SWEEP → MSS → CHOCH → FVG → OB → ENTRY", transform=ax.transAxes, fontsize=9.5, color=PURPLE, fontweight="bold")
     ax.text(.99, 1.018, direction, transform=ax.transAxes, fontsize=11, color=arrow_color, fontweight="bold", ha="right")
-    ax.text(.01, .018, "Only ICT 2022 price-action components are shown · 15m closed candle", transform=ax.transAxes, fontsize=8.2, color=MUTED)
+    ax.text(.01, .018, "SAIWAN Move Hunter · 5m closed entry · 15m context · ICT price action only", transform=ax.transAxes, fontsize=8.2, color=MUTED)
 
     ax.yaxis.tick_right(); ax.tick_params(axis="y", colors=TEXT, labelsize=8.3, length=0)
     ax.tick_params(axis="x", colors=MUTED, labelsize=8, length=0, pad=8)
@@ -742,10 +727,10 @@ def status_text():
             "BOT STATUS: ONLINE\n"
             f"Scanner: {'RUNNING' if scanner_running else 'STOPPED'}\n"
             "Market: Bitget USDT Perpetual Futures (full eligible market)\n"
-            "Strategy: SAIWAN CRYPTO SIGNAL\n"
-            "Model: Liquidity Sweep + MSS + FVG + OB + CHOCH\n"
+            "Strategy: SAIWAN CRYPTO SIGNAL — Move Hunter\n"
+            "Model: SAIWAN Move Hunter — Liquidity Sweep + MSS + CHOCH + FVG + OB\n"
             "Data source: Bitget Futures market data\n"
-            "Scan: 15m closed candles only\n"
+            "Scan: 5m closed candles + 15m context\n"
             f"Pending signals: {len(pending_signals)}\n"
             f"Tracked signals: {len(active_signals)}\n"
             "Chart: ICT components annotated\n"
@@ -786,10 +771,11 @@ def scan_once():
 
     def check_symbol(symbol):
         try:
-            rows = get_klines(symbol)
-            if len(rows) < 80:
+            rows5 = get_klines(symbol, TF_5M, CANDLE_LIMIT)
+            rows15 = get_klines(symbol, TF_15M, 180)
+            if len(rows5) < 120 or len(rows15) < 30:
                 return symbol, None, None
-            return symbol, analyze(symbol, rows), None
+            return symbol, analyze(symbol, rows5, rows15), None
         except Exception as e:
             return symbol, None, e
 
@@ -826,7 +812,7 @@ def scan_once():
 
     total_errors = sum(error_buckets.values())
     summary = ", ".join(f"{name}={count}" for name, count in sorted(error_buckets.items(), key=lambda kv: kv[1], reverse=True)[:4])
-    print(f"Bitget 15m scan: universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
+    print(f"Bitget Move Hunter scan: universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
     if not contracts:
         print("Bitget warning: no contracts returned from /api/v2/mix/market/contracts")
     elif not tickers:
@@ -838,15 +824,17 @@ def scan_once():
 def signal_caption(sig):
     d = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
     return (
-        f"🚀 ICT 2022 SIGNAL\n\n{d}\n"
+        f"🚀 SAIWAN CRYPTO SIGNAL\n\n{d}\n"
         f"⭐ {sig['symbol']} · Bitget Futures\n"
-        f"⏱ 15m\n\n"
+        f"⏱ 5m Entry · 15m Context\n\n"
         "Liquidity Sweep ✓  ·  MSS ✓  ·  CHOCH ✓  ·  FVG ✓  ·  OB ✓\n"
+        f"15m Context: {sig.get('context15','UNKNOWN')}\n"
         f"Entry: {fmt_price(sig['entry'])}\n"
         f"SL: {fmt_price(sig['sl'])}\n"
         f"TP1: {fmt_price(sig['tp1'])}\n"
         f"TP2: {fmt_price(sig['tp2'])}\n"
         f"TP3: {fmt_price(sig['tp3'])}\n\n"
+        "⚡ Early move setup — closed candles only.\n"
         "⚠️ Signal only — no automatic trading."
     )
 
@@ -1019,16 +1007,16 @@ def poll_updates():
                         "/stop - Stop scanner\n"
                         "/status - Bot status\n\n"
                         "Market: Bitget USDT Perpetual Futures\n"
-                        "Timeframe: 15m closed candles only\n"
-                        "Model: Liquidity Sweep + MSS + FVG + OB + CHOCH\n"
-                        "Chart: all ICT components are annotated\n"
+                        "Timeframe: 5m entry + 15m context\n"
+                        "Model: SAIWAN Move Hunter — Liquidity Sweep + MSS + CHOCH + FVG + OB\n"
+                        "Chart: professional 5m setup map with all ICT components\n"
                         "TP/SL monitoring: ENABLED")
                 elif text.startswith("/scan"):
                     start_scanner(active_chat_id)
                     send_message(active_chat_id,
                         "🚀 SAIWAN CRYPTO SIGNAL SCANNER STARTED\n\n"
-                        "15m closed candles only.\n"
-                        "Signal requires: Liquidity Sweep + MSS + FVG + OB + CHOCH.\n"
+                        "5m closed candles for early entries + 15m context.\n"
+                        "Signal hunts: Liquidity Sweep + MSS + CHOCH + FVG + OB.\n"
                         "The chart will mark every ICT component used.\n"
                         "TP/SL monitoring is enabled.")
                 elif text.startswith("/stop"):
