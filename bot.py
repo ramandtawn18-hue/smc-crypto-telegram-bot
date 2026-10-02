@@ -37,8 +37,7 @@ SAIWAN_AI_API_KEY = os.getenv("SAIWAN_AI_API_KEY", "")
 saiwan_ai_client = bool(SAIWAN_AI_URL and SAIWAN_AI_API_KEY)
 AI_REQUIRED = os.getenv("AI_REQUIRED", "true").strip().lower() not in {"0", "false", "no", "off"}
 AI_TIMEOUT = 15
-# SAIWAN AI is private/self-hosted. Serialize AI calls and keep a small gap
-# between requests so a full market scan does not burst requests into the service.
+# Serialize private SAIWAN AI calls and keep a small gap between requests.
 AI_MIN_INTERVAL = float(os.getenv("AI_MIN_INTERVAL", "3.0"))
 AI_MAX_RETRIES = 2
 # AI is only used for the strongest ICT candidates after the full market scan.
@@ -537,95 +536,157 @@ def _context_15m(rows15, direction):
 
 
 def _move_setup(rows, direction):
-    """Early move hunter: sweep -> MSS/CHOCH -> FVG + OB. No retest wait."""
+    """Build an early ICT setup from the liquidity-sweep origin.
+
+    Core rule:
+      LONG  = sell-side sweep -> bullish MSS/CHOCH -> OB/FVG origin
+      SHORT = buy-side sweep  -> bearish MSS/CHOCH -> OB/FVG origin
+
+    The execution price is taken from the OB/FVG origin zone, not from the
+    latest market close. If the move has already extended too far away from
+    that origin, the setup is rejected rather than chased.
+    """
     if len(rows) < 120:
         return None
+
     candidates = _sweep_candidates(rows)
     for direction0, sweep_idx, liquidity in reversed(candidates):
         if direction0 != direction or sweep_idx >= len(rows) - 1:
             continue
+
+        # The sweep must be recent enough to still represent the current move.
+        if len(rows) - 1 - sweep_idx > 8:
+            continue
+
+        sweep_candle = rows[sweep_idx]
         structure = _structure_break(rows, direction, sweep_idx, len(rows) - 1)
         if not structure:
             continue
         mss_idx = structure["index"]
-        # FVG is allowed on the MSS candle or within the next few closed candles.
-        fvg = _find_fvg(rows, direction, max(2, mss_idx - 1), min(len(rows), mss_idx + 5))
-        if not fvg:
+        if mss_idx <= sweep_idx or mss_idx - sweep_idx > 6:
             continue
+
+        # Require real displacement after the sweep.
+        displacement = rows[mss_idx]
+        if _body_ratio(displacement) < 0.45:
+            continue
+        if direction == "LONG" and displacement["close"] <= displacement["open"]:
+            continue
+        if direction == "SHORT" and displacement["close"] >= displacement["open"]:
+            continue
+
+        # FVG must belong to the post-sweep displacement leg.
+        fvg = _find_fvg(rows, direction, max(2, mss_idx - 1), min(len(rows), mss_idx + 4))
+        if not fvg or fvg["index"] <= sweep_idx:
+            continue
+
         ob = _find_order_block(rows, direction, fvg["index"] + 1)
-        if not ob:
-            continue
-        zone = _overlap(fvg, ob) or fvg
-        trigger_idx = max(mss_idx, fvg["index"])
-        if len(rows) - 1 - trigger_idx > 4:
-            continue
-        trigger = rows[trigger_idx]
-        if direction == "LONG" and not _candle_bull(trigger):
-            continue
-        if direction == "SHORT" and not _candle_bear(trigger):
-            continue
-        cur = rows[-1]
-        if direction == "LONG" and cur["close"] <= structure["level"]:
-            continue
-        if direction == "SHORT" and cur["close"] >= structure["level"]:
+        if not ob or ob["index"] <= sweep_idx:
             continue
 
-        entry = cur["close"]
+        # Prefer the actual OB/FVG overlap as the execution origin. If they do
+        # not overlap, use the OB itself; both are still anchored to the sweep.
+        zone = _overlap(fvg, ob) or dict(ob)
+        if zone["high"] <= zone["low"]:
+            continue
+
+        # Keep the entry at the setup origin, never at the latest close.
+        entry = (zone["low"] + zone["high"]) / 2.0
+        cur = rows[-1]["close"]
+        zone_width = max(zone["high"] - zone["low"], cur * 1e-9)
+
+        # Do not chase a move that has already escaped its origin zone.
+        # A small extension is acceptable because the signal is a limit-style
+        # origin entry; a large extension is rejected completely.
         if direction == "LONG":
-            # Keep the stop behind the nearest valid setup structure.
-            # The old version used the original liquidity sweep itself, which
-            # could place SL far away after a large displacement.
-            stop_anchor = max(liquidity, ob["low"], zone["low"])
-            sl = stop_anchor * 0.9995
-            if sl >= entry: continue
-            risk = entry - sl
-
-            # TP1 is the nearest opposing liquidity/swing above entry.
-            # Do NOT force TP1 to 1.5R when that would push it much farther
-            # away than the actual market structure (e.g. USUSDT ~0.029).
-            highs, _ = swing_points(rows[:-1], 2, 2)
-            targets = sorted({p for _, p in highs if p > entry * 1.002})
-            if targets:
-                tp1 = targets[0]
-                remaining = [p for p in targets[1:] if p > tp1 * 1.002]
-                tp2 = remaining[0] if remaining else max(tp1 + risk, entry + risk*2.0)
-                remaining2 = [p for p in remaining[1:] if p > tp2 * 1.002]
-                tp3 = remaining2[0] if remaining2 else max(tp2 + risk, entry + risk*3.0)
-            else:
-                tp1 = entry + risk*1.5
-                tp2 = entry + risk*2.5
-                tp3 = entry + risk*4.0
+            if cur < zone["low"]:
+                # Price below the origin means the setup has not confirmed cleanly.
+                continue
+            extension = max(0.0, cur - zone["high"]) / zone_width
         else:
-            # Same principle for shorts: use the nearest structural
-            # invalidation, not the distant original sweep.
-            stop_anchor = min(liquidity, ob["high"], zone["high"])
-            sl = stop_anchor * 1.0005
-            if sl <= entry: continue
+            if cur > zone["high"]:
+                continue
+            extension = max(0.0, zone["low"] - cur) / zone_width
+        if extension > 2.0:
+            continue
+
+        # Structural invalidation: the sweep extreme and the OB must remain
+        # intact. No fixed 0.05%/0.1% percentage padding and no ATR.
+        if direction == "LONG":
+            protected_low = min(sweep_candle["low"], ob["low"], zone["low"])
+            sl = protected_low
+            if sl >= entry:
+                continue
+            risk = entry - sl
+        else:
+            protected_high = max(sweep_candle["high"], ob["high"], zone["high"])
+            sl = protected_high
+            if sl <= entry:
+                continue
             risk = sl - entry
 
-            _, lows = swing_points(rows[:-1], 2, 2)
-            targets = sorted({p for _, p in lows if p < entry * 0.998}, reverse=True)
-            if targets:
-                tp1 = targets[0]
-                remaining = [p for p in targets[1:] if p < tp1 * 0.998]
-                tp2 = remaining[0] if remaining else min(tp1 - risk, entry - risk*2.0)
-                remaining2 = [p for p in remaining[1:] if p < tp2 * 0.998]
-                tp3 = remaining2[0] if remaining2 else min(tp2 - risk, entry - risk*3.0)
-            else:
-                tp1 = entry - risk*1.5
-                tp2 = entry - risk*2.5
-                tp3 = entry - risk*4.0
+        # Reject structurally invalid or unusably tight stops; never widen them
+        # artificially just to make the signal pass.
+        min_structural_risk = max(zone_width * 0.50, abs(entry) * 0.0005)
+        if risk < min_structural_risk:
+            continue
+
+        # TP targets come only from opposing liquidity/confirmed swing structure.
+        # No R-multiple fallback: if there are not enough structural targets,
+        # keep the setup out of the signal queue instead of inventing targets.
+        highs, lows = swing_points(rows[:mss_idx + 1], 2, 2)
+        if direction == "LONG":
+            targets = sorted({p for _, p in highs if p > entry * 1.0005})
+            targets = [p for p in targets if p > entry and p < cur * 10]
+        else:
+            targets = sorted({p for _, p in lows if p < entry * 0.9995}, reverse=True)
+            targets = [p for p in targets if p < entry and p > cur / 10]
+
+        # Include the post-sweep structure's opposing liquidity if available.
+        if direction == "LONG":
+            later_highs, _ = swing_points(rows[mss_idx + 1:], 2, 2)
+            targets += [p for _, p in later_highs if p > entry]
+            targets = sorted(set(targets))
+        else:
+            _, later_lows = swing_points(rows[mss_idx + 1:], 2, 2)
+            targets += [p for _, p in later_lows if p < entry]
+            targets = sorted(set(targets), reverse=True)
+
+        if len(targets) < 3:
+            continue
+
+        tp1, tp2, tp3 = targets[0], targets[1], targets[2]
+        if direction == "LONG":
+            # If price has already passed a target before the origin entry can
+            # fill, that target is no longer a valid forward objective.
+            floor = max(entry, cur)
+            targets = [p for p in targets if p > floor]
+        else:
+            ceiling = min(entry, cur)
+            targets = [p for p in targets if p < ceiling]
+        if len(targets) < 3:
+            continue
+        tp1, tp2, tp3 = targets[0], targets[1], targets[2]
+        if direction == "LONG" and not (entry < tp1 < tp2 < tp3):
+            continue
+        if direction == "SHORT" and not (entry > tp1 > tp2 > tp3):
+            continue
 
         return {
             "symbol": "", "direction": direction,
             "structure": "Liquidity Sweep + MSS + CHOCH + FVG + OB",
-            "entry": entry, "trigger_level": structure["level"], "sl": sl,
+            "entry": entry, "current_price": cur, "trigger_level": structure["level"], "sl": sl,
             "tp1": tp1, "tp2": tp2, "tp3": tp3,
             "entry_zone_low": zone["low"], "entry_zone_high": zone["high"],
-            "score": 5, "max_score": 5, "time": cur["time"],
-            "liquidity": liquidity, "sweep_index": sweep_idx,
+            "score": 5, "max_score": 5, "time": rows[-1]["time"],
+            "liquidity": liquidity, "sweep_price": liquidity,
+            "sweep_index": sweep_idx, "sweep_low": sweep_candle["low"],
+            "sweep_high": sweep_candle["high"],
             "mss_index": mss_idx, "mss_level": structure["level"],
             "fvg": fvg, "ob": ob, "entry_zone": zone,
+            "origin_type": "OB + FVG" if _overlap(fvg, ob) else "OB",
+            "extension_from_origin": extension,
+            "risk_distance": risk,
             "rows": rows[max(0, sweep_idx-18):], "full_len": len(rows),
             "checks": {"Liquidity Sweep": True, "MSS": True, "FVG": True, "OB": True, "CHOCH": True},
             "retest_ok": False, "rejection_ok": True, "early_entry": True,
@@ -764,11 +825,16 @@ def ai_review_setup(sig, rows5, rows15):
         "entry_proximity": round(proximity, 4),
         "fresh_setup": bool(sig.get("early_entry", False)) and sig.get("ict_age", 99) <= 3,
         "entry": sig.get("entry"),
+        "entry_zone_low": sig.get("entry_zone_low"),
+        "entry_zone_high": sig.get("entry_zone_high"),
+        "origin_type": sig.get("origin_type"),
+        "extension_from_origin": sig.get("extension_from_origin"),
         "sl": sig.get("sl"),
         "tp1": sig.get("tp1"),
         "tp2": sig.get("tp2"),
         "tp3": sig.get("tp3"),
         "context15": sig.get("context15"),
+        "execution_rule": "Entry must stay at the OB/FVG origin after the liquidity sweep; reject late/chased entries. SL must be structural invalidation; TP1-TP3 must be structural liquidity targets.",
     }
     try:
         result = _saiwan_ai_analyze(payload)
@@ -824,15 +890,19 @@ def build_ict_candidates(symbol, rows5, rows15=None):
             1 if ((direction == "LONG" and sig["context15"] == "BULLISH CONTEXT") or
                   (direction == "SHORT" and sig["context15"] == "BEARISH CONTEXT")) else 0
         )
+        # 15m context disagreement is a hard no-signal rule.
+        if sig["context_match"] != 1:
+            continue
         out.append(sig)
     return out
 
 
 def _ict_candidate_rank(sig):
-    """ICT-only preselection; no indicators, volume, score, or confidence."""
+    """ICT-only preselection: context, origin freshness, and proximity."""
     return (
         sig.get("context_match", 0),
         -sig.get("ict_age", 99),
+        -sig.get("extension_from_origin", 999.0),
         -sig.get("zone_distance", 999.0),
         sig.get("time", 0),
     )
@@ -1173,8 +1243,9 @@ def signal_caption(sig):
         f"⏱ 5m Entry · 15m Context\n\n"
         "Liquidity Sweep ✓  ·  MSS ✓  ·  CHOCH ✓  ·  FVG ✓  ·  OB ✓\n"
         f"15m Context: {sig.get('context15','UNKNOWN')}\n"
+        f"Entry Zone ({sig.get('origin_type','OB')}): {fmt_price(sig.get('entry_zone_low', sig['entry']))} – {fmt_price(sig.get('entry_zone_high', sig['entry']))}\n"
         f"Entry: {fmt_price(sig['entry'])}\n"
-        f"SL: {fmt_price(sig['sl'])}\n"
+        f"SL (structural): {fmt_price(sig['sl'])}\n"
         f"TP1: {fmt_price(sig['tp1'])}\n"
         f"TP2: {fmt_price(sig['tp2'])}\n"
         f"TP3: {fmt_price(sig['tp3'])}\n\n"
@@ -1213,6 +1284,7 @@ def track_sent_signal(sig, chat_id, message_id):
             "tp1": sig["tp1"],
             "tp2": sig["tp2"],
             "tp3": sig["tp3"],
+            "entry_filled": False,
             "tp1_hit": False,
             "tp2_hit": False,
             "tp3_hit": False,
@@ -1256,6 +1328,23 @@ def monitor_active_signals():
                 continue
 
             try:
+                # Origin entries are limit-style. SL/TP monitoring starts only
+                # after price has actually reached the advertised entry.
+                if not state.get("entry_filled", False):
+                    reached = (price <= state["entry"] if state["direction"] == "LONG"
+                               else price >= state["entry"])
+                    if reached:
+                        with state_lock:
+                            if state["key"] in active_signals:
+                                active_signals[state["key"]]["entry_filled"] = True
+                        send_message(
+                            state["chat_id"],
+                            f"🎯 Entry Hit\n⭐ {state['symbol']}\n💵 Price: {fmt_price(price)}",
+                            reply_to_message_id=state["message_id"],
+                        )
+                    else:
+                        continue
+
                 # Stop monitoring after SL. This prevents a later TP notification
                 # after the original setup has already been invalidated.
                 if _hit_level(state["direction"], state["sl"], price):
@@ -1301,7 +1390,15 @@ def sender_loop():
         with state_lock:
             if pending_signals:
                 # One new signal per 10-minute window; send the strongest candidate.
-                pending_signals.sort(key=lambda x: (x.get("radar_score", 0), x.get("score", 0), x.get("confidence", 0), x.get("time", 0)), reverse=True)
+                pending_signals.sort(
+                    key=lambda x: (
+                        x.get("context_match", 0),
+                        -x.get("ict_age", 99),
+                        -x.get("extension_from_origin", 999.0),
+                        x.get("time", 0),
+                    ),
+                    reverse=True,
+                )
                 sig = pending_signals.pop(0)
                 pending_signals.clear()
         if not sig:
