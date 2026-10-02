@@ -1,459 +1,898 @@
-import io
 import os
 import time
+import json
+import math
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import requests
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 from flask import Flask, jsonify
 
 # ============================================================
-# SAIWAN — 15m Trendline Breakout
-# Bitget USDT-M Futures | Telegram signal bot
-# Strategy: trendline + CLOSED 15m candle breakout only.
-# No AI / RSI / MACD / SMC / FVG / OB / volume filters.
+# SAIWAN — 1H TRENDLINE BREAKOUT CRYPTO SIGNAL BOT
+# ============================================================
+# Logic:
+#   LONG  = 1H candle CLOSES above a descending swing-high trendline.
+#   SHORT = 1H candle CLOSES below an ascending swing-low trendline.
+#   ENTRY = breakout candle close.
+#   SL    = last structural swing low/high before breakout.
+#   TP1/2/3 = 1R / 2R / 3R.
+# Market: Bitget USDT perpetual crypto futures only.
+# No AI, RSI, MACD, SMC, FVG, OB, volume, Fibonacci, ATR filters.
 # ============================================================
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip() or None
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+BITGET_API = "https://api.bitget.com"
+BITGET_PRODUCT = "USDT-FUTURES"
+TELEGRAM_API = "https://api.telegram.org/bot"
 
-BITGET_BASE = "https://api.bitget.com"
-PRODUCT_TYPE = "USDT-FUTURES"
-INTERVAL = "15m"
-SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "25"))
-CANDLE_LIMIT = int(os.getenv("CANDLE_LIMIT", "240"))
-PIVOT_WINDOW = int(os.getenv("PIVOT_WINDOW", "3"))
-MIN_TOUCHES = 2
-SYMBOL_COOLDOWN_MIN = int(os.getenv("SYMBOL_COOLDOWN_MIN", "180"))
-BREAKOUT_BUFFER_PCT = float(os.getenv("BREAKOUT_BUFFER_PCT", "0.0005"))
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "0"))  # 0 = all eligible
+TIMEFRAME = "1H"
+CANDLE_LIMIT = 240
+CHART_CANDLES = 80
+PIVOT_WINDOW = 3
+TOUCH_TOLERANCE_PCT = 0.0015
+SCAN_INTERVAL = 45
+MONITOR_INTERVAL = 8
+SCAN_WORKERS = 8
+HTTP_TIMEOUT = 15
+MAX_PAIRS = 0  # 0 = all eligible contracts
+
+TP1_R = 1.0
+TP2_R = 2.0
+TP3_R = 3.0
 
 app = Flask(__name__)
-s = requests.Session()
-s.headers.update({"User-Agent": "SAIWAN/TrendlineBreakout"})
+stop_event = threading.Event()
+force_scan_event = threading.Event()
+state_lock = threading.RLock()
 
-state = {
-    "running": True,
+scanner_running = False
+scanner_thread = None
+monitor_thread = None
+telegram_thread = None
+active_chat_id = None
+offset = None
+
+# key -> active signal. Only one active signal per symbol is allowed.
+active_signals = {}
+seen_breakouts = set()
+seen_order = []
+signal_history = []
+MAX_HISTORY = 500
+
+stats_lock = threading.Lock()
+stats = {
     "last_scan": None,
-    "last_error": None,
-    "signals_sent": 0,
-    "symbols": 0,
-    "chat_id": CHAT_ID,
+    "last_duration": 0.0,
+    "universe": 0,
+    "scanned": 0,
+    "signals": 0,
+    "errors": 0,
+    "error_summary": "",
 }
 
-seen_keys = set()
-last_signal_by_symbol = {}
-last_candle_by_symbol = {}
-telegram_offset = None
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "SAIWAN/1.0",
+    "Accept": "application/json",
+})
+rate_lock = threading.Lock()
+last_request = 0.0
+MIN_REQUEST_INTERVAL = 0.055
 
 
-def bitget(path, params=None, timeout=15):
-    r = s.get(BITGET_BASE + path, params=params, timeout=timeout)
-    r.raise_for_status()
-    j = r.json()
-    if j.get("code") != "00000":
-        raise RuntimeError(f"Bitget {j.get('code')}: {j.get('msg')}")
-    return j.get("data", [])
-
-
-def get_symbols():
-    rows = bitget("/api/v2/mix/market/contracts", {"productType": PRODUCT_TYPE})
-    out = []
-    for x in rows:
-        sym = str(x.get("symbol", "")).upper()
-        quote = str(x.get("quoteCoin", "")).upper()
-        status = str(x.get("symbolStatus", x.get("status", ""))).lower()
-        if sym.endswith("USDT") and quote == "USDT" and status in ("normal", "online", "", "listed"):
-            out.append(sym)
-    out = sorted(set(out))
-    return out[:MAX_SYMBOLS] if MAX_SYMBOLS else out
-
-
-def get_candles(symbol):
-    rows = bitget("/api/v2/mix/market/candles", {
-        "symbol": symbol,
-        "productType": PRODUCT_TYPE,
-        "granularity": INTERVAL,
-        "limit": min(CANDLE_LIMIT, 1000),
-    })
-    rows = sorted(rows, key=lambda x: int(x[0]))
-    now_ms = int(time.time() * 1000)
-    out = []
-    for r in rows:
-        ts = int(r[0])
-        out.append({
-            "ts": ts,
-            "open": float(r[1]),
-            "high": float(r[2]),
-            "low": float(r[3]),
-            "close": float(r[4]),
-        })
-    # Bitget's current candle can still be changing. Use only fully closed candles.
-    interval_ms = 15 * 60 * 1000
-    out = [x for x in out if x["ts"] + interval_ms <= now_ms]
-    return out
-
-
-def pivot_high(c, i):
-    n = PIVOT_WINDOW
-    if i < n or i + n >= len(c):
-        return False
-    h = c[i]["high"]
-    return all(h > c[j]["high"] for j in range(i - n, i)) and all(h > c[j]["high"] for j in range(i + 1, i + n + 1))
-
-
-def pivot_low(c, i):
-    n = PIVOT_WINDOW
-    if i < n or i + n >= len(c):
-        return False
-    lo = c[i]["low"]
-    return all(lo < c[j]["low"] for j in range(i - n, i)) and all(lo < c[j]["low"] for j in range(i + 1, i + n + 1))
-
-
-def pivots(c):
-    highs, lows = [], []
-    for i in range(PIVOT_WINDOW, len(c) - PIVOT_WINDOW):
-        if pivot_high(c, i): highs.append(i)
-        if pivot_low(c, i): lows.append(i)
-    return highs, lows
-
-
-def line_value(line, i):
-    i1, p1, i2, p2 = line
-    return p1 + (p2 - p1) * (i - i1) / (i2 - i1)
-
-
-def near(a, b):
-    return abs(a - b) <= max(abs(a) * 0.001, 1e-12)
-
-
-def build_down_line(c, highs, i1, i2, before):
-    # Resistance: two descending pivot highs.
-    if not (i1 < i2 < before and c[i1]["high"] > c[i2]["high"]):
-        return None
-    line = (i1, c[i1]["high"], i2, c[i2]["high"])
-    touches = 0
-    for j in highs:
-        if j < before and near(c[j]["high"], line_value(line, j)):
-            touches += 1
-    if touches < MIN_TOUCHES:
-        return None
-    # Before the breakout, a closed candle must not already have closed above resistance.
-    for j in range(i2 + 1, before):
-        if c[j]["close"] > line_value(line, j) + max(abs(c[j]["close"]) * BREAKOUT_BUFFER_PCT, 1e-12):
-            return None
-    return line, touches
-
-
-def build_up_line(c, lows, i1, i2, before):
-    # Support: two ascending pivot lows.
-    if not (i1 < i2 < before and c[i1]["low"] < c[i2]["low"]):
-        return None
-    line = (i1, c[i1]["low"], i2, c[i2]["low"])
-    touches = 0
-    for j in lows:
-        if j < before and near(c[j]["low"], line_value(line, j)):
-            touches += 1
-    if touches < MIN_TOUCHES:
-        return None
-    for j in range(i2 + 1, before):
-        if c[j]["close"] < line_value(line, j) - max(abs(c[j]["close"]) * BREAKOUT_BUFFER_PCT, 1e-12):
-            return None
-    return line, touches
-
-
-def best_line(c, highs, lows, before, direction):
-    candidates = []
-    piv = highs if direction == "down" else lows
-    # Recent anchors are preferred, but the line is only accepted if it remains intact.
-    piv = [i for i in piv if i < before]
-    for b in range(len(piv) - 1, max(-1, len(piv) - 14), -1):
-        i2 = piv[b]
-        for a in range(b - 1, max(-1, b - 13), -1):
-            i1 = piv[a]
-            x = build_down_line(c, highs, i1, i2, before) if direction == "down" else build_up_line(c, lows, i1, i2, before)
-            if x:
-                line, touches = x
-                # Score: more touches, then more recent second anchor, then tighter anchor span.
-                score = (touches, i2, -(i2 - i1))
-                candidates.append((score, line, touches))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates[0][1], candidates[0][2]
-
-
-def find_breakout(symbol, c):
-    if len(c) < 80:
-        return None
-    idx = len(c) - 1
-    prev = idx - 1
-    highs, lows = pivots(c)
-    down = best_line(c, highs, lows, idx, "down")
-    up = best_line(c, highs, lows, idx, "up")
-    candle = c[idx]
-
-    if down:
-        line, touches = down
-        now_line = line_value(line, idx)
-        prev_line = line_value(line, prev)
-        buf = max(abs(now_line) * BREAKOUT_BUFFER_PCT, 1e-12)
-        if c[prev]["close"] <= prev_line and candle["close"] > now_line + buf:
-            lows_before = [i for i in lows if line[2] <= i < idx]
-            if lows_before:
-                sl_idx = lows_before[-1]
-                entry = candle["close"]
-                sl = c[sl_idx]["low"]
-                risk = entry - sl
-                if risk > 0:
-                    return make_signal(symbol, "LONG", candle, line, touches, sl_idx, entry, sl, risk)
-
-    if up:
-        line, touches = up
-        now_line = line_value(line, idx)
-        prev_line = line_value(line, prev)
-        buf = max(abs(now_line) * BREAKOUT_BUFFER_PCT, 1e-12)
-        if c[prev]["close"] >= prev_line and candle["close"] < now_line - buf:
-            highs_before = [i for i in highs if line[2] <= i < idx]
-            if highs_before:
-                sl_idx = highs_before[-1]
-                entry = candle["close"]
-                sl = c[sl_idx]["high"]
-                risk = sl - entry
-                if risk > 0:
-                    return make_signal(symbol, "SHORT", candle, line, touches, sl_idx, entry, sl, risk)
-    return None
-
-
-def make_signal(symbol, side, candle, line, touches, sl_idx, entry, sl, risk):
-    if side == "LONG":
-        tp = [entry + risk, entry + 2*risk, entry + 3*risk]
-    else:
-        tp = [entry - risk, entry - 2*risk, entry - 3*risk]
-    return {
-        "symbol": symbol, "side": side, "candle_ts": candle["ts"], "entry": entry, "sl": sl,
-        "tp1": tp[0], "tp2": tp[1], "tp3": tp[2], "risk": risk,
-        "line": line, "touches": touches, "sl_idx": sl_idx,
-        "key": (symbol, candle["ts"], side, line[0], line[2]),
-    }
-
-
-def fmt(x):
-    ax = abs(x)
-    if ax >= 1000: return f"{x:.2f}"
-    if ax >= 1: return f"{x:.4f}"
-    if ax >= 0.01: return f"{x:.6f}"
-    if ax >= 0.0001: return f"{x:.8f}"
+def fmt_price(x):
+    x = float(x)
+    if x >= 1000:
+        return f"{x:.2f}"
+    if x >= 1:
+        return f"{x:.4f}"
+    if x >= 0.01:
+        return f"{x:.6f}"
+    if x >= 0.0001:
+        return f"{x:.8f}"
     return f"{x:.10f}".rstrip("0").rstrip(".")
 
 
-def telegram_api(method, **kwargs):
-    if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
-    r = s.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", timeout=30, **kwargs)
-    r.raise_for_status()
-    return r.json()
+def bitget_get(path, params=None, retries=3):
+    global last_request
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            with rate_lock:
+                wait = MIN_REQUEST_INTERVAL - (time.monotonic() - last_request)
+                if wait > 0:
+                    time.sleep(wait)
+                last_request = time.monotonic()
+            r = session.get(BITGET_API + path, params=params or {}, timeout=HTTP_TIMEOUT)
+            if r.status_code == 429 or r.status_code in (403, 418, 500, 502, 503, 504):
+                if attempt < retries:
+                    time.sleep(min(1.0 * (attempt + 1), 5.0))
+                    continue
+            r.raise_for_status()
+            data = r.json()
+            if str(data.get("code")) != "00000":
+                raise RuntimeError(f"Bitget {data.get('code')}: {data.get('msg', 'unknown')}")
+            return data
+        except (requests.RequestException, ValueError, RuntimeError) as exc:
+            last = exc
+            if attempt < retries:
+                time.sleep(min(0.8 * (attempt + 1), 4.0))
+    raise last or RuntimeError("Bitget request failed")
 
 
-def send_photo(signal, candles):
-    global CHAT_ID
-    if not CHAT_ID:
-        return False
-    image = render_chart(signal, candles)
-    dt = datetime.fromtimestamp(signal["candle_ts"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    icon = "🟢" if signal["side"] == "LONG" else "🔴"
-    caption = (
-        f"🚀 SAIWAN TRENDLINE BREAKOUT\n\n"
-        f"{icon} {signal['side']}  •  {signal['symbol']}\n"
-        f"⏱ 15m  |  Closed-candle confirmation\n"
-        f"🕒 {dt}\n\n"
-        f"ENTRY  {fmt(signal['entry'])}\n"
-        f"SL     {fmt(signal['sl'])}\n"
-        f"TP1    {fmt(signal['tp1'])}  •  1R\n"
-        f"TP2    {fmt(signal['tp2'])}  •  2R\n"
-        f"TP3    {fmt(signal['tp3'])}  •  3R\n\n"
-        f"📐 Trendline touches: {signal['touches']}\n"
-        f"🏦 Bitget USDT Perpetual\n"
-        f"⚠️ Signal only — no automatic order."
+def get_contracts():
+    payload = bitget_get(
+        "/api/v2/mix/market/contracts",
+        {"productType": BITGET_PRODUCT},
     )
-    symbol_tv = signal["symbol"].replace("/", "")
-    markup = {"inline_keyboard": [[{"text": "📈 Open in TradingView", "url": f"https://www.tradingview.com/chart/?symbol=BITGET%3A{symbol_tv}&interval=15"}]]}
-    data = {"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML", "reply_markup": __import__("json").dumps(markup)}
-    files = {"photo": (f"{signal['symbol']}_15m.png", image, "image/png")}
-    telegram_api("sendPhoto", data=data, files=files)
+    out = []
+    for x in payload.get("data") or []:
+        symbol = str(x.get("symbol", "")).upper()
+        if (
+            symbol.endswith("USDT")
+            and x.get("quoteCoin") == "USDT"
+            and str(x.get("symbolType", "")).lower() == "perpetual"
+            and str(x.get("symbolStatus", "")).lower() == "normal"
+            and str(x.get("isRwa", "NO")).upper() != "YES"
+        ):
+            out.append(x)
+    return out
+
+
+def get_tickers():
+    payload = bitget_get(
+        "/api/v2/mix/market/tickers",
+        {"productType": BITGET_PRODUCT},
+    )
+    return payload.get("data") or []
+
+
+def get_last_price(symbol):
+    payload = bitget_get(
+        "/api/v2/mix/market/ticker",
+        {"productType": BITGET_PRODUCT, "symbol": symbol},
+    )
+    data = payload.get("data") or []
+    if not data:
+        return None
+    try:
+        return float(data[0]["lastPr"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def get_klines(symbol, limit=CANDLE_LIMIT):
+    payload = bitget_get(
+        "/api/v2/mix/market/candles",
+        {
+            "symbol": symbol,
+            "productType": BITGET_PRODUCT,
+            "granularity": TIMEFRAME,
+            "limit": min(limit, 1000),
+            "kLineType": "market",
+        },
+    )
+    raw = payload.get("data") or []
+    now_ms = int(time.time() * 1000)
+    candle_ms = 60 * 60 * 1000
+    rows = []
+    for v in raw:
+        try:
+            if len(v) < 6:
+                continue
+            ts = int(v[0])
+            # Never use the currently forming 1H candle.
+            if ts + candle_ms > now_ms:
+                continue
+            rows.append({
+                "time": ts // 1000,
+                "open": float(v[1]),
+                "high": float(v[2]),
+                "low": float(v[3]),
+                "close": float(v[4]),
+                "vol": float(v[5]),
+            })
+        except (TypeError, ValueError, IndexError):
+            continue
+    rows.sort(key=lambda r: r["time"])
+    return rows[-limit:]
+
+
+def swing_points(rows, left=PIVOT_WINDOW, right=PIVOT_WINDOW):
+    highs, lows = [], []
+    for i in range(left, len(rows) - right):
+        h = rows[i]["high"]
+        l = rows[i]["low"]
+        if all(h > rows[j]["high"] for j in range(i-left, i)) and all(h >= rows[j]["high"] for j in range(i+1, i+right+1)):
+            highs.append((i, h))
+        if all(l < rows[j]["low"] for j in range(i-left, i)) and all(l <= rows[j]["low"] for j in range(i+1, i+right+1)):
+            lows.append((i, l))
+    return highs, lows
+
+
+def line_value(p1, p2, x):
+    i1, y1 = p1
+    i2, y2 = p2
+    if i2 == i1:
+        return y2
+    return y1 + (y2 - y1) * ((x - i1) / (i2 - i1))
+
+
+def _line_is_clean(rows, p1, p2, side):
+    """Reject a trendline that was already closed-through before the break."""
+    start = p1[0]
+    end = min(p2[0], len(rows) - 1)
+    tol = TOUCH_TOLERANCE_PCT
+    for i in range(start + 1, end + 1):
+        lv = line_value(p1, p2, i)
+        c = rows[i]["close"]
+        if side == "LONG" and c > lv * (1 + tol):
+            return False
+        if side == "SHORT" and c < lv * (1 - tol):
+            return False
     return True
 
 
-def render_chart(signal, candles):
-    # TradingView-inspired visual language: dark canvas, teal/red candles, subtle grid,
-    # right-side price levels, and a single fixed trendline from the actual pivot anchors.
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Rectangle
-
-    n = min(90, len(candles))
-    data = candles[-n:]
-    offset = len(candles) - n
-    fig, ax = plt.subplots(figsize=(13.5, 7.6), dpi=150)
-    fig.patch.set_facecolor("#131722")
-    ax.set_facecolor("#131722")
-
-    for x, k in enumerate(data):
-        o, h, l, cl = k["open"], k["high"], k["low"], k["close"]
-        up = cl >= o
-        body_color = "#26a69a" if up else "#ef5350"
-        ax.vlines(x, l, h, color=body_color, linewidth=0.9, zorder=2)
-        height = max(abs(cl-o), abs(cl) * 0.00002)
-        ax.add_patch(Rectangle((x-0.32, min(o, cl)), 0.64, height,
-                               facecolor=body_color, edgecolor=body_color, linewidth=0.5, zorder=3))
-
-    line = signal["line"]
-    # Draw exactly the mathematical line used by the detector, from its first anchor through the breakout.
-    x_start = max(0, line[0] - offset)
-    x_end = n - 1
-    y_start = line_value(line, offset + x_start)
-    y_end = line_value(line, len(candles) - 1)
-    if x_end >= x_start:
-        ax.plot([x_start, x_end], [y_start, y_end], color="#f0b90b", linewidth=2.2, zorder=6)
-
-    # Entry/SL/TP levels are part of the same chart, not a second message.
-    level_specs = [
-        (signal["entry"], "ENTRY", "#f5f5f5", "-"),
-        (signal["sl"], "SL", "#ef5350", "--"),
-        (signal["tp1"], "TP1", "#26a69a", ":"),
-        (signal["tp2"], "TP2", "#26a69a", ":"),
-        (signal["tp3"], "TP3", "#26a69a", ":"),
-    ]
-    for price, label, color, style in level_specs:
-        ax.axhline(price, color=color, linestyle=style, linewidth=1.0, alpha=0.9, zorder=1)
-        ax.text(1.005, price, f" {label}  {fmt(price)}", transform=ax.get_yaxis_transform(),
-                va="center", ha="left", color=color, fontsize=8.5,
-                bbox=dict(facecolor="#131722", edgecolor="none", pad=1.5, alpha=0.92))
-
-    bx = n - 1
-    by = data[-1]["close"]
-    color = "#26a69a" if signal["side"] == "LONG" else "#ef5350"
-    marker = "^" if signal["side"] == "LONG" else "v"
-    ax.scatter([bx], [by], s=95, marker=marker, color=color, edgecolors="#ffffff", linewidths=0.7, zorder=10)
-    ax.annotate("BREAKOUT", (bx, by), xytext=(-8, 15 if signal["side"] == "LONG" else -18),
-                textcoords="offset points", ha="right", color="#ffffff", fontsize=8.5,
-                arrowprops=dict(arrowstyle="-", color="#8b93a1", lw=0.7))
-
-    ax.set_title(f"{signal['symbol']}  ·  15m  ·  {signal['side']} TRENDLINE BREAKOUT",
-                 loc="left", color="#f0f3f6", fontsize=15, fontweight="bold", pad=14)
-    ax.text(0, 1.01, "SAIWAN  •  Bitget USDT Perpetual  •  fixed pivot trendline",
-            transform=ax.transAxes, color="#8b93a1", fontsize=8.5, va="bottom")
-    ax.set_xlim(-2, n + 8)
-    ax.grid(True, color="#1e222d", linewidth=0.7, alpha=0.9)
-    ax.tick_params(colors="#8b93a1", labelsize=8)
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    ax.yaxis.tick_right()
-    ax.set_xlabel("")
-    ax.set_ylabel("")
-    fig.tight_layout(pad=1.2)
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return buf.getvalue()
+def _touch_count(rows, pivots, p1, p2):
+    lo, hi = p1[0], p2[0]
+    tol = TOUCH_TOLERANCE_PCT
+    count = 0
+    for idx, price in pivots:
+        if lo <= idx <= hi:
+            lv = line_value(p1, p2, idx)
+            if abs(price - lv) / max(abs(lv), 1e-12) <= tol:
+                count += 1
+    return count
 
 
-def telegram_poll_loop():
-    global telegram_offset, CHAT_ID
-    if not BOT_TOKEN:
+def best_downtrend_line(rows):
+    highs, _ = swing_points(rows)
+    if len(highs) < 2:
+        return None
+    candidates = []
+    # Recent pivots are more useful, but we evaluate all pairs in the visible window.
+    for a in range(max(0, len(highs) - 12), len(highs) - 1):
+        for b in range(a + 1, len(highs)):
+            p1, p2 = highs[a], highs[b]
+            if p2[1] >= p1[1]:
+                continue
+            span = p2[0] - p1[0]
+            if span < 5:
+                continue
+            if not _line_is_clean(rows, p1, p2, "LONG"):
+                continue
+            touches = _touch_count(rows, highs, p1, p2)
+            if touches < 2:
+                continue
+            candidates.append((touches, p2[0], -span, p1, p2))
+    if not candidates:
+        return None
+    _, _, _, p1, p2 = max(candidates)
+    return {"p1": p1, "p2": p2, "touches": _touch_count(rows, highs, p1, p2), "side": "LONG"}
+
+
+def best_uptrend_line(rows):
+    _, lows = swing_points(rows)
+    if len(lows) < 2:
+        return None
+    candidates = []
+    for a in range(max(0, len(lows) - 12), len(lows) - 1):
+        for b in range(a + 1, len(lows)):
+            p1, p2 = lows[a], lows[b]
+            if p2[1] <= p1[1]:
+                continue
+            span = p2[0] - p1[0]
+            if span < 5:
+                continue
+            if not _line_is_clean(rows, p1, p2, "SHORT"):
+                continue
+            touches = _touch_count(rows, lows, p1, p2)
+            if touches < 2:
+                continue
+            candidates.append((touches, p2[0], -span, p1, p2))
+    if not candidates:
+        return None
+    _, _, _, p1, p2 = max(candidates)
+    return {"p1": p1, "p2": p2, "touches": _touch_count(rows, lows, p1, p2), "side": "SHORT"}
+
+
+def breakout_signal(rows, symbol):
+    if len(rows) < 80:
+        return None
+    # The last row is the newest CLOSED candle.
+    cur_i = len(rows) - 1
+    prev_i = cur_i - 1
+
+    down = best_downtrend_line(rows)
+    if down:
+        p1, p2 = down["p1"], down["p2"]
+        if p2[0] < prev_i:
+            prev_line = line_value(p1, p2, prev_i)
+            cur_line = line_value(p1, p2, cur_i)
+            if rows[prev_i]["close"] <= prev_line and rows[cur_i]["close"] > cur_line:
+                lows, _ = swing_points(rows[:cur_i], PIVOT_WINDOW, PIVOT_WINDOW)
+                # Last swing LOW before breakout, after the second trendline anchor.
+                _, pivot_lows = swing_points(rows[:cur_i], PIVOT_WINDOW, PIVOT_WINDOW)
+                valid = [(i, p) for i, p in pivot_lows if p2[0] <= i < cur_i]
+                if valid:
+                    sl_idx, sl = valid[-1]
+                    entry = rows[cur_i]["close"]
+                    risk = entry - sl
+                    if risk > 0:
+                        return make_signal(symbol, "LONG", rows, cur_i, down, entry, sl, sl_idx)
+
+    up = best_uptrend_line(rows)
+    if up:
+        p1, p2 = up["p1"], up["p2"]
+        if p2[0] < prev_i:
+            prev_line = line_value(p1, p2, prev_i)
+            cur_line = line_value(p1, p2, cur_i)
+            if rows[prev_i]["close"] >= prev_line and rows[cur_i]["close"] < cur_line:
+                _, pivot_lows = swing_points(rows[:cur_i], PIVOT_WINDOW, PIVOT_WINDOW)
+                highs, _ = swing_points(rows[:cur_i], PIVOT_WINDOW, PIVOT_WINDOW)
+                valid = [(i, p) for i, p in highs if p2[0] <= i < cur_i]
+                if valid:
+                    sl_idx, sl = valid[-1]
+                    entry = rows[cur_i]["close"]
+                    risk = sl - entry
+                    if risk > 0:
+                        return make_signal(symbol, "SHORT", rows, cur_i, up, entry, sl, sl_idx)
+    return None
+
+
+def make_signal(symbol, direction, rows, breakout_idx, line, entry, sl, sl_idx):
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return None
+    if direction == "LONG":
+        tp1, tp2, tp3 = entry + risk * TP1_R, entry + risk * TP2_R, entry + risk * TP3_R
+    else:
+        tp1, tp2, tp3 = entry - risk * TP1_R, entry - risk * TP2_R, entry - risk * TP3_R
+    return {
+        "key": f"{symbol}:{rows[breakout_idx]['time']}:{direction}:{line['p1'][0]}:{line['p2'][0]}",
+        "symbol": symbol,
+        "direction": direction,
+        "time": rows[breakout_idx]["time"],
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "risk": risk,
+        "line": line,
+        "sl_idx": sl_idx,
+        "breakout_idx": breakout_idx,
+        "rows": rows[-CHART_CANDLES:],
+        "touches": line["touches"],
+        "timeframe": TIMEFRAME,
+    }
+
+
+def scan_symbol(symbol):
+    try:
+        rows = get_klines(symbol)
+        return symbol, breakout_signal(rows, symbol), None
+    except Exception as exc:
+        return symbol, None, f"{type(exc).__name__}: {exc}"
+
+
+def scan_once():
+    started = time.monotonic()
+    errors = []
+    try:
+        contracts = get_contracts()
+        symbols = [str(x["symbol"]).upper() for x in contracts]
+        if MAX_PAIRS > 0:
+            tickers = get_tickers()
+            volumes = {}
+            for t in tickers:
+                try:
+                    volumes[str(t.get("symbol", "")).upper()] = float(t.get("quoteVolume", 0))
+                except Exception:
+                    pass
+            symbols.sort(key=lambda s: volumes.get(s, 0), reverse=True)
+            symbols = symbols[:MAX_PAIRS]
+
+        with stats_lock:
+            stats["universe"] = len(symbols)
+
+        found = []
+        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+            futures = [pool.submit(scan_symbol, s) for s in symbols]
+            for fut in as_completed(futures):
+                symbol, sig, err = fut.result()
+                if err:
+                    errors.append(f"{symbol}: {err}")
+                elif sig:
+                    found.append(sig)
+
+        for sig in sorted(found, key=lambda x: x["time"]):
+            handle_candidate(sig)
+
+        with stats_lock:
+            stats["scanned"] = len(symbols)
+            stats["signals"] += len(found)
+            stats["errors"] = len(errors)
+            stats["error_summary"] = " | ".join(errors[:3])
+            stats["last_scan"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            stats["last_duration"] = round(time.monotonic() - started, 2)
+        print(f"SAIWAN 1H scan: universe={len(symbols)} found={len(found)} errors={len(errors)} duration={time.monotonic()-started:.1f}s")
+    except Exception as exc:
+        with stats_lock:
+            stats["errors"] += 1
+            stats["error_summary"] = f"{type(exc).__name__}: {exc}"
+            stats["last_duration"] = round(time.monotonic() - started, 2)
+        print(f"SCAN ERROR: {type(exc).__name__}: {exc}")
+
+
+def handle_candidate(sig):
+    with state_lock:
+        # Never repeat the same breakout candle/trendline.
+        if sig["key"] in seen_breakouts:
+            return
+        seen_breakouts.add(sig["key"])
+        seen_order.append(sig["key"])
+        if len(seen_order) > 3000:
+            old = seen_order.pop(0)
+            seen_breakouts.discard(old)
+
+        # Avoid overlapping signals on the same symbol. Once TP3/SL closes it,
+        # a later, new closed-candle breakout may create a fresh signal.
+        if sig["symbol"] in {v["symbol"] for v in active_signals.values()}:
+            return
+
+    if not active_chat_id:
+        print(f"SIGNAL READY but no Telegram chat yet: {sig['symbol']} {sig['direction']}")
         return
-    while True:
-        try:
-            params = {"timeout": 20, "allowed_updates": ["message"]}
-            if telegram_offset is not None:
-                params["offset"] = telegram_offset
-            data = telegram_api("getUpdates", params=params)
-            for upd in data.get("result", []):
-                telegram_offset = upd["update_id"] + 1
-                msg = upd.get("message") or {}
-                chat = msg.get("chat") or {}
-                cid = chat.get("id")
-                if cid is not None:
-                    CHAT_ID = str(cid)
-                    state["chat_id"] = CHAT_ID
-                text = (msg.get("text") or "").strip().lower()
-                if text == "/start" and CHAT_ID:
-                    telegram_api("sendMessage", json={"chat_id": CHAT_ID, "text": "✅ SAIWAN is online. 15m Trendline Breakout scanner is running."})
-                elif text == "/stop":
-                    state["running"] = False
-                    telegram_api("sendMessage", json={"chat_id": CHAT_ID, "text": "⏸ Scanner stopped. Send /scan to start."})
-                elif text == "/scan":
-                    state["running"] = True
-                    telegram_api("sendMessage", json={"chat_id": CHAT_ID, "text": "▶️ Scanner started. Strategy: 15m Trendline Breakout only."})
-                elif text == "/status":
-                    telegram_api("sendMessage", json={"chat_id": CHAT_ID, "text": status_text()})
-        except Exception as e:
-            state["last_error"] = str(e)
-            time.sleep(5)
+
+    try:
+        path = make_chart(sig)
+        tv = tradingview_url(sig["symbol"])
+        markup = {"inline_keyboard": [[{"text": "📈 Open in TradingView", "url": tv}]]}
+        message_id = send_photo(active_chat_id, path, signal_caption(sig), markup)
+        if message_id:
+            with state_lock:
+                active_signals[sig["key"]] = {
+                    "key": sig["key"],
+                    "symbol": sig["symbol"],
+                    "direction": sig["direction"],
+                    "entry": sig["entry"],
+                    "sl": sig["sl"],
+                    "tp1": sig["tp1"],
+                    "tp2": sig["tp2"],
+                    "tp3": sig["tp3"],
+                    "chat_id": active_chat_id,
+                    "message_id": message_id,
+                    "tp1_hit": False,
+                    "tp2_hit": False,
+                    "tp3_hit": False,
+                    "sl_hit": False,
+                    "created": time.time(),
+                }
+                signal_history.append(sig.copy())
+                if len(signal_history) > MAX_HISTORY:
+                    signal_history.pop(0)
+        print(f"SENT {sig['symbol']} {sig['direction']} entry={fmt_price(sig['entry'])}")
+    except Exception as exc:
+        print(f"SEND ERROR {sig['symbol']}: {type(exc).__name__}: {exc}")
 
 
-def status_text():
+def signal_caption(sig):
+    side = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
     return (
-        "🤖 SAIWAN STATUS\n"
-        f"Bot: ONLINE\nScanner: {'RUNNING' if state['running'] else 'STOPPED'}\n"
-        "Market: Bitget USDT Perpetual\n"
-        "Timeframe: 15m\n"
-        "Strategy: Trendline + CLOSED candle breakout\n"
-        f"Symbols: {state['symbols']}\nSignals sent: {state['signals_sent']}\n"
-        f"Last scan: {state['last_scan'] or '-'}"
+        "🚀 SAIWAN CONFIRMED SIGNAL\n\n"
+        f"{side}\n"
+        f"⭐ {sig['symbol']} · Bitget Futures\n"
+        f"⏱ Timeframe: {TIMEFRAME}\n"
+        "📐 Setup: Trendline Breakout\n"
+        f"🔗 Trendline touches: {sig['touches']}\n\n"
+        f"ENTRY: {fmt_price(sig['entry'])}\n"
+        f"SL: {fmt_price(sig['sl'])}\n"
+        f"TP1: {fmt_price(sig['tp1'])}  (1R)\n"
+        f"TP2: {fmt_price(sig['tp2'])}  (2R)\n"
+        f"TP3: {fmt_price(sig['tp3'])}  (3R)\n\n"
+        "✅ Confirmation: CLOSED 1H candle beyond trendline\n"
+        "⚠️ Signal only — no automatic trading."
     )
 
 
-def scan_loop():
-    while True:
-        if state["running"]:
-            try:
-                symbols = get_symbols()
-                state["symbols"] = len(symbols)
-                for symbol in symbols:
+def monitor_active_signals():
+    while not stop_event.is_set():
+        try:
+            with state_lock:
+                signals = [x.copy() for x in active_signals.values()]
+            if signals:
+                tickers = get_tickers()
+                prices = {}
+                for t in tickers:
                     try:
-                        candles = get_candles(symbol)
-                        if len(candles) < 80:
-                            continue
-                        last_ts = candles[-1]["ts"]
-                        if last_candle_by_symbol.get(symbol) == last_ts:
-                            continue
-                        last_candle_by_symbol[symbol] = last_ts
-                        signal = find_breakout(symbol, candles)
-                        if not signal:
-                            continue
-                        if signal["key"] in seen_keys:
-                            continue
-                        previous = last_signal_by_symbol.get(symbol, 0)
-                        if time.time() - previous < SYMBOL_COOLDOWN_MIN * 60:
-                            continue
-                        if send_photo(signal, candles):
-                            seen_keys.add(signal["key"])
-                            last_signal_by_symbol[symbol] = time.time()
-                            state["signals_sent"] += 1
-                    except Exception as e:
-                        state["last_error"] = f"{symbol}: {e}"
-                state["last_scan"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-            except Exception as e:
-                state["last_error"] = str(e)
-        time.sleep(SCAN_SECONDS)
+                        prices[str(t.get("symbol", "")).upper()] = float(t["lastPr"])
+                    except Exception:
+                        pass
+                for sig in signals:
+                    price = prices.get(sig["symbol"])
+                    if price is not None:
+                        check_signal_event(sig["key"], price)
+        except Exception as exc:
+            print(f"MONITOR ERROR: {type(exc).__name__}: {exc}")
+        for _ in range(MONITOR_INTERVAL):
+            if stop_event.is_set():
+                break
+            time.sleep(1)
+
+
+def check_signal_event(key, price):
+    with state_lock:
+        sig = active_signals.get(key)
+        if not sig:
+            return
+        direction = sig["direction"]
+        hit = None
+        close_after = False
+        if direction == "LONG":
+            if not sig["sl_hit"] and price <= sig["sl"]:
+                sig["sl_hit"] = True
+                hit = ("SL", sig["sl"])
+                close_after = True
+            elif not sig["tp1_hit"] and price >= sig["tp1"]:
+                sig["tp1_hit"] = True
+                hit = ("TP1", sig["tp1"])
+            elif not sig["tp2_hit"] and price >= sig["tp2"]:
+                sig["tp2_hit"] = True
+                hit = ("TP2", sig["tp2"])
+            elif not sig["tp3_hit"] and price >= sig["tp3"]:
+                sig["tp3_hit"] = True
+                hit = ("TP3", sig["tp3"])
+                close_after = True
+        else:
+            if not sig["sl_hit"] and price >= sig["sl"]:
+                sig["sl_hit"] = True
+                hit = ("SL", sig["sl"])
+                close_after = True
+            elif not sig["tp1_hit"] and price <= sig["tp1"]:
+                sig["tp1_hit"] = True
+                hit = ("TP1", sig["tp1"])
+            elif not sig["tp2_hit"] and price <= sig["tp2"]:
+                sig["tp2_hit"] = True
+                hit = ("TP2", sig["tp2"])
+            elif not sig["tp3_hit"] and price <= sig["tp3"]:
+                sig["tp3_hit"] = True
+                hit = ("TP3", sig["tp3"])
+                close_after = True
+        chat_id = sig["chat_id"]
+        message_id = sig["message_id"]
+        snapshot = sig.copy()
+
+    if hit:
+        level, level_price = hit
+        side = "🟢 LONG" if snapshot["direction"] == "LONG" else "🔴 SHORT"
+        if level == "SL":
+            text = (
+                f"🛑 STOP LOSS HIT\n\n{side}\n⭐ {snapshot['symbol']}\n"
+                f"Level: {fmt_price(level_price)}\nObserved: {fmt_price(price)}\n\n"
+                "Signal closed — monitoring stopped."
+            )
+        else:
+            text = (
+                f"🎯 {level} HIT\n\n{side}\n⭐ {snapshot['symbol']}\n"
+                f"Target: {fmt_price(level_price)}\nObserved: {fmt_price(price)}\n\n"
+                + ("TP3 reached — signal closed." if level == "TP3" else "Signal remains active; next target is still monitored.")
+            )
+        try:
+            send_message(chat_id, text, reply_to_message_id=message_id)
+        except Exception as exc:
+            print(f"TP/SL TELEGRAM ERROR: {type(exc).__name__}: {exc}")
+        if close_after:
+            with state_lock:
+                active_signals.pop(key, None)
+
+
+def tradingview_url(symbol):
+    # Bitget symbol maps cleanly to TradingView's BITGET:<SYMBOL> futures chart.
+    return f"https://www.tradingview.com/chart/?symbol=BITGET%3A{symbol}&interval=60"
+
+
+def make_chart(sig):
+    rows = sig["rows"]
+    n = len(rows)
+    fig, ax = plt.subplots(figsize=(16, 9), dpi=100, facecolor="#0b0e11")
+    ax.set_facecolor("#0b0e11")
+
+    up = "#26a69a"
+    down = "#ef5350"
+    grid = "#1d2329"
+    text = "#e6edf3"
+    muted = "#8b949e"
+    line_color = "#f0b90b"
+    entry_color = "#ffffff"
+    tp_color = "#26a69a"
+    sl_color = "#ef5350"
+
+    width = 0.58
+    for i, r in enumerate(rows):
+        c = up if r["close"] >= r["open"] else down
+        ax.vlines(i, r["low"], r["high"], color=c, linewidth=1.0, zorder=2)
+        lo = min(r["open"], r["close"])
+        body = max(abs(r["close"] - r["open"]), abs(r["close"]) * 1e-7)
+        ax.add_patch(Rectangle((i - width / 2, lo), width, body,
+                               facecolor=c, edgecolor=c, linewidth=0.5, zorder=3))
+
+    # Trendline is the exact mathematical line used by the detector.
+    line = sig["line"]
+    offset = sig["breakout_idx"] - (len(rows) if len(rows) == CANDLE_LIMIT else sig["breakout_idx"])
+    # Use index coordinates relative to visible chart window.
+    full_visible_start = max(0, sig["breakout_idx"] - len(rows) + 1)
+    x1 = line["p1"][0] - full_visible_start
+    x2 = line["p2"][0] - full_visible_start
+    xb = sig["breakout_idx"] - full_visible_start
+    xend = n - 1
+    if x2 < n:
+        xs = [max(0, x1), xend]
+        ys = [line_value(line["p1"], line["p2"], full_visible_start + xs[0]),
+              line_value(line["p1"], line["p2"], full_visible_start + xs[1])]
+        ax.plot(xs, ys, color=line_color, linewidth=2.2, zorder=5)
+        ax.text(max(0, x1), ys[0],
+                "DESCENDING RESISTANCE" if sig["direction"] == "LONG" else "ASCENDING SUPPORT",
+                color=line_color, fontsize=9, fontweight="bold", va="bottom")
+
+    # Entry / SL / TP levels.
+    levels = [
+        (sig["entry"], "ENTRY", entry_color, "--", 1.5),
+        (sig["sl"], "SL", sl_color, "-", 1.5),
+        (sig["tp1"], "TP1", tp_color, ":", 1.1),
+        (sig["tp2"], "TP2", tp_color, ":", 1.1),
+        (sig["tp3"], "TP3", tp_color, ":", 1.1),
+    ]
+    right = n + 10
+    for y, label, color, style, lw in levels:
+        ax.axhline(y, color=color, linestyle=style, linewidth=lw, alpha=0.95)
+        ax.text(right + 0.2, y, f"{label}  {fmt_price(y)}", color=color,
+                fontsize=9, fontweight="bold", va="center")
+
+    ax.scatter([xb], [sig["entry"]], s=70,
+               color=up if sig["direction"] == "LONG" else down,
+               edgecolor="#ffffff", linewidth=0.9, zorder=8)
+    ax.annotate("BREAKOUT", xy=(xb, sig["entry"]),
+                xytext=(max(0, xb - 12), sig["entry"]),
+                arrowprops=dict(arrowstyle="->", color=line_color, lw=1.6),
+                color=line_color, fontsize=10, fontweight="bold")
+
+    ax.text(0.01, 1.045,
+            f"{sig['symbol']}  ·  SAIWAN  ·  {sig['direction']}  ·  1H TRENDLINE BREAKOUT",
+            transform=ax.transAxes, color=text, fontsize=15, fontweight="bold")
+    ax.text(0.01, 1.015,
+            "CLOSED-CANDLE CONFIRMATION  •  ENTRY = BREAKOUT CLOSE  •  STRUCTURAL SL  •  1R / 2R / 3R",
+            transform=ax.transAxes, color=muted, fontsize=9)
+    ax.text(0.99, 1.045, "BITGET USDT PERPETUAL", transform=ax.transAxes,
+            color=muted, fontsize=9, ha="right", fontweight="bold")
+
+    ax.grid(axis="y", color=grid, linewidth=0.65)
+    ax.grid(axis="x", color=grid, linewidth=0.35, alpha=0.5)
+    ax.tick_params(axis="both", colors=muted, labelsize=8, length=0)
+    for side in ["top", "left", "bottom", "right"]:
+        ax.spines[side].set_visible(False)
+    ax.yaxis.tick_right()
+
+    step = max(1, n // 8)
+    ticks = list(range(0, n, step))
+    if ticks[-1] != n - 1:
+        ticks.append(n - 1)
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([
+        datetime.fromtimestamp(rows[i]["time"], tz=timezone.utc).strftime("%d %b\\n%H:%M")
+        for i in ticks
+    ])
+
+    lows = [r["low"] for r in rows] + [sig["sl"], sig["tp3"]]
+    highs = [r["high"] for r in rows] + [sig["entry"], sig["tp3"]]
+    ymin, ymax = min(lows), max(highs)
+    span = max(ymax - ymin, abs(rows[-1]["close"]) * 0.01)
+    ax.set_ylim(ymin - span * 0.08, ymax + span * 0.10)
+    ax.set_xlim(-1, right + 4)
+    fig.subplots_adjust(left=0.035, right=0.86, top=0.88, bottom=0.09)
+
+    safe = "".join(c if c.isalnum() else "_" for c in sig["symbol"])
+    path = f"/tmp/saiwan_{safe}_{sig['time']}.png"
+    fig.savefig(path, dpi=100, facecolor="#0b0e11", edgecolor="none")
+    plt.close(fig)
+    return path
+
+
+def telegram_url(method):
+    if not TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+    return TELEGRAM_API + TOKEN + "/" + method
+
+
+def send_message(chat_id, text, reply_markup=None, reply_to_message_id=None):
+    data = {"chat_id": chat_id, "text": text}
+    if reply_markup is not None:
+        data["reply_markup"] = json.dumps(reply_markup)
+    if reply_to_message_id is not None:
+        data["reply_to_message_id"] = str(reply_to_message_id)
+    r = requests.post(telegram_url("sendMessage"), data=data, timeout=HTTP_TIMEOUT)
+    if not r.ok:
+        raise RuntimeError(f"Telegram sendMessage {r.status_code}: {r.text[:500]}")
+    return (r.json().get("result") or {}).get("message_id")
+
+
+def send_photo(chat_id, path, caption, reply_markup=None):
+    data = {"chat_id": chat_id, "caption": caption}
+    if reply_markup is not None:
+        data["reply_markup"] = json.dumps(reply_markup)
+    with open(path, "rb") as f:
+        r = requests.post(telegram_url("sendPhoto"), data=data,
+                          files={"photo": f}, timeout=HTTP_TIMEOUT)
+    if not r.ok:
+        raise RuntimeError(f"Telegram sendPhoto {r.status_code}: {r.text[:1000]}")
+    return (r.json().get("result") or {}).get("message_id")
+
+
+def status_text():
+    with state_lock:
+        active = list(active_signals.values())
+        chat = active_chat_id
+    with stats_lock:
+        s = stats.copy()
+    lines = [
+        "🚀 SAIWAN STATUS",
+        "",
+        f"Scanner: {'RUNNING' if scanner_running else 'STOPPED'}",
+        f"Market: CRYPTO ONLY — Bitget USDT perpetual",
+        f"Timeframe: {TIMEFRAME}",
+        f"Universe: {s['universe']}",
+        f"Last scan: {s['last_scan'] or '—'}",
+        f"Last duration: {s['last_duration']}s",
+        f"Last scan found: {s['signals']}",
+        f"Active signals: {len(active)}",
+        f"Telegram chat: {'connected' if chat else 'not detected'}",
+        "",
+        "Logic: trendline close breakout only",
+        "Entry: breakout candle close",
+        "SL: last structural swing",
+        "TP: 1R / 2R / 3R",
+        "TP/SL monitor: ENABLED",
+    ]
+    if s["error_summary"]:
+        lines += ["", f"Last errors: {s['error_summary'][:500]}"]
+    return "\n".join(lines)
+
+
+def start_scanner(chat_id):
+    global scanner_thread, active_chat_id, scanner_running
+    active_chat_id = chat_id
+    if not scanner_running:
+        stop_event.clear()
+        scanner_thread = threading.Thread(target=scanner_loop, name="saiwan-scanner", daemon=True)
+        scanner_thread.start()
+    force_scan_event.set()
+
+
+def stop_scanner():
+    stop_event.set()
+
+
+def scanner_loop():
+    global scanner_running
+    scanner_running = True
+    while not stop_event.is_set():
+        try:
+            scan_once()
+        except Exception as exc:
+            print(f"SCANNER LOOP ERROR: {type(exc).__name__}: {exc}")
+        force_scan_event.clear()
+        for _ in range(SCAN_INTERVAL):
+            if stop_event.is_set() or force_scan_event.is_set():
+                break
+            time.sleep(1)
+    scanner_running = False
+
+
+def poll_updates():
+    global offset, active_chat_id
+    conflict_wait = 3
+    while True:
+        try:
+            r = requests.get(
+                telegram_url("getUpdates"),
+                params={"timeout": 25, "offset": offset,
+                        "allowed_updates": json.dumps(["message"])},
+                timeout=35,
+            )
+            if r.status_code == 409:
+                print("TELEGRAM 409: another poller is active; retrying")
+                time.sleep(conflict_wait)
+                conflict_wait = min(conflict_wait * 2, 30)
+                continue
+            r.raise_for_status()
+            conflict_wait = 3
+            for upd in r.json().get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message") or {}
+                chat = msg.get("chat") or {}
+                text = (msg.get("text") or "").strip()
+                if not chat.get("id"):
+                    continue
+                active_chat_id = chat["id"]
+                if text.startswith("/start"):
+                    send_message(active_chat_id,
+                        "🚀 SAIWAN — 1H Trendline Breakout\n\n"
+                        "/scan — start scanner\n"
+                        "/stop — stop scanner\n"
+                        "/status — status\n\n"
+                        "Market: CRYPTO ONLY\n"
+                        "Exchange: Bitget USDT Perpetual Futures\n"
+                        "Timeframe: 1H only\n"
+                        "LONG: closed candle above descending trendline\n"
+                        "SHORT: closed candle below ascending trendline\n"
+                        "TP/SL monitoring: ENABLED")
+                elif text.startswith("/scan"):
+                    start_scanner(active_chat_id)
+                    send_message(active_chat_id,
+                        "🚀 SAIWAN scanner started.\n\n"
+                        "CRYPTO ONLY • USDT perpetuals • 1H CLOSED candles\n"
+                        "Trendline breakout only.\n"
+                        "Entry = breakout close • SL = structural swing • TP1/2/3 = 1R/2R/3R.\n"
+                        "TP/SL notifications are enabled.")
+                elif text.startswith("/stop"):
+                    stop_scanner()
+                    send_message(active_chat_id, "🛑 SAIWAN scanner stopped.")
+                elif text.startswith("/status"):
+                    send_message(active_chat_id, status_text())
+        except Exception as exc:
+            print(f"TELEGRAM ERROR: {type(exc).__name__}: {exc}")
+            time.sleep(3)
+
+
+def start_background_services():
+    global telegram_thread, monitor_thread
+    if not TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+    try:
+        requests.post(telegram_url("deleteWebhook"), data={"drop_pending_updates": "false"}, timeout=10)
+    except Exception as exc:
+        print(f"Webhook cleanup warning: {type(exc).__name__}: {exc}")
+    telegram_thread = threading.Thread(target=poll_updates, name="telegram-poller", daemon=True)
+    monitor_thread = threading.Thread(target=monitor_active_signals, name="tp-sl-monitor", daemon=True)
+    telegram_thread.start()
+    monitor_thread.start()
 
 
 @app.get("/")
-def home():
-    return "SAIWAN Trendline Breakout ONLINE"
+def health():
+    return jsonify({"ok": True, "bot": "SAIWAN", "market": "crypto-only", "timeframe": TIMEFRAME})
 
 
 @app.get("/status")
-def status():
-    return jsonify({**state, "strategy": "15m Trendline + CLOSED candle breakout", "market": PRODUCT_TYPE})
+def health_status():
+    return jsonify({
+        "ok": True,
+        "scanner_running": scanner_running,
+        "active_signals": len(active_signals),
+        "stats": stats,
+    })
 
 
-def start_threads():
-    threading.Thread(target=telegram_poll_loop, daemon=True).start()
-    threading.Thread(target=scan_loop, daemon=True).start()
+_services_started = False
+_services_lock = threading.Lock()
 
 
-start_threads()
+def ensure_services():
+    global _services_started
+    if _services_started:
+        return
+    with _services_lock:
+        if _services_started:
+            return
+        start_background_services()
+        _services_started = True
+
+
+# Gunicorn imports bot:app, so initialize the background workers at import time.
+ensure_services()
