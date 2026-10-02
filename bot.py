@@ -34,6 +34,7 @@ MIN_SCORE = 5
 
 SAIWAN_AI_URL = os.getenv("SAIWAN_AI_URL", "").rstrip("/")
 SAIWAN_AI_API_KEY = os.getenv("SAIWAN_AI_API_KEY", "")
+saiwan_ai_client = bool(SAIWAN_AI_URL and SAIWAN_AI_API_KEY)
 AI_REQUIRED = os.getenv("AI_REQUIRED", "true").strip().lower() not in {"0", "false", "no", "off"}
 AI_TIMEOUT = 15
 # Groq free/on-demand limits are organization-wide. Serialize AI calls and
