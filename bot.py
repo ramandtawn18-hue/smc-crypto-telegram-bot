@@ -32,27 +32,6 @@ CHART_CANDLES = 70
 HTTP_TIMEOUT = 15
 MIN_SCORE = 5
 
-SAIWAN_AI_URL = os.getenv("SAIWAN_AI_URL", "").rstrip("/")
-SAIWAN_AI_API_KEY = os.getenv("SAIWAN_AI_API_KEY", "")
-saiwan_ai_client = bool(SAIWAN_AI_URL and SAIWAN_AI_API_KEY)
-AI_REQUIRED = os.getenv("AI_REQUIRED", "true").strip().lower() not in {"0", "false", "no", "off"}
-AI_TIMEOUT = 15
-# Serialize private SAIWAN AI calls and keep a small gap between requests.
-AI_MIN_INTERVAL = float(os.getenv("AI_MIN_INTERVAL", "3.0"))
-AI_MAX_RETRIES = 2
-# AI is only used for the strongest ICT candidates after the full market scan.
-AI_MAX_REVIEWS_PER_SCAN = int(os.getenv("AI_MAX_REVIEWS_PER_SCAN", "5"))
-ai_call_lock = threading.Lock()
-ai_last_call = 0.0
-
-# SAIWAN AI Market Radar / risk-aware leverage (informational only)
-RADAR_MIN_SCORE = 72
-MAX_SUGGESTED_LEVERAGE = 5
-MIN_SUGGESTED_LEVERAGE = 2
-
-TP1_R = 1.5
-TP2_R = 2.5
-TP3_R = 4.0
 
 app = Flask(__name__)
 stop_event = threading.Event()
@@ -70,6 +49,20 @@ active_signals = {}  # key -> tracked signal state for TP/SL notifications
 signal_history = []  # sent signal summaries for /search
 MAX_SIGNAL_HISTORY = 500
 monitor_thread = None
+
+# Live scanner diagnostics (shown by /status).
+scan_stats_lock = threading.Lock()
+scan_stats = {
+    "last_at": None,
+    "last_duration": 0.0,
+    "universe": 0,
+    "scanned": 0,
+    "confirmed": 0,
+    "ict_candidates": 0,
+    "insufficient_data": 0,
+    "errors": 0,
+    "error_summary": "",
+}
 
 session = requests.Session()
 session.headers.update({"User-Agent": "SAIWAN-Crypto-Signal-Move-Hunter/5.0", "Accept": "application/json"})
@@ -536,406 +529,92 @@ def _context_15m(rows15, direction):
 
 
 def _move_setup(rows, direction):
-    """Build an early ICT setup from the liquidity-sweep origin.
+    """Pure Liquidity Sweep setup.
 
-    Core rule:
-      LONG  = sell-side sweep -> bullish MSS/CHOCH -> OB/FVG origin
-      SHORT = buy-side sweep  -> bearish MSS/CHOCH -> OB/FVG origin
-
-    The execution price is taken from the OB/FVG origin zone, not from the
-    latest market close. If the move has already extended too far away from
-    that origin, the setup is rejected rather than chased.
+    The sweep price itself is the entry.  No MSS/CHOCH/FVG/OB/AI confirmation.
+    LONG = sell-side liquidity sweep; SHORT = buy-side liquidity sweep.
+    SL is the sweep candle extreme. TPs are pre-existing opposing liquidity/swing levels.
     """
-    if len(rows) < 120:
+    if len(rows) < 80:
         return None
-
     candidates = _sweep_candidates(rows)
     for direction0, sweep_idx, liquidity in reversed(candidates):
-        if direction0 != direction or sweep_idx >= len(rows) - 1:
+        if direction0 != direction:
+            continue
+        if sweep_idx >= len(rows) - 1:
+            continue
+        sweep = rows[sweep_idx]
+        entry = float(liquidity)
+        if entry <= 0:
             continue
 
-        # The sweep must be recent enough to still represent the current move.
-        if len(rows) - 1 - sweep_idx > 8:
+        # The sweep candle itself is the structural invalidation reference.
+        sl = float(sweep["low"] if direction == "LONG" else sweep["high"])
+        if direction == "LONG" and sl >= entry:
+            continue
+        if direction == "SHORT" and sl <= entry:
             continue
 
-        sweep_candle = rows[sweep_idx]
-        structure = _structure_break(rows, direction, sweep_idx, len(rows) - 1)
-        if not structure:
-            continue
-        mss_idx = structure["index"]
-        if mss_idx <= sweep_idx or mss_idx - sweep_idx > 6:
-            continue
-
-        # Require real displacement after the sweep.
-        displacement = rows[mss_idx]
-        if _body_ratio(displacement) < 0.45:
-            continue
-        if direction == "LONG" and displacement["close"] <= displacement["open"]:
-            continue
-        if direction == "SHORT" and displacement["close"] >= displacement["open"]:
-            continue
-
-        # FVG must belong to the post-sweep displacement leg.
-        fvg = _find_fvg(rows, direction, max(2, mss_idx - 1), min(len(rows), mss_idx + 4))
-        if not fvg or fvg["index"] <= sweep_idx:
-            continue
-
-        ob = _find_order_block(rows, direction, fvg["index"] + 1)
-        if not ob or ob["index"] <= sweep_idx:
-            continue
-
-        # Prefer the actual OB/FVG overlap as the execution origin. If they do
-        # not overlap, use the OB itself; both are still anchored to the sweep.
-        zone = _overlap(fvg, ob) or dict(ob)
-        if zone["high"] <= zone["low"]:
-            continue
-
-        # Keep the entry at the setup origin, never at the latest close.
-        entry = (zone["low"] + zone["high"]) / 2.0
-        cur = rows[-1]["close"]
-        zone_width = max(zone["high"] - zone["low"], cur * 1e-9)
-
-        # Do not chase a move that has already escaped its origin zone.
-        # A small extension is acceptable because the signal is a limit-style
-        # origin entry; a large extension is rejected completely.
+        # Targets are opposing liquidity/swing levels that already existed
+        # before the sweep. Never manufacture R-multiple targets.
+        prior = rows[:sweep_idx]
+        highs, lows = swing_points(prior, 2, 2)
         if direction == "LONG":
-            if cur < zone["low"]:
-                # Price below the origin means the setup has not confirmed cleanly.
-                continue
-            extension = max(0.0, cur - zone["high"]) / zone_width
+            targets = sorted({float(p) for _, p in highs if p > entry})
         else:
-            if cur > zone["high"]:
-                continue
-            extension = max(0.0, zone["low"] - cur) / zone_width
-        if extension > 2.0:
+            targets = sorted({float(p) for _, p in lows if p < entry}, reverse=True)
+        targets = targets[:3]
+        if not targets:
             continue
+        tp1 = targets[0]
+        tp2 = targets[1] if len(targets) > 1 else None
+        tp3 = targets[2] if len(targets) > 2 else None
 
-        # Structural invalidation: the sweep extreme and the OB must remain
-        # intact. No fixed 0.05%/0.1% percentage padding and no ATR.
-        if direction == "LONG":
-            protected_low = min(sweep_candle["low"], ob["low"], zone["low"])
-            sl = protected_low
-            if sl >= entry:
-                continue
-            risk = entry - sl
-        else:
-            protected_high = max(sweep_candle["high"], ob["high"], zone["high"])
-            sl = protected_high
-            if sl <= entry:
-                continue
-            risk = sl - entry
-
-        # Reject structurally invalid or unusably tight stops; never widen them
-        # artificially just to make the signal pass.
-        min_structural_risk = max(zone_width * 0.50, abs(entry) * 0.0005)
-        if risk < min_structural_risk:
-            continue
-
-        # TP targets come only from opposing liquidity/confirmed swing structure.
-        # No R-multiple fallback: if there are not enough structural targets,
-        # keep the setup out of the signal queue instead of inventing targets.
-        highs, lows = swing_points(rows[:mss_idx + 1], 2, 2)
-        if direction == "LONG":
-            targets = sorted({p for _, p in highs if p > entry * 1.0005})
-            targets = [p for p in targets if p > entry and p < cur * 10]
-        else:
-            targets = sorted({p for _, p in lows if p < entry * 0.9995}, reverse=True)
-            targets = [p for p in targets if p < entry and p > cur / 10]
-
-        # Include the post-sweep structure's opposing liquidity if available.
-        if direction == "LONG":
-            later_highs, _ = swing_points(rows[mss_idx + 1:], 2, 2)
-            targets += [p for _, p in later_highs if p > entry]
-            targets = sorted(set(targets))
-        else:
-            _, later_lows = swing_points(rows[mss_idx + 1:], 2, 2)
-            targets += [p for _, p in later_lows if p < entry]
-            targets = sorted(set(targets), reverse=True)
-
-        if len(targets) < 3:
-            continue
-
-        tp1, tp2, tp3 = targets[0], targets[1], targets[2]
-        if direction == "LONG":
-            # If price has already passed a target before the origin entry can
-            # fill, that target is no longer a valid forward objective.
-            floor = max(entry, cur)
-            targets = [p for p in targets if p > floor]
-        else:
-            ceiling = min(entry, cur)
-            targets = [p for p in targets if p < ceiling]
-        if len(targets) < 3:
-            continue
-        tp1, tp2, tp3 = targets[0], targets[1], targets[2]
-        if direction == "LONG" and not (entry < tp1 < tp2 < tp3):
-            continue
-        if direction == "SHORT" and not (entry > tp1 > tp2 > tp3):
-            continue
-
+        # Signal identity is the sweep candle timestamp. The same sweep can
+        # therefore never be sent twice on subsequent 60s scans.
         return {
             "symbol": "", "direction": direction,
-            "structure": "Liquidity Sweep + MSS + CHOCH + FVG + OB",
-            "entry": entry, "current_price": cur, "trigger_level": structure["level"], "sl": sl,
-            "tp1": tp1, "tp2": tp2, "tp3": tp3,
-            "entry_zone_low": zone["low"], "entry_zone_high": zone["high"],
-            "score": 5, "max_score": 5, "time": rows[-1]["time"],
-            "liquidity": liquidity, "sweep_price": liquidity,
-            "sweep_index": sweep_idx, "sweep_low": sweep_candle["low"],
-            "sweep_high": sweep_candle["high"],
-            "mss_index": mss_idx, "mss_level": structure["level"],
-            "fvg": fvg, "ob": ob, "entry_zone": zone,
-            "origin_type": "OB + FVG" if _overlap(fvg, ob) else "OB",
-            "extension_from_origin": extension,
-            "risk_distance": risk,
-            "rows": rows[max(0, sweep_idx-18):], "full_len": len(rows),
-            "checks": {"Liquidity Sweep": True, "MSS": True, "FVG": True, "OB": True, "CHOCH": True},
-            "retest_ok": False, "rejection_ok": True, "early_entry": True,
+            "structure": "Liquidity Sweep ONLY",
+            "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+            "entry_zone_low": entry, "entry_zone_high": entry,
+            "time": sweep["time"],
+            "liquidity": entry, "sweep_index": sweep_idx,
+            "sweep_high": float(sweep["high"]), "sweep_low": float(sweep["low"]),
+            "rows": rows[max(0, sweep_idx-25):], "full_len": len(rows),
+            "checks": {"Liquidity Sweep": True},
+            "early_entry": True,
+            "entry_pending": True,
         }
     return None
 
 
-
-def _compact_candles(rows, count=36):
-    """Keep the AI prompt small: recent closed candles only."""
-    out = []
-    for r in rows[-count:]:
-        out.append({
-            "t": r["time"],
-            "o": round(r["open"], 10),
-            "h": round(r["high"], 10),
-            "l": round(r["low"], 10),
-            "c": round(r["close"], 10),
-        })
-    return out
-
-
-def _ai_json(text):
-    """Extract a JSON object from the model's text response."""
-    text = (text or "").strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:].strip()
-    try:
-        return json.loads(text)
-    except Exception:
-        start, end = text.find("{"), text.rfind("}")
-        if start >= 0 and end > start:
-            return json.loads(text[start:end + 1])
-    raise ValueError("AI returned invalid JSON")
-
-
-def _saiwan_ai_analyze(payload):
-    """Call the private SAIWAN AI v1 decision API."""
-    global ai_last_call
-    if not SAIWAN_AI_URL:
-        raise RuntimeError("SAIWAN_AI_URL is missing")
-    if not SAIWAN_AI_API_KEY:
-        raise RuntimeError("SAIWAN_AI_API_KEY is missing")
-
-    url = f"{SAIWAN_AI_URL}/analyze"
-    headers = {
-        "Authorization": f"Bearer {SAIWAN_AI_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-
-    with ai_call_lock:
-        wait = AI_MIN_INTERVAL - (time.monotonic() - ai_last_call)
-        if wait > 0:
-            time.sleep(wait)
-        for attempt in range(AI_MAX_RETRIES + 1):
-            try:
-                r = requests.post(url, headers=headers, json=payload, timeout=AI_TIMEOUT)
-                ai_last_call = time.monotonic()
-            except requests.RequestException as e:
-                ai_last_call = time.monotonic()
-                if attempt >= AI_MAX_RETRIES:
-                    raise RuntimeError(f"SAIWAN AI connection failed: {type(e).__name__}: {e}")
-                time.sleep(min(3.0, 0.8 * (attempt + 1)))
-                continue
-
-            if r.ok:
-                data = r.json()
-                if not isinstance(data, dict):
-                    raise RuntimeError("SAIWAN AI returned invalid JSON")
-                return data
-
-            if r.status_code in (429, 500, 502, 503, 504) and attempt < AI_MAX_RETRIES:
-                time.sleep(min(5.0, 1.0 * (attempt + 1)))
-                continue
-
-            try:
-                detail = r.json()
-            except Exception:
-                detail = r.text[:500]
-            raise RuntimeError(f"SAIWAN AI HTTP {r.status_code}: {detail}")
-
-    raise RuntimeError("SAIWAN AI request failed")
-
-
-AI_REVIEW_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "decision": {"type": "string", "enum": ["CONFIRM", "WAIT", "REJECT"]},
-        "timing": {"type": "string", "enum": ["EARLY", "READY", "LATE", "INVALID"]},
-        "direction": {"type": "string", "enum": ["LONG", "SHORT"]},
-        "reason": {"type": "string"},
-        "reversal_watch": {"type": "boolean"}
-    },
-    "required": ["decision", "timing", "direction", "reason", "reversal_watch"],
-    "additionalProperties": False
-}
-
-
-def ai_review_setup(sig, rows5, rows15):
-    """SAIWAN AI is the private ICT decision/timing layer."""
-    if not saiwan_ai_client:
-        if AI_REQUIRED:
-            return None, "SAIWAN AI unavailable: URL/API key missing"
-        return {"decision": "CONFIRM", "timing": "READY", "reason": "AI disabled", "reversal_watch": False}, None
-
-    zone = sig.get("entry_zone") or {}
-    lo, hi = zone.get("low"), zone.get("high")
-    current = None
-    if rows5:
-        current = rows5[-1].get("close")
-    proximity = 0.0
-    try:
-        lo, hi, current = float(lo), float(hi), float(current)
-        width = max(abs(hi - lo), abs(current) * 1e-9)
-        if lo <= current <= hi:
-            proximity = 1.0
-        else:
-            distance = min(abs(current - lo), abs(current - hi))
-            proximity = max(0.0, 1.0 - distance / (width * 2.0))
-    except (TypeError, ValueError):
-        proximity = 0.0
-
-    checks = sig.get("checks") or {}
-    payload = {
-        "symbol": sig["symbol"],
-        "direction": sig["direction"],
-        "liquidity_sweep": bool(checks.get("Liquidity Sweep", True)),
-        "mss": bool(checks.get("MSS", True)),
-        "choch": bool(checks.get("CHOCH", True)),
-        "fvg": bool(sig.get("fvg")),
-        "ob": bool(sig.get("ob")),
-        "context_15m": sig.get("context15") in {"BULLISH CONTEXT", "BEARISH CONTEXT"},
-        "entry_proximity": round(proximity, 4),
-        "fresh_setup": bool(sig.get("early_entry", False)) and sig.get("ict_age", 99) <= 3,
-        "entry": sig.get("entry"),
-        "entry_zone_low": sig.get("entry_zone_low"),
-        "entry_zone_high": sig.get("entry_zone_high"),
-        "origin_type": sig.get("origin_type"),
-        "extension_from_origin": sig.get("extension_from_origin"),
-        "sl": sig.get("sl"),
-        "tp1": sig.get("tp1"),
-        "tp2": sig.get("tp2"),
-        "tp3": sig.get("tp3"),
-        "context15": sig.get("context15"),
-        "execution_rule": "Entry must stay at the OB/FVG origin after the liquidity sweep; reject late/chased entries. SL must be structural invalidation; TP1-TP3 must be structural liquidity targets.",
-    }
-    try:
-        result = _saiwan_ai_analyze(payload)
-        decision = str(result.get("decision", "REJECT")).upper()
-        timing = str(result.get("timing", "INVALID")).upper()
-        direction = str(result.get("direction", sig["direction"])).upper()
-        if decision not in {"CONFIRM", "WAIT", "REJECT"}:
-            decision = "REJECT"
-        if timing not in {"EARLY", "READY", "LATE", "INVALID", "WAIT"}:
-            timing = "INVALID"
-        if direction != sig["direction"]:
-            decision = "REJECT"
-        result.update({
-            "decision": decision,
-            "timing": timing,
-            "direction": direction,
-            "reversal_watch": bool(result.get("reversal_watch", False)),
-        })
-        return result, None
-    except Exception as e:
-        return None, f"SAIWAN AI review failed: {type(e).__name__}: {e}"
-
-
-def build_ict_candidates(symbol, rows5, rows15=None):
-    """Build ICT candidates without calling AI. Used for the full-market first pass."""
-    if len(rows5) < 120:
-        return []
+def analyze(symbol, rows5, rows15=None, diagnostics=False):
+    """Pure Liquidity Sweep scanner. No AI and no secondary indicators/structure filters."""
+    diag = {"ict_candidates": 0, "insufficient_data": 0}
+    if len(rows5) < 80:
+        return (None, diag) if diagnostics else None
     for r in rows5:
         r["symbol"] = symbol
-    out = []
+    candidates = []
     for direction in ("LONG", "SHORT"):
         sig = _move_setup(rows5, direction)
-        if not sig:
-            continue
-        sig["symbol"] = symbol
-        sig["_ai_rows5"] = rows5
-        sig["_ai_rows15"] = rows15 or []
-        sig["context15"] = _context_15m(rows15, direction)
-        sig["timeframe"] = "5m Entry · 15m Context"
-        sig["ict_age"] = max(0, len(rows5) - 1 - int(sig.get("mss_index", len(rows5) - 1)))
-        zone = sig.get("entry_zone") or {}
-        lo, hi = zone.get("low"), zone.get("high")
-        cur = rows5[-1].get("close")
-        if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and isinstance(cur, (int, float)):
-            width = max(abs(hi - lo), abs(cur) * 1e-9)
-            if lo <= cur <= hi:
-                sig["zone_distance"] = 0.0
-            else:
-                sig["zone_distance"] = min(abs(cur - lo), abs(cur - hi)) / width
-        else:
-            sig["zone_distance"] = 999.0
-        sig["context_match"] = (
-            1 if ((direction == "LONG" and sig["context15"] == "BULLISH CONTEXT") or
-                  (direction == "SHORT" and sig["context15"] == "BEARISH CONTEXT")) else 0
-        )
-        # 15m context disagreement is a hard no-signal rule.
-        if sig["context_match"] != 1:
-            continue
-        out.append(sig)
-    return out
-
-
-def _ict_candidate_rank(sig):
-    """ICT-only preselection: context, origin freshness, and proximity."""
-    return (
-        sig.get("context_match", 0),
-        -sig.get("ict_age", 99),
-        -sig.get("extension_from_origin", 999.0),
-        -sig.get("zone_distance", 999.0),
-        sig.get("time", 0),
-    )
-
-
-def analyze(symbol, rows5, rows15=None):
-    """SAIWAN Move Hunter: ICT setup + one optional AI timing review."""
-    candidates = build_ict_candidates(symbol, rows5, rows15)
-    if not candidates:
-        return None
-    reviewed = []
-    for sig in candidates:
-        ai, err = ai_review_setup(sig, rows5, rows15 or [])
-        if err:
-            print(f"AI REVIEW {symbol} {sig['direction']}: {err}")
-            continue
-        if not ai or ai.get("decision") != "CONFIRM":
-            continue
-        sig["ai_timing"] = ai.get("timing", "READY")
-        sig["ai_reason"] = ai.get("reason", "ICT setup confirmed")
-        sig["ai_reversal_watch"] = bool(ai.get("reversal_watch", False))
-        reviewed.append(sig)
-    return max(reviewed, key=lambda x: x["time"]) if reviewed else None
+        if sig:
+            diag["ict_candidates"] += 1
+            sig["symbol"] = symbol
+            sig["timeframe"] = "5m Liquidity Sweep"
+            candidates.append(sig)
+    result = max(candidates, key=lambda x: x["time"]) if candidates else None
+    return (result, diag) if diagnostics else result
 
 def make_chart(sig):
-    """Render the SAIWAN Move Hunter setup with every ICT component annotated."""
+    """Professional 5m chart showing only the Liquidity Sweep and trade levels."""
     rows = sig["rows"]
     n = len(rows)
     direction = sig["direction"]
     entry, sl = sig["entry"], sig["sl"]
-    tp1, tp2, tp3 = sig["tp1"], sig["tp2"], sig["tp3"]
+    tps = [(sig.get("tp1"), "TP1"), (sig.get("tp2"), "TP2"), (sig.get("tp3"), "TP3")]
     BG, GRID, TEXT, MUTED = "#f7f7f8", "#e4e6e8", "#17191c", "#73777d"
-    UP, DOWN, GOLD, PURPLE = "#16a085", "#e14b55", "#c8a84e", "#7957d5"
+    UP, DOWN = "#16a085", "#e14b55"
     fig, ax = plt.subplots(figsize=(14.4, 7.8), dpi=170, facecolor=BG)
     ax.set_facecolor(BG)
     width = 0.58
@@ -945,56 +624,32 @@ def make_chart(sig):
         lo = min(r["open"], r["close"])
         bh = max(abs(r["close"]-r["open"]), abs(r["close"])*1e-5)
         ax.add_patch(Rectangle((i-width/2, lo), width, bh, facecolor=c, edgecolor=c, linewidth=.5, zorder=4))
-
     right = n + 14
-    fvg = sig["fvg"]; ob = sig["ob"]; zone = sig["entry_zone"]
-    def box(z, color, alpha, label, yoff=0):
-        local_index = z.get("index", 0) - (sig.get("full_len", n) - n) if "index" in z else 0
-        x0 = max(0, min(n-1, local_index - max(3, n//10)))
-        ax.add_patch(Rectangle((x0, z["low"]), right-x0, z["high"]-z["low"], facecolor=color, edgecolor=color, alpha=alpha, linewidth=1.0, zorder=1))
-        ax.text(x0+1, z["high"]+yoff, label, color=color, fontsize=8.2, fontweight="bold", va="bottom", zorder=6)
-
-    box(ob, GOLD, .13, "ORDER BLOCK")
-    box(fvg, PURPLE, .15, "FVG")
-    ax.add_patch(Rectangle((max(0, fvg["index"]-2), zone["low"]), right-max(0, fvg["index"]-2), zone["high"]-zone["low"], facecolor=PURPLE, edgecolor=PURPLE, alpha=.08, linewidth=1.2, zorder=0))
-    ax.text(max(0, fvg["index"]-1), zone["high"], "ENTRY ZONE", color=PURPLE, fontsize=8, fontweight="bold", va="bottom")
-
-    # Map stored indices from full series to chart-local indices using timestamp.
-    times = {r["time"]: i for i, r in enumerate(rows)}
-    full_rows = rows
+    offset = sig.get("full_len", n) - n
+    sweep_local = sig["sweep_index"] - offset
     sweep_price = sig["liquidity"]
-    # Sweep and MSS indices are converted approximately from the setup's latest
-    # chart window by matching the closest candle timestamp when possible.
-    sweep_local = max(0, n-1)
-    mss_local = max(0, n-1)
-    # The stored setup indices refer to the full scan; derive their local offset
-    # from the visible window size.
-    full_len_hint = sig.get("full_len", n)
-    sweep_local = sig["sweep_index"] - (full_len_hint - n)
-    mss_local = sig["mss_index"] - (full_len_hint - n)
     if 0 <= sweep_local < n:
-        ax.scatter([sweep_local], [sweep_price], s=55, marker="v" if direction == "SHORT" else "^", color=DOWN if direction == "SHORT" else UP, zorder=8)
-        ax.annotate("LIQUIDITY SWEEP", xy=(sweep_local, sweep_price), xytext=(max(0,sweep_local-10), sweep_price), arrowprops=dict(arrowstyle="->", color=DOWN if direction=="SHORT" else UP, lw=1.4), color=DOWN if direction=="SHORT" else UP, fontsize=8.4, fontweight="bold")
-    if 0 <= mss_local < n:
-        ax.axhline(sig["mss_level"], color=GOLD, linestyle="--", linewidth=1.0, alpha=.85)
-        ax.annotate("MSS / CHOCH", xy=(mss_local, sig["mss_level"]), xytext=(max(0,mss_local-10), sig["mss_level"]), arrowprops=dict(arrowstyle="->", color=GOLD, lw=1.4), color=GOLD, fontsize=8.4, fontweight="bold")
-
-    ax.axhline(entry, color=TEXT, linewidth=1.15, linestyle="--")
+        c = DOWN if direction == "SHORT" else UP
+        ax.scatter([sweep_local], [sweep_price], s=65, marker="v" if direction == "SHORT" else "^", color=c, zorder=8)
+        ax.annotate("LIQUIDITY SWEEP / ENTRY", xy=(sweep_local, sweep_price),
+                    xytext=(max(0, sweep_local-12), sweep_price),
+                    arrowprops=dict(arrowstyle="->", color=c, lw=1.5),
+                    color=c, fontsize=8.8, fontweight="bold")
+    ax.axhline(entry, color=TEXT, linewidth=1.2, linestyle="--")
     ax.axhline(sl, color=DOWN, linewidth=1.0)
-    for y, lab, c in [(tp1,"TP1",UP),(tp2,"TP2",UP),(tp3,"TP3",UP)]:
-        ax.axhline(y, color=c, linewidth=.9, linestyle=":")
-        ax.text(right+.3, y, f"{lab} {fmt_price(y)}", color=c, fontsize=8, fontweight="bold", va="center")
+    for y, lab in tps:
+        if y is None:
+            continue
+        ax.axhline(y, color=UP, linewidth=.9, linestyle=":")
+        ax.text(right+.3, y, f"{lab} {fmt_price(y)}", color=UP, fontsize=8, fontweight="bold", va="center")
     ax.text(right+.3, entry, f"ENTRY {fmt_price(entry)}", color=TEXT, fontsize=8, fontweight="bold", va="center")
     ax.text(right+.3, sl, f"SL {fmt_price(sl)}", color=DOWN, fontsize=8, fontweight="bold", va="center")
-
     arrow_color = UP if direction == "LONG" else DOWN
-    ax.scatter([n-1], [entry], s=42, color=arrow_color, edgecolor="white", linewidth=.8, zorder=9)
-    ax.annotate(direction, xy=(n-1, entry), xytext=(max(0,n-15), entry), arrowprops=dict(arrowstyle="->", color=arrow_color, lw=1.7), color=arrow_color, fontsize=10, fontweight="bold")
-    ax.text(.01, 1.055, f"{sig['symbol']} · SAIWAN CRYPTO SIGNAL · 5m ENTRY · Bitget Futures", transform=ax.transAxes, fontsize=15, color=TEXT, fontweight="bold")
-    ax.text(.01, 1.018, "LIQUIDITY SWEEP → MSS → CHOCH → FVG → OB → ENTRY", transform=ax.transAxes, fontsize=9.5, color=PURPLE, fontweight="bold")
+    ax.scatter([sweep_local], [entry], s=42, color=arrow_color, edgecolor="white", linewidth=.8, zorder=9)
+    ax.text(.01, 1.055, f"{sig['symbol']} · SAIWAN CRYPTO SIGNAL · 5m · Bitget Futures", transform=ax.transAxes, fontsize=15, color=TEXT, fontweight="bold")
+    ax.text(.01, 1.018, "LIQUIDITY SWEEP → ENTRY", transform=ax.transAxes, fontsize=9.5, color=arrow_color, fontweight="bold")
     ax.text(.99, 1.018, direction, transform=ax.transAxes, fontsize=11, color=arrow_color, fontweight="bold", ha="right")
-    ax.text(.01, .018, "SAIWAN Move Hunter · 5m closed entry · 15m context · ICT price action only", transform=ax.transAxes, fontsize=8.2, color=MUTED)
-
+    ax.text(.01, .018, "SAIWAN · Liquidity Sweep only · closed candles", transform=ax.transAxes, fontsize=8.2, color=MUTED)
     ax.yaxis.tick_right(); ax.tick_params(axis="y", colors=TEXT, labelsize=8.3, length=0)
     ax.tick_params(axis="x", colors=MUTED, labelsize=8, length=0, pad=8)
     ax.grid(axis="y", color=GRID, linewidth=.6); ax.grid(axis="x", color=GRID, linewidth=.4, alpha=.5)
@@ -1003,14 +658,14 @@ def make_chart(sig):
     step=max(1,n//7); ticks=list(range(0,n,step))
     if ticks[-1] != n-1: ticks.append(n-1)
     ax.set_xticks(ticks); ax.set_xticklabels([datetime.fromtimestamp(rows[i]["time"], tz=timezone.utc).strftime("%d\\n%H:%M") for i in ticks])
-    all_lows=[r["low"] for r in rows]+[sl,tp3,ob["low"],fvg["low"]]
-    all_highs=[r["high"] for r in rows]+[sl,tp3,ob["high"],fvg["high"]]
+    levels=[x for x in [entry,sl]+[p for p,_ in tps if p is not None]]
+    all_lows=[r["low"] for r in rows]+levels
+    all_highs=[r["high"] for r in rows]+levels
     ymin,ymax=min(all_lows),max(all_highs); span=max(ymax-ymin,abs(rows[-1]["close"])*.012)
     ax.set_ylim(ymin-span*.06,ymax+span*.12); ax.set_xlim(-1,right+8)
     fig.subplots_adjust(left=.035,right=.86,top=.89,bottom=.09)
     safe="".join(ch if ch.isalnum() else "_" for ch in sig["symbol"])
     path=f"/tmp/chart_{safe}_{sig['time']}.png"; fig.savefig(path,facecolor=BG,edgecolor="none"); plt.close(fig); return path
-
 
 def telegram_url(method):
     if not TOKEN:
@@ -1058,62 +713,38 @@ def search_signals(query):
         arrow = "🟢 LONG" if x["direction"] == "LONG" else "🔴 SHORT"
         lines.append(f"{arrow} {x['symbol']} · {dt}")
         lines.append(f"Entry {fmt_price(x['entry'])} · SL {fmt_price(x['sl'])} · TP1 {fmt_price(x['tp1'])}")
-        if x.get("ai_reason"):
-            lines.append(f"AI: {x['ai_reason']}")
         lines.append("")
     return "\n".join(lines).strip()
 
 
-def ai_test():
-    """Telegram diagnostic for the private SAIWAN AI service."""
-    if not saiwan_ai_client:
-        return "❌ AI TEST FAILED\nSAIWAN_AI_URL or SAIWAN_AI_API_KEY is missing."
-    try:
-        r = requests.get(
-            f"{SAIWAN_AI_URL}/health",
-            headers={"Authorization": f"Bearer {SAIWAN_AI_API_KEY}"},
-            timeout=AI_TIMEOUT,
-        )
-        if not r.ok:
-            return f"❌ AI TEST FAILED\nHTTP {r.status_code}: {r.text[:300]}"
-        data = r.json()
-        test = _saiwan_ai_analyze({
-            "direction": "LONG",
-            "liquidity_sweep": True,
-            "mss": True,
-            "choch": True,
-            "fvg": True,
-            "ob": True,
-            "context_15m": True,
-            "entry_proximity": 1.0,
-            "fresh_setup": True,
-        })
-        return (
-            "✅ SAIWAN AI TEST OK\n"
-            f"Service: {data.get('service', 'SAIWAN AI')}\n"
-            f"Decision: {test.get('decision')}\n"
-            f"Timing: {test.get('timing')}"
-        )
-    except Exception as e:
-        return f"❌ AI TEST FAILED\n{type(e).__name__}: {e}"
-
-
 def status_text():
     with state_lock:
-        return (
-            "BOT STATUS: ONLINE\n"
-            f"Scanner: {'RUNNING' if scanner_running else 'STOPPED'}\n"
-            "Market: Bitget USDT Perpetual Futures (full eligible market)\n"
-            "Strategy: SAIWAN CRYPTO SIGNAL — Move Hunter\n"
-            "Model: SAIWAN Move Hunter — Liquidity Sweep + MSS + CHOCH + FVG + OB\n"
-            "Data source: Bitget Futures market data\n"
-            "Scan: 5m closed candles + 15m context\n"
-            f"Pending signals: {len(pending_signals)}\n"
-            f"Tracked signals: {len(active_signals)}\n"
-            f"AI: SAIWAN AI v1 {'CONNECTED' if saiwan_ai_client else 'NOT CONNECTED'} · max {AI_MAX_REVIEWS_PER_SCAN}/scan\n"
-            "Chart: ICT components annotated\n"
-            "TradingView: chart link only"
-        )
+        scanner = scanner_running
+        pending = len(pending_signals)
+        tracked = len(active_signals)
+    with scan_stats_lock:
+        st = dict(scan_stats)
+    return (
+        "BOT STATUS: ONLINE\n"
+        f"Scanner: {'RUNNING' if scanner else 'STOPPED'}\n"
+        "Market: Bitget USDT Perpetual Futures\n"
+        "Strategy: LIQUIDITY SWEEP ONLY\n"
+        "Entry: exact liquidity-sweep level\n"
+        "SL: sweep candle extreme\n"
+        "TP: opposing pre-existing liquidity/swing levels\n"
+        "AI: DISABLED / REMOVED\n"
+        f"Pending signals: {pending}\n"
+        f"Tracked signals: {tracked}\n"
+        f"Last scan (UTC): {st.get('last_at') or 'never'}\n"
+        f"Duration: {st.get('last_duration', 0.0):.1f}s\n"
+        f"Universe: {st.get('universe', 0)}\n"
+        f"Scanned: {st.get('scanned', 0)}\n"
+        f"Liquidity sweeps found: {st.get('ict_candidates', 0)}\n"
+        f"Signals confirmed: {st.get('confirmed', 0)}\n"
+        f"Data too short: {st.get('insufficient_data', 0)}\n"
+        f"Scan errors: {st.get('errors', 0)}\n"
+        f"Error summary: {st.get('error_summary') or 'none'}"
+    )
 
 def _error_bucket(exc):
     msg = str(exc).replace("\n", " ").strip()
@@ -1130,8 +761,8 @@ def _error_bucket(exc):
 
 
 def scan_once():
-    """Two-phase scan: full-market ICT pass, then AI reviews only top candidates."""
     global pending_signals
+    started = time.time()
     contracts = get_contracts()
     tickers = get_tickers()
     tv = {x.get("symbol"): x for x in tickers}
@@ -1150,83 +781,67 @@ def scan_once():
     def check_symbol(symbol):
         try:
             rows5 = get_klines(symbol, TF_5M, CANDLE_LIMIT)
-            rows15 = get_klines(symbol, TF_15M, 180)
-            if len(rows5) < 120 or len(rows15) < 30:
-                return symbol, [], None
-            return symbol, build_ict_candidates(symbol, rows5, rows15), None
+            if len(rows5) < 80:
+                return symbol, None, None, {"insufficient_data": 1}
+            sig, diag = analyze(symbol, rows5, None, diagnostics=True)
+            return symbol, sig, None, diag
         except Exception as e:
-            return symbol, [], e
+            return symbol, None, e, {}
 
-    ict_candidates = []
+    found = []
     error_buckets = {}
+    totals = {"ict_candidates": 0, "insufficient_data": 0}
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
         futures = [pool.submit(check_symbol, symbol) for symbol in pairs]
         for fut in as_completed(futures):
-            symbol, candidates, err = fut.result()
+            symbol, sig, err, diag = fut.result()
+            for key in totals:
+                totals[key] += int(diag.get(key, 0))
             if err is not None:
                 key = _error_bucket(err)
                 error_buckets[key] = error_buckets.get(key, 0) + 1
                 continue
-            ict_candidates.extend(candidates)
-
-    # AI is deliberately NOT called during the 466-symbol threaded pass.
-    # First select a tiny ICT-only shortlist, then review it sequentially.
-    ict_candidates.sort(key=_ict_candidate_rank, reverse=True)
-    shortlist = ict_candidates[:max(0, AI_MAX_REVIEWS_PER_SCAN)]
-    found = []
-    ai_confirmed = 0
-    ai_wait = 0
-    ai_rejected = 0
-    ai_errors = 0
-
-    for sig in shortlist:
-        ai, err = ai_review_setup(
-            sig,
-            sig.get("_ai_rows5", []),
-            sig.get("_ai_rows15", []),
-        )
-        if err:
-            ai_errors += 1
-            print(f"AI REVIEW {sig['symbol']} {sig['direction']}: {err}")
-            continue
-        decision = (ai or {}).get("decision")
-        if decision == "CONFIRM":
-            ai_confirmed += 1
-            sig["ai_timing"] = ai.get("timing", "READY")
-            sig["ai_reason"] = ai.get("reason", "ICT setup confirmed")
-            sig["ai_reversal_watch"] = bool(ai.get("reversal_watch", False))
-            key = f"{sig['symbol']}:{sig['direction']}:{sig['time']}"
-            if key not in seen_signals:
-                sig["key"] = key
-                sig.pop("_ai_rows5", None)
-                sig.pop("_ai_rows15", None)
-                found.append(sig)
-        elif decision == "WAIT":
-            ai_wait += 1
-        else:
-            ai_rejected += 1
+            if sig:
+                key = f"{symbol}:{sig['direction']}:SWEEP:{sig['time']}:{sig['entry']}"
+                if key not in seen_signals:
+                    sig["key"] = key
+                    found.append(sig)
 
     with state_lock:
-        active_symbols = {x.get("symbol") for x in active_signals.values()}
+        active_keys = set(active_signals.keys())
+        pending_keys = {x.get("key") for x in pending_signals}
         for sig in found:
             seen_signals.add(sig["key"])
             seen_order.append(sig["key"])
-            if sig["symbol"] not in active_symbols:
+            if sig["key"] not in active_keys and sig["key"] not in pending_keys:
                 pending_signals.append(sig)
-        # Keep the pending queue small and fresh; this is only an ICT timestamp
-        # ordering, not a radar/indicator score.
         pending_signals.sort(key=lambda x: x.get("time", 0), reverse=True)
         del pending_signals[12:]
         while len(seen_order) > 4000:
             seen_signals.discard(seen_order.pop(0))
 
     total_errors = sum(error_buckets.values())
-    summary = ", ".join(f"{name}={count}" for name, count in sorted(error_buckets.items(), key=lambda kv: kv[1], reverse=True)[:4])
+    summary = ", ".join(f"{name}={count}" for name, count in sorted(error_buckets.items(), key=lambda kv: kv[1], reverse=True)[:6])
+    duration = time.time() - started
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    with scan_stats_lock:
+        scan_stats.update({
+            "last_at": now_utc,
+            "last_duration": duration,
+            "universe": len(eligible),
+            "scanned": len(pairs),
+            "confirmed": len(found),
+            "ict_candidates": totals["ict_candidates"],
+            "insufficient_data": totals["insufficient_data"],
+            "errors": total_errors,
+            "error_summary": summary,
+        })
+
     print(
-        f"Bitget Move Hunter scan: universe={len(eligible)}, scanned={len(pairs)}, "
-        f"ICT candidates={len(ict_candidates)}, AI shortlist={len(shortlist)}, "
-        f"AI confirmed={ai_confirmed}, wait={ai_wait}, rejected={ai_rejected}, "
-        f"AI errors={ai_errors}, data_errors={total_errors}"
+        "Bitget Liquidity Sweep scan: "
+        f"universe={len(eligible)}, scanned={len(pairs)}, "
+        f"sweeps={totals['ict_candidates']}, confirmed={len(found)}, "
+        f"errors={total_errors}, duration={duration:.1f}s, workers={SCAN_WORKERS}"
     )
     if not contracts:
         print("Bitget warning: no contracts returned from /api/v2/mix/market/contracts")
@@ -1237,21 +852,19 @@ def scan_once():
 
 def signal_caption(sig):
     d = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
+    tp_lines = []
+    for name in ("tp1", "tp2", "tp3"):
+        if sig.get(name) is not None:
+            tp_lines.append(f"{name.upper()}: {fmt_price(sig[name])}")
     return (
         f"🚀 SAIWAN CRYPTO SIGNAL\n\n{d}\n"
         f"⭐ {sig['symbol']} · Bitget Futures\n"
-        f"⏱ 5m Entry · 15m Context\n\n"
-        "Liquidity Sweep ✓  ·  MSS ✓  ·  CHOCH ✓  ·  FVG ✓  ·  OB ✓\n"
-        f"15m Context: {sig.get('context15','UNKNOWN')}\n"
-        f"Entry Zone ({sig.get('origin_type','OB')}): {fmt_price(sig.get('entry_zone_low', sig['entry']))} – {fmt_price(sig.get('entry_zone_high', sig['entry']))}\n"
-        f"Entry: {fmt_price(sig['entry'])}\n"
-        f"SL (structural): {fmt_price(sig['sl'])}\n"
-        f"TP1: {fmt_price(sig['tp1'])}\n"
-        f"TP2: {fmt_price(sig['tp2'])}\n"
-        f"TP3: {fmt_price(sig['tp3'])}\n\n"
-        f"🧠 AI timing: {sig.get('ai_timing', 'READY')}\n"
-        f"AI note: {sig.get('ai_reason', 'ICT setup confirmed')}\n\n"
-        "⚡ Early move setup — closed candles only.\n"
+        f"⏱ 5m Liquidity Sweep\n\n"
+        "Liquidity Sweep ✓\n"
+        f"Entry (Sweep): {fmt_price(sig['entry'])}\n"
+        f"SL (Sweep Extreme): {fmt_price(sig['sl'])}\n"
+        + "\n".join(tp_lines) + "\n\n"
+        "⚡ Entry is the exact liquidity-sweep level.\n"
         "⚠️ Signal only — no automatic trading."
     )
 
@@ -1284,17 +897,17 @@ def track_sent_signal(sig, chat_id, message_id):
             "tp1": sig["tp1"],
             "tp2": sig["tp2"],
             "tp3": sig["tp3"],
-            "entry_filled": False,
             "tp1_hit": False,
             "tp2_hit": False,
             "tp3_hit": False,
+            "entry_pending": True,
+            "entry_filled": False,
             "closed": False,
         }
         signal_history.append({
             "key": sig["key"], "symbol": sig["symbol"], "direction": sig["direction"],
             "time": sig["time"], "entry": sig["entry"], "sl": sig["sl"],
             "tp1": sig["tp1"], "tp2": sig["tp2"], "tp3": sig["tp3"],
-            "ai_timing": sig.get("ai_timing", "READY"), "ai_reason": sig.get("ai_reason", ""),
         })
         if len(signal_history) > MAX_SIGNAL_HISTORY:
             del signal_history[:-MAX_SIGNAL_HISTORY]
@@ -1303,11 +916,9 @@ def _hit_level(direction, price, level):
     return price >= level if direction == "LONG" else price <= level
 
 def monitor_active_signals():
-    global active_signals
-    # Monitoring stays alive even when /stop pauses the scanner, so already-sent
-    # signals can still receive TP/SL replies.
+    """Monitor pending entry first, then structural SL/TP after entry is touched."""
     while True:
-        time.sleep(30)
+        time.sleep(15)
         with state_lock:
             tracked = list(active_signals.values())
         if not tracked:
@@ -1315,9 +926,8 @@ def monitor_active_signals():
         try:
             tv = {x.get("symbol"): x for x in get_tickers()}
         except Exception as e:
-            print(f"TP MONITOR ERROR {_error_bucket(e)}: {e}")
+            print(f"TP MONITOR ERROR: {type(e).__name__}: {e}")
             continue
-
         for state in tracked:
             if state.get("closed"):
                 continue
@@ -1326,52 +936,38 @@ def monitor_active_signals():
                 price = float(ticker.get("lastPr"))
             except (TypeError, ValueError):
                 continue
-
             try:
-                # Origin entries are limit-style. SL/TP monitoring starts only
-                # after price has actually reached the advertised entry.
-                if not state.get("entry_filled", False):
-                    reached = (price <= state["entry"] if state["direction"] == "LONG"
-                               else price >= state["entry"])
-                    if reached:
+                direction = state["direction"]
+                entry = float(state["entry"])
+                # Entry is a liquidity-sweep level. First wait for price to touch it.
+                if state.get("entry_pending", True):
+                    filled = price <= entry if direction == "LONG" else price >= entry
+                    if filled:
                         with state_lock:
                             if state["key"] in active_signals:
+                                active_signals[state["key"]]["entry_pending"] = False
                                 active_signals[state["key"]]["entry_filled"] = True
-                        send_message(
-                            state["chat_id"],
-                            f"🎯 Entry Hit\n⭐ {state['symbol']}\n💵 Price: {fmt_price(price)}",
-                            reply_to_message_id=state["message_id"],
-                        )
+                        send_message(state["chat_id"], f"✅ Entry Hit\n⭐ {state['symbol']}\n💵 Price: {fmt_price(price)}", reply_to_message_id=state["message_id"])
                     else:
                         continue
 
-                # Stop monitoring after SL. This prevents a later TP notification
-                # after the original setup has already been invalidated.
-                if _hit_level(state["direction"], state["sl"], price):
-                    send_message(
-                        state["chat_id"],
-                        f"🛑 SL Hit\n⭐ {state['symbol']}\n💵 Price: {fmt_price(price)}",
-                        reply_to_message_id=state["message_id"],
-                    )
+                # SL is the sweep candle extreme; it is only active after entry fill.
+                if _hit_level(direction, state["sl"], price):
+                    send_message(state["chat_id"], f"🛑 SL Hit\n⭐ {state['symbol']}\n💵 Price: {fmt_price(price)}", reply_to_message_id=state["message_id"])
                     with state_lock:
                         active_signals.pop(state["key"], None)
                     continue
 
                 for name in ("tp1", "tp2", "tp3"):
-                    hit_key = f"{name}_hit"
-                    if state[hit_key]:
+                    level = state.get(name)
+                    if level is None or state.get(f"{name}_hit"):
                         continue
-                    if _hit_level(state["direction"], price, state[name]):
-                        label = name.upper().replace("TP", "TP")
-                        send_message(
-                            state["chat_id"],
-                            f"🎯 {label} Hit\n⭐ {state['symbol']}\n💵 Price: {fmt_price(price)}",
-                            reply_to_message_id=state["message_id"],
-                        )
+                    if _hit_level(direction, price, level):
+                        send_message(state["chat_id"], f"🎯 {name.upper()} Hit\n⭐ {state['symbol']}\n💵 Price: {fmt_price(price)}", reply_to_message_id=state["message_id"])
                         with state_lock:
                             if state["key"] in active_signals:
-                                active_signals[state["key"]][hit_key] = True
-                                if name == "tp3":
+                                active_signals[state["key"]][f"{name}_hit"] = True
+                                if name == "tp3" or all(state.get(f"{n}_hit") or state.get(n) is None for n in ("tp1","tp2","tp3")):
                                     active_signals.pop(state["key"], None)
                                     break
             except Exception as e:
@@ -1390,15 +986,7 @@ def sender_loop():
         with state_lock:
             if pending_signals:
                 # One new signal per 10-minute window; send the strongest candidate.
-                pending_signals.sort(
-                    key=lambda x: (
-                        x.get("context_match", 0),
-                        -x.get("ict_age", 99),
-                        -x.get("extension_from_origin", 999.0),
-                        x.get("time", 0),
-                    ),
-                    reverse=True,
-                )
+                pending_signals.sort(key=lambda x: x.get("time", 0), reverse=True)
                 sig = pending_signals.pop(0)
                 pending_signals.clear()
         if not sig:
@@ -1458,27 +1046,27 @@ def poll_updates():
                         "/scan - Start scanner\n"
                         "/stop - Stop scanner\n"
                         "/status - Bot status\n"
-                        "/aitest - Test SAIWAN AI connection\n"
                         "/search SYMBOL - Find saved signals\n\n"
                         "Market: Bitget USDT Perpetual Futures\n"
-                        "Timeframe: 5m entry + 15m context\n"
-                        "Model: SAIWAN Move Hunter — Liquidity Sweep + MSS + CHOCH + FVG + OB\n"
-                        "Chart: professional 5m setup map with all ICT components\n"
+                        "Timeframe: 5m closed candles\n"
+                        "Strategy: Liquidity Sweep ONLY\n"
+                        "Entry: exact sweep level\n"
+                        "SL: sweep candle extreme\n"
+                        "TP: opposing liquidity/swing levels\n"
                         "TP/SL monitoring: ENABLED")
                 elif text.startswith("/scan"):
                     start_scanner(active_chat_id)
                     send_message(active_chat_id,
                         "🚀 SAIWAN CRYPTO SIGNAL SCANNER STARTED\n\n"
-                        "5m closed candles for early entries + 15m context.\n"
-                        "Signal hunts: Liquidity Sweep + MSS + CHOCH + FVG + OB.\n"
-                        "The chart will mark every ICT component used.\n"
+                        "5m closed candles.\n"
+                        "Signal rule: Liquidity Sweep ONLY.\n"
+                        "Sweep level = Entry; sweep extreme = SL.\n"
+                        "TPs = opposing pre-existing liquidity/swing levels.\n"
                         "TP/SL monitoring is enabled.")
                 elif text.startswith("/stop"):
                     stop_scanner(); send_message(active_chat_id, "🛑 Scanner stopped.")
                 elif text.startswith("/status"):
                     send_message(active_chat_id, status_text())
-                elif text.startswith("/aitest"):
-                    send_message(active_chat_id, ai_test())
                 elif text.startswith("/search"):
                     send_message(active_chat_id, search_signals(text))
         except Exception as e:
