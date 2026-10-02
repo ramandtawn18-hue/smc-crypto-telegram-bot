@@ -30,24 +30,30 @@ SCAN_INTERVAL = 60
 SEND_INTERVAL = 600  # minimum 10 minutes between sent signals
 CHART_CANDLES = 70
 HTTP_TIMEOUT = 15
+MIN_SCORE = 5
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+SAIWAN_AI_URL = os.getenv("SAIWAN_AI_URL", "").rstrip("/")
+SAIWAN_AI_API_KEY = os.getenv("SAIWAN_AI_API_KEY", "")
+saiwan_ai_client = bool(SAIWAN_AI_URL and SAIWAN_AI_API_KEY)
 AI_REQUIRED = os.getenv("AI_REQUIRED", "true").strip().lower() not in {"0", "false", "no", "off"}
-AI_TIMEOUT = 20
-# Groq free/on-demand limits are organization-wide. Serialize AI calls and
-# keep a small gap between requests so a full 466-symbol scan does not burst
-# 20+ candidate requests into the same minute.
-AI_MIN_INTERVAL = float(os.getenv("AI_MIN_INTERVAL", "2.0"))
-AI_MAX_RETRIES = 1
+AI_TIMEOUT = 15
+# SAIWAN AI is private/self-hosted. Serialize AI calls and keep a small gap
+# between requests so a full market scan does not burst requests into the service.
+AI_MIN_INTERVAL = float(os.getenv("AI_MIN_INTERVAL", "3.0"))
+AI_MAX_RETRIES = 2
+# AI is only used for the strongest ICT candidates after the full market scan.
+AI_MAX_REVIEWS_PER_SCAN = int(os.getenv("AI_MAX_REVIEWS_PER_SCAN", "5"))
 ai_call_lock = threading.Lock()
 ai_last_call = 0.0
-ai_cache_lock = threading.Lock()
-ai_review_cache = {}
-AI_CACHE_TTL = 12 * 60
-groq_client = bool(GROQ_API_KEY)
 
+# SAIWAN AI Market Radar / risk-aware leverage (informational only)
+RADAR_MIN_SCORE = 72
+MAX_SUGGESTED_LEVERAGE = 5
+MIN_SUGGESTED_LEVERAGE = 2
+
+TP1_R = 1.5
+TP2_R = 2.5
+TP3_R = 4.0
 
 app = Flask(__name__)
 stop_event = threading.Event()
@@ -172,6 +178,250 @@ def get_klines(symbol, interval=TIMEFRAME, limit=CANDLE_LIMIT):
     return rows[-limit:]
 
 
+def ema(values, period):
+    if not values:
+        return []
+    k = 2.0 / (period + 1.0)
+    out = [values[0]]
+    for x in values[1:]:
+        out.append(x * k + out[-1] * (1 - k))
+    return out
+
+
+def atr(rows, period=14):
+    if len(rows) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(rows)):
+        r, p = rows[i], rows[i - 1]
+        trs.append(max(r["high"] - r["low"], abs(r["high"] - p["close"]), abs(r["low"] - p["close"])))
+    return sum(trs[-period:]) / period
+
+
+def swing_points(rows, left=2, right=2):
+    highs, lows = [], []
+    for i in range(left, len(rows) - right):
+        h = rows[i]["high"]
+        l = rows[i]["low"]
+        if all(h > rows[j]["high"] for j in range(i-left, i)) and all(h >= rows[j]["high"] for j in range(i+1, i+right+1)):
+            highs.append((i, h))
+        if all(l < rows[j]["low"] for j in range(i-left, i)) and all(l <= rows[j]["low"] for j in range(i+1, i+right+1)):
+            lows.append((i, l))
+    return highs, lows
+
+
+def rsi(values, period=14):
+    if len(values) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(values)):
+        d = values[i] - values[i-1]
+        gains.append(max(d, 0.0))
+        losses.append(max(-d, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def trend_context(rows):
+    closes = [r["close"] for r in rows]
+    if len(closes) < 60:
+        return "NEUTRAL", None, None, None
+    e20, e50, e200 = ema(closes, 20), ema(closes, 50), ema(closes, 200)
+    slope20 = e20[-1] - e20[-6]
+    slope50 = e50[-1] - e50[-6]
+    if e20[-1] > e50[-1] and slope20 > 0 and slope50 >= 0 and closes[-1] > e20[-1]:
+        return "BULLISH", e20[-1], e50[-1], e200[-1]
+    if e20[-1] < e50[-1] and slope20 < 0 and slope50 <= 0 and closes[-1] < e20[-1]:
+        return "BEARISH", e20[-1], e50[-1], e200[-1]
+    if e20[-1] > e50[-1]:
+        return "BULLISH", e20[-1], e50[-1], e200[-1]
+    if e20[-1] < e50[-1]:
+        return "BEARISH", e20[-1], e50[-1], e200[-1]
+    return "NEUTRAL", e20[-1], e50[-1], e200[-1]
+
+
+def line_value(p1, p2, x):
+    i1, y1 = p1
+    i2, y2 = p2
+    if i2 == i1:
+        return y2
+    return y1 + (y2 - y1) * ((x - i1) / (i2 - i1))
+
+
+def trendline_signal(rows, direction):
+    """Return a real breakout/breakdown signal and the matching trendline level.
+
+    LONG uses descending swing-high resistance.
+    SHORT uses ascending swing-low support.
+    This keeps the signal check and the displayed structure label consistent.
+    """
+    window = rows[-90:]
+    highs, lows = swing_points(window, left=2, right=2)
+    now = len(window) - 1
+    prev_i = now - 1
+
+    if direction == "LONG" and len(highs) >= 2:
+        p1, p2 = highs[-2], highs[-1]
+        if p2[1] < p1[1]:
+            line_now = line_value(p1, p2, now)
+            line_prev = line_value(p1, p2, prev_i)
+            crossed = window[-2]["close"] <= line_prev and window[-1]["close"] > line_now
+            return crossed, line_now
+
+    if direction == "SHORT" and len(lows) >= 2:
+        p1, p2 = lows[-2], lows[-1]
+        if p2[1] > p1[1]:
+            line_now = line_value(p1, p2, now)
+            line_prev = line_value(p1, p2, prev_i)
+            crossed = window[-2]["close"] >= line_prev and window[-1]["close"] < line_now
+            return crossed, line_now
+
+    return False, None
+
+
+def structure_bias(rows, direction):
+    highs, lows = swing_points(rows[-80:], left=2, right=2)
+    if len(highs) < 2 or len(lows) < 2:
+        return False
+    if direction == "LONG":
+        return highs[-1][1] >= highs[-2][1] and lows[-1][1] > lows[-2][1]
+    return highs[-1][1] < highs[-2][1] and lows[-1][1] <= lows[-2][1]
+
+
+def volatility_score(rows):
+    a = atr(rows, 14)
+    if not a or rows[-1]["close"] <= 0:
+        return 0.0, "LOW"
+    atr_values = []
+    for i in range(30, len(rows)):
+        x = atr(rows[:i+1], 14)
+        if x:
+            atr_values.append(x)
+    if not atr_values:
+        return 0.0, "LOW"
+    med = sorted(atr_values)[len(atr_values)//2]
+    ratio = a / med if med else 0
+    if 0.85 <= ratio <= 1.80:
+        return min(10.0, 7.0 + (ratio - 0.85) * 2.0), "HEALTHY"
+    if 0.65 <= ratio < 0.85:
+        return 5.5, "LOW"
+    if 1.80 < ratio <= 2.60:
+        return 6.0, "HIGH"
+    if ratio > 2.60:
+        return 3.0, "EXTREME"
+    return 4.0, "LOW"
+
+
+
+def radar_score(direction, trend, rv, vol_ratio, vol_score, structure_ok,
+                breakout_ok, trendline_ok, momentum_ok, extension_ok,
+                zone_ok=True, retest_ok=False, rejection_ok=False):
+    """Score setup quality from 0-100; never a profit probability."""
+    score = 0.0
+    if direction == "LONG":
+        score += 15 if trend == "BULLISH" else 0
+        score += 8 if 52 <= rv <= 68 else 0
+    else:
+        score += 15 if trend == "BEARISH" else 0
+        score += 8 if 32 <= rv <= 48 else 0
+    score += 14 if structure_ok else 0
+    score += 14 if breakout_ok else 0
+    score += 6 if trendline_ok else 0
+    score += 10 if momentum_ok else 0
+    score += 9 if vol_ratio >= 1.15 else (4 if vol_ratio >= 1.0 else 0)
+    score += 7 if 4.5 <= vol_score <= 8.5 else (3 if vol_score >= 3.5 else 0)
+    score += 5 if zone_ok else 0
+    score += 7 if retest_ok else 0
+    score += 3 if rejection_ok else 0
+    score += 2 if extension_ok else 0
+    return int(max(0, min(100, round(score))))
+
+
+def _zone_candidates(rows, atr_value):
+    """Find compact 15m demand/supply zones from swing candles plus displacement.
+
+    This is deliberately price-action based: a zone is only kept when a swing
+    is followed by a meaningful move away. It is not a generic moving-average
+    band.
+    """
+    if not atr_value or len(rows) < 30:
+        return [], []
+    highs, lows = swing_points(rows[-100:], left=2, right=2)
+    base = rows[-100:]
+    demand, supply = [], []
+    for idx, low in lows[-8:]:
+        if idx + 3 >= len(base):
+            continue
+        future_high = max(x["high"] for x in base[idx+1:min(len(base), idx+6)])
+        if future_high - low < 0.9 * atr_value:
+            continue
+        r = base[idx]
+        zone_low = low
+        zone_high = min(max(r["open"], r["close"]), low + 0.75 * atr_value)
+        if zone_high > zone_low:
+            demand.append({"low": zone_low, "high": zone_high, "index": idx})
+    for idx, high in highs[-8:]:
+        if idx + 3 >= len(base):
+            continue
+        future_low = min(x["low"] for x in base[idx+1:min(len(base), idx+6)])
+        if high - future_low < 0.9 * atr_value:
+            continue
+        r = base[idx]
+        zone_high = high
+        zone_low = max(min(r["open"], r["close"]), high - 0.75 * atr_value)
+        if zone_high > zone_low:
+            supply.append({"low": zone_low, "high": zone_high, "index": idx})
+    return demand, supply
+
+
+def _zone_touch(row, zone, tolerance):
+    return row["low"] <= zone["high"] + tolerance and row["high"] >= zone["low"] - tolerance
+
+
+def _zone_rejection(row, zone, direction):
+    rng = max(row["high"] - row["low"], 1e-12)
+    body = abs(row["close"] - row["open"])
+    if direction == "LONG":
+        lower_wick = min(row["open"], row["close"]) - row["low"]
+        return (
+            _zone_touch(row, zone, rng * 0.10)
+            and row["close"] > zone["high"]
+            and lower_wick >= max(body * 0.45, rng * 0.20)
+        )
+    upper_wick = row["high"] - max(row["open"], row["close"])
+    return (
+        _zone_touch(row, zone, rng * 0.10)
+        and row["close"] < zone["low"]
+        and upper_wick >= max(body * 0.45, rng * 0.20)
+    )
+
+def suggested_leverage(radar, volatility, risk_pct):
+    """Return a conservative informational leverage suggestion (2x-5x).
+
+    Leverage is reduced for high/extreme volatility and wider stops. It does
+    not change position size and the bot never places trades automatically.
+    """
+    if volatility == "EXTREME" or radar < RADAR_MIN_SCORE:
+        return 2
+    if volatility == "HIGH":
+        return 3 if radar < 88 else 4
+    if risk_pct >= 2.5:
+        return 2
+    if risk_pct >= 1.7:
+        return 3
+    if radar >= 92 and risk_pct <= 1.0:
+        return 5
+    if radar >= 84 and risk_pct <= 1.4:
+        return 4
+    return 3
+
 def _candle_bull(r):
     return r["close"] > r["open"]
 
@@ -287,48 +537,33 @@ def _context_15m(rows15, direction):
 
 
 def _move_setup(rows, direction):
-    """Deterministic ICT Move Hunter.
-
-    Chain: liquidity sweep -> reaction/displacement -> MSS/CHOCH -> FVG + OB.
-    The current candle must still be close enough to the origin of the move.
-    No indicators are used here.
-    """
+    """Early move hunter: sweep -> MSS/CHOCH -> FVG + OB. No retest wait."""
     if len(rows) < 120:
         return None
-
     candidates = _sweep_candidates(rows)
     for direction0, sweep_idx, liquidity in reversed(candidates):
-        if direction0 != direction or sweep_idx >= len(rows) - 2:
+        if direction0 != direction or sweep_idx >= len(rows) - 1:
             continue
-
         structure = _structure_break(rows, direction, sweep_idx, len(rows) - 1)
         if not structure:
             continue
         mss_idx = structure["index"]
-        if mss_idx <= sweep_idx:
-            continue
-
-        # The displacement/FVG must happen soon after the MSS. This prevents
-        # old structure from becoming a late signal several candles later.
+        # FVG is allowed on the MSS candle or within the next few closed candles.
         fvg = _find_fvg(rows, direction, max(2, mss_idx - 1), min(len(rows), mss_idx + 5))
         if not fvg:
             continue
         ob = _find_order_block(rows, direction, fvg["index"] + 1)
         if not ob:
             continue
-
         zone = _overlap(fvg, ob) or fvg
         trigger_idx = max(mss_idx, fvg["index"])
-        age = len(rows) - 1 - trigger_idx
-        if age > 3:
+        if len(rows) - 1 - trigger_idx > 4:
             continue
-
         trigger = rows[trigger_idx]
         if direction == "LONG" and not _candle_bull(trigger):
             continue
         if direction == "SHORT" and not _candle_bear(trigger):
             continue
-
         cur = rows[-1]
         if direction == "LONG" and cur["close"] <= structure["level"]:
             continue
@@ -336,66 +571,50 @@ def _move_setup(rows, direction):
             continue
 
         entry = cur["close"]
-        trigger_range = max(trigger["high"] - trigger["low"], 1e-12)
-        zone_width = max(zone["high"] - zone["low"], 1e-12)
-
-        # Structural invalidation: LONG below the protected low; SHORT above
-        # the protected high. A small candle-structure buffer is used only to
-        # keep the stop outside the invalidation wick, never as a fixed %.
         if direction == "LONG":
-            invalidation = min(liquidity, ob["low"], zone["low"])
-            sl = invalidation - trigger_range * 0.15
-            if sl >= entry:
-                continue
+            # Keep the stop behind the nearest valid setup structure.
+            # The old version used the original liquidity sweep itself, which
+            # could place SL far away after a large displacement.
+            stop_anchor = max(liquidity, ob["low"], zone["low"])
+            sl = stop_anchor * 0.9995
+            if sl >= entry: continue
             risk = entry - sl
-            if risk < zone_width * 0.50:
-                continue
 
-            # Liquidity/structure targets first; R-multiples are only a final
-            # fallback when there is genuinely no visible opposing swing.
+            # TP1 is the nearest opposing liquidity/swing above entry.
+            # Do NOT force TP1 to 1.5R when that would push it much farther
+            # away than the actual market structure (e.g. USUSDT ~0.029).
             highs, _ = swing_points(rows[:-1], 2, 2)
             targets = sorted({p for _, p in highs if p > entry * 1.002})
             if targets:
                 tp1 = targets[0]
                 remaining = [p for p in targets[1:] if p > tp1 * 1.002]
-                tp2 = remaining[0] if remaining else entry + risk * 2.0
+                tp2 = remaining[0] if remaining else max(tp1 + risk, entry + risk*2.0)
                 remaining2 = [p for p in remaining[1:] if p > tp2 * 1.002]
-                tp3 = remaining2[0] if remaining2 else entry + risk * 3.0
+                tp3 = remaining2[0] if remaining2 else max(tp2 + risk, entry + risk*3.0)
             else:
-                tp1, tp2, tp3 = entry + risk * 1.5, entry + risk * 2.5, entry + risk * 4.0
+                tp1 = entry + risk*1.5
+                tp2 = entry + risk*2.5
+                tp3 = entry + risk*4.0
         else:
-            invalidation = max(liquidity, ob["high"], zone["high"])
-            sl = invalidation + trigger_range * 0.15
-            if sl <= entry:
-                continue
+            # Same principle for shorts: use the nearest structural
+            # invalidation, not the distant original sweep.
+            stop_anchor = min(liquidity, ob["high"], zone["high"])
+            sl = stop_anchor * 1.0005
+            if sl <= entry: continue
             risk = sl - entry
-            if risk < zone_width * 0.50:
-                continue
 
             _, lows = swing_points(rows[:-1], 2, 2)
             targets = sorted({p for _, p in lows if p < entry * 0.998}, reverse=True)
             if targets:
                 tp1 = targets[0]
                 remaining = [p for p in targets[1:] if p < tp1 * 0.998]
-                tp2 = remaining[0] if remaining else entry - risk * 2.0
+                tp2 = remaining[0] if remaining else min(tp1 - risk, entry - risk*2.0)
                 remaining2 = [p for p in remaining[1:] if p < tp2 * 0.998]
-                tp3 = remaining2[0] if remaining2 else entry - risk * 3.0
+                tp3 = remaining2[0] if remaining2 else min(tp2 - risk, entry - risk*3.0)
             else:
-                tp1, tp2, tp3 = entry - risk * 1.5, entry - risk * 2.5, entry - risk * 4.0
-
-        # Reject impossible/behind-market targets.
-        if direction == "LONG" and not (sl < entry < tp1 <= tp2 <= tp3):
-            continue
-        if direction == "SHORT" and not (tp3 <= tp2 <= tp1 < entry < sl):
-            continue
-
-        # Deterministic timing/freshness used to rank candidates before AI.
-        move_origin = max(sweep_idx, trigger_idx)
-        bars_since_sweep = len(rows) - 1 - sweep_idx
-        extension = abs(entry - trigger["close"]) / max(trigger_range, 1e-12)
-        freshness = max(0.0, 10.0 - bars_since_sweep * 1.8 - age * 1.5)
-        origin_proximity = max(0.0, 10.0 - extension * 1.5)
-        ict_rank = freshness + origin_proximity + (3.0 if age <= 1 else 0.0)
+                tp1 = entry - risk*1.5
+                tp2 = entry - risk*2.5
+                tp3 = entry - risk*4.0
 
         return {
             "symbol": "", "direction": direction,
@@ -403,18 +622,17 @@ def _move_setup(rows, direction):
             "entry": entry, "trigger_level": structure["level"], "sl": sl,
             "tp1": tp1, "tp2": tp2, "tp3": tp3,
             "entry_zone_low": zone["low"], "entry_zone_high": zone["high"],
-            "time": cur["time"],
+            "score": 5, "max_score": 5, "time": cur["time"],
             "liquidity": liquidity, "sweep_index": sweep_idx,
             "mss_index": mss_idx, "mss_level": structure["level"],
             "fvg": fvg, "ob": ob, "entry_zone": zone,
             "rows": rows[max(0, sweep_idx-18):], "full_len": len(rows),
             "checks": {"Liquidity Sweep": True, "MSS": True, "FVG": True, "OB": True, "CHOCH": True},
-            "retest_ok": False, "rejection_ok": True, "early_entry": age <= 1,
-            "setup_age_bars": age, "bars_since_sweep": bars_since_sweep,
-            "trigger_range": trigger_range, "zone_width": zone_width,
-            "ict_rank": ict_rank, "setup_key": f"{direction}:{rows[sweep_idx]['time']}:{rows[mss_idx]['time']}:{rows[fvg['index']]['time']}",
+            "retest_ok": False, "rejection_ok": True, "early_entry": True,
         }
     return None
+
+
 
 def _compact_candles(rows, count=36):
     """Keep the AI prompt small: recent closed candles only."""
@@ -446,75 +664,53 @@ def _ai_json(text):
     raise ValueError("AI returned invalid JSON")
 
 
-def _groq_chat_json(system, user_payload, schema_name="saiwan_ai_review", schema=None, max_tokens=300):
-    """Call Groq safely with serialized requests and 429 backoff."""
+def _saiwan_ai_analyze(payload):
+    """Call the private SAIWAN AI v1 decision API."""
     global ai_last_call
-    if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY is missing")
+    if not SAIWAN_AI_URL:
+        raise RuntimeError("SAIWAN_AI_URL is missing")
+    if not SAIWAN_AI_API_KEY:
+        raise RuntimeError("SAIWAN_AI_API_KEY is missing")
 
-    body = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_payload if isinstance(user_payload, str) else json.dumps(user_payload, separators=(",", ":"))},
-        ],
-        "reasoning_effort": "low",
-        "include_reasoning": False,
-        "temperature": 0.1,
-        "max_completion_tokens": max_tokens,
+    url = f"{SAIWAN_AI_URL}/analyze"
+    headers = {
+        "Authorization": f"Bearer {SAIWAN_AI_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
     }
-    # Do not enable Groq server-side JSON validation here. GPT-OSS is a reasoning
-    # model, and constrained JSON generation can fail with json_validate_failed
-    # even when the request is otherwise valid. We hide reasoning and validate
-    # the final JSON locally with _ai_json().
 
-    # One AI request at a time. This is the important fix for the 8K TPM
-    # organization limit seen during the 466-symbol scan.
     with ai_call_lock:
         wait = AI_MIN_INTERVAL - (time.monotonic() - ai_last_call)
         if wait > 0:
             time.sleep(wait)
         for attempt in range(AI_MAX_RETRIES + 1):
             try:
-                r = requests.post(
-                    GROQ_API_URL,
-                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                    json=body,
-                    timeout=AI_TIMEOUT,
-                )
+                r = requests.post(url, headers=headers, json=payload, timeout=AI_TIMEOUT)
                 ai_last_call = time.monotonic()
             except requests.RequestException as e:
                 ai_last_call = time.monotonic()
                 if attempt >= AI_MAX_RETRIES:
-                    raise RuntimeError(f"Groq request failed: {type(e).__name__}: {e}")
-                time.sleep(min(5.0, 1.5 * (attempt + 1)))
+                    raise RuntimeError(f"SAIWAN AI connection failed: {type(e).__name__}: {e}")
+                time.sleep(min(3.0, 0.8 * (attempt + 1)))
                 continue
 
             if r.ok:
                 data = r.json()
-                choices = data.get("choices") or []
-                if not choices:
-                    raise RuntimeError("Groq returned no choices")
-                content = ((choices[0].get("message") or {}).get("content") or "").strip()
-                return _ai_json(content)
+                if not isinstance(data, dict):
+                    raise RuntimeError("SAIWAN AI returned invalid JSON")
+                return data
 
-            if r.status_code == 429 and attempt < AI_MAX_RETRIES:
-                retry_after = r.headers.get("retry-after")
-                try:
-                    delay = float(retry_after) if retry_after is not None else 5.0
-                except ValueError:
-                    delay = 5.0
-                # Do not spin on a minute-level TPM limit.
-                time.sleep(max(1.0, min(delay, 65.0)))
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < AI_MAX_RETRIES:
+                time.sleep(min(5.0, 1.0 * (attempt + 1)))
                 continue
 
             try:
                 detail = r.json()
             except Exception:
-                detail = r.text[:800]
-            raise RuntimeError(f"Groq HTTP {r.status_code}: {detail}")
+                detail = r.text[:500]
+            raise RuntimeError(f"SAIWAN AI HTTP {r.status_code}: {detail}")
 
-    raise RuntimeError("Groq request failed after retries")
+    raise RuntimeError("SAIWAN AI request failed")
 
 
 AI_REVIEW_SCHEMA = {
@@ -532,73 +728,72 @@ AI_REVIEW_SCHEMA = {
 
 
 def ai_review_setup(sig, rows5, rows15):
-    """Small AI timing gate. One request per fresh ICT setup, cached afterwards."""
-    if not groq_client:
+    """SAIWAN AI is the private ICT decision/timing layer."""
+    if not saiwan_ai_client:
         if AI_REQUIRED:
-            return None, "AI unavailable: GROQ_API_KEY is missing"
-        return {"decision": "CONFIRM", "timing": "READY", "direction": sig["direction"], "reason": "ICT-only mode", "reversal_watch": False}, None
+            return None, "SAIWAN AI unavailable: URL/API key missing"
+        return {"decision": "CONFIRM", "timing": "READY", "reason": "AI disabled", "reversal_watch": False}, None
 
-    cache_key = f"{sig['symbol']}:{sig['setup_key']}:{rows5[-1]['time']}"
-    now = time.time()
-    with ai_cache_lock:
-        cached = ai_review_cache.get(cache_key)
-        if cached and now - cached[0] < AI_CACHE_TTL:
-            return dict(cached[1]), None
+    zone = sig.get("entry_zone") or {}
+    lo, hi = zone.get("low"), zone.get("high")
+    current = None
+    if rows5:
+        current = rows5[-1].get("close")
+    proximity = 0.0
+    try:
+        lo, hi, current = float(lo), float(hi), float(current)
+        width = max(abs(hi - lo), abs(current) * 1e-9)
+        if lo <= current <= hi:
+            proximity = 1.0
+        else:
+            distance = min(abs(current - lo), abs(current - hi))
+            proximity = max(0.0, 1.0 - distance / (width * 2.0))
+    except (TypeError, ValueError):
+        proximity = 0.0
 
+    checks = sig.get("checks") or {}
     payload = {
         "symbol": sig["symbol"],
         "direction": sig["direction"],
-        "timing_data": {
-            "bars_since_sweep": sig.get("bars_since_sweep"),
-            "setup_age_bars": sig.get("setup_age_bars"),
-            "ict_rank": round(float(sig.get("ict_rank", 0)), 2),
-            "entry_zone": sig.get("entry_zone"),
-            "entry": sig.get("entry"),
-            "sl": sig.get("sl"),
-            "context15": sig.get("context15"),
-        },
-        "ict": {
-            "liquidity_sweep": True,
-            "mss": True,
-            "choch": True,
-            "fvg": sig.get("fvg"),
-            "ob": sig.get("ob"),
-        },
-        "recent_5m": _compact_candles(rows5, 8),
-        "recent_15m": _compact_candles(rows15, 3),
+        "liquidity_sweep": bool(checks.get("Liquidity Sweep", True)),
+        "mss": bool(checks.get("MSS", True)),
+        "choch": bool(checks.get("CHOCH", True)),
+        "fvg": bool(sig.get("fvg")),
+        "ob": bool(sig.get("ob")),
+        "context_15m": sig.get("context15") in {"BULLISH CONTEXT", "BEARISH CONTEXT"},
+        "entry_proximity": round(proximity, 4),
+        "fresh_setup": bool(sig.get("early_entry", False)) and sig.get("ict_age", 99) <= 3,
+        "entry": sig.get("entry"),
+        "sl": sig.get("sl"),
+        "tp1": sig.get("tp1"),
+        "tp2": sig.get("tp2"),
+        "tp3": sig.get("tp3"),
+        "context15": sig.get("context15"),
     }
-    system = (
-        "You are SAIWAN Move Hunter's timing gate. The deterministic engine already proved "
-        "Liquidity Sweep + MSS/CHOCH + FVG + OB. Decide only whether this is early enough to alert now. "
-        "CONFIRM only when the move is still near its origin and structure is valid. WAIT when structure is "
-        "valid but needs a fresh candle/retest. REJECT when clearly extended or invalidated. "
-        "Never use RSI, volume, MACD, Fibonacci, ATR, EMA, indicators, scores, confidence or predictions. "
-        "Return one compact JSON object with decision, timing, direction, reason, reversal_watch."
-    )
     try:
-        result = _groq_chat_json(system, payload, "saiwan_ai_review", AI_REVIEW_SCHEMA, max_tokens=128)
+        result = _saiwan_ai_analyze(payload)
         decision = str(result.get("decision", "REJECT")).upper()
         timing = str(result.get("timing", "INVALID")).upper()
         direction = str(result.get("direction", sig["direction"])).upper()
-        if decision not in {"CONFIRM", "WAIT", "REJECT"}: decision = "REJECT"
-        if timing not in {"EARLY", "READY", "LATE", "INVALID"}: timing = "INVALID"
-        if direction != sig["direction"]: decision = "REJECT"
-        if timing == "LATE": decision = "REJECT"
-        result.update({"decision": decision, "timing": timing, "direction": direction})
-        with ai_cache_lock:
-            ai_review_cache[cache_key] = (time.time(), dict(result))
-            if len(ai_review_cache) > 500:
-                cutoff = time.time() - AI_CACHE_TTL
-                for k, v in list(ai_review_cache.items()):
-                    if v[0] < cutoff:
-                        ai_review_cache.pop(k, None)
+        if decision not in {"CONFIRM", "WAIT", "REJECT"}:
+            decision = "REJECT"
+        if timing not in {"EARLY", "READY", "LATE", "INVALID", "WAIT"}:
+            timing = "INVALID"
+        if direction != sig["direction"]:
+            decision = "REJECT"
+        result.update({
+            "decision": decision,
+            "timing": timing,
+            "direction": direction,
+            "reversal_watch": bool(result.get("reversal_watch", False)),
+        })
         return result, None
     except Exception as e:
-        return None, f"AI review failed: {type(e).__name__}: {e}"
+        return None, f"SAIWAN AI review failed: {type(e).__name__}: {e}"
 
 
-def collect_ict_candidates(symbol, rows5, rows15=None):
-    """Phase 1: deterministic ICT scan only. No AI calls."""
+def build_ict_candidates(symbol, rows5, rows15=None):
+    """Build ICT candidates without calling AI. Used for the full-market first pass."""
     if len(rows5) < 120:
         return []
     for r in rows5:
@@ -609,34 +804,58 @@ def collect_ict_candidates(symbol, rows5, rows15=None):
         if not sig:
             continue
         sig["symbol"] = symbol
+        sig["_ai_rows5"] = rows5
+        sig["_ai_rows15"] = rows15 or []
         sig["context15"] = _context_15m(rows15, direction)
         sig["timeframe"] = "5m Entry · 15m Context"
-        # If 15m context directly contradicts the setup, do not spend AI budget.
-        if direction == "LONG" and sig["context15"] == "BEARISH CONTEXT":
-            continue
-        if direction == "SHORT" and sig["context15"] == "BULLISH CONTEXT":
-            continue
+        sig["ict_age"] = max(0, len(rows5) - 1 - int(sig.get("mss_index", len(rows5) - 1)))
+        zone = sig.get("entry_zone") or {}
+        lo, hi = zone.get("low"), zone.get("high")
+        cur = rows5[-1].get("close")
+        if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and isinstance(cur, (int, float)):
+            width = max(abs(hi - lo), abs(cur) * 1e-9)
+            if lo <= cur <= hi:
+                sig["zone_distance"] = 0.0
+            else:
+                sig["zone_distance"] = min(abs(cur - lo), abs(cur - hi)) / width
+        else:
+            sig["zone_distance"] = 999.0
+        sig["context_match"] = (
+            1 if ((direction == "LONG" and sig["context15"] == "BULLISH CONTEXT") or
+                  (direction == "SHORT" and sig["context15"] == "BEARISH CONTEXT")) else 0
+        )
         out.append(sig)
     return out
 
 
+def _ict_candidate_rank(sig):
+    """ICT-only preselection; no indicators, volume, score, or confidence."""
+    return (
+        sig.get("context_match", 0),
+        -sig.get("ict_age", 99),
+        -sig.get("zone_distance", 999.0),
+        sig.get("time", 0),
+    )
+
+
 def analyze(symbol, rows5, rows15=None):
-    """Compatibility wrapper: deterministic ICT candidate + AI gate."""
-    candidates = collect_ict_candidates(symbol, rows5, rows15)
+    """SAIWAN Move Hunter: ICT setup + one optional AI timing review."""
+    candidates = build_ict_candidates(symbol, rows5, rows15)
     if not candidates:
         return None
-    candidates.sort(key=lambda x: x.get("ict_rank", 0), reverse=True)
-    sig = candidates[0]
-    ai, err = ai_review_setup(sig, rows5, rows15 or [])
-    if err:
-        print(f"AI REVIEW {symbol} {sig['direction']}: {err}")
-        return None
-    if not ai or ai.get("decision") != "CONFIRM":
-        return None
-    sig["ai_timing"] = ai.get("timing", "READY")
-    sig["ai_reason"] = ai.get("reason", "ICT setup confirmed")
-    sig["ai_reversal_watch"] = bool(ai.get("reversal_watch", False))
-    return sig
+    reviewed = []
+    for sig in candidates:
+        ai, err = ai_review_setup(sig, rows5, rows15 or [])
+        if err:
+            print(f"AI REVIEW {symbol} {sig['direction']}: {err}")
+            continue
+        if not ai or ai.get("decision") != "CONFIRM":
+            continue
+        sig["ai_timing"] = ai.get("timing", "READY")
+        sig["ai_reason"] = ai.get("reason", "ICT setup confirmed")
+        sig["ai_reversal_watch"] = bool(ai.get("reversal_watch", False))
+        reviewed.append(sig)
+    return max(reviewed, key=lambda x: x["time"]) if reviewed else None
 
 def make_chart(sig):
     """Render the SAIWAN Move Hunter setup with every ICT component annotated."""
@@ -776,24 +995,35 @@ def search_signals(query):
 
 
 def ai_test():
-    """Small Telegram diagnostic proving the Groq key/model are reachable."""
-    if not groq_client:
-        return "❌ AI TEST FAILED\nGROQ_API_KEY is missing."
-    schema = {
-        "type": "object",
-        "properties": {"ok": {"type": "boolean"}, "reply": {"type": "string"}},
-        "required": ["ok", "reply"],
-        "additionalProperties": False
-    }
+    """Telegram diagnostic for the private SAIWAN AI service."""
+    if not saiwan_ai_client:
+        return "❌ AI TEST FAILED\nSAIWAN_AI_URL or SAIWAN_AI_API_KEY is missing."
     try:
-        result = _groq_chat_json(
-            "You are a connectivity test. Return JSON only.",
-            "Reply with ok=true and a short reply saying SAIWAN AI OK.",
-            "saiwan_ai_test", schema, max_tokens=80
+        r = requests.get(
+            f"{SAIWAN_AI_URL}/health",
+            headers={"Authorization": f"Bearer {SAIWAN_AI_API_KEY}"},
+            timeout=AI_TIMEOUT,
         )
-        if result.get("ok") is True:
-            return f"✅ AI TEST OK\nModel: {GROQ_MODEL}\nReply: {result.get('reply', 'SAIWAN AI OK')}"
-        return f"❌ AI TEST FAILED\nUnexpected response: {result}"
+        if not r.ok:
+            return f"❌ AI TEST FAILED\nHTTP {r.status_code}: {r.text[:300]}"
+        data = r.json()
+        test = _saiwan_ai_analyze({
+            "direction": "LONG",
+            "liquidity_sweep": True,
+            "mss": True,
+            "choch": True,
+            "fvg": True,
+            "ob": True,
+            "context_15m": True,
+            "entry_proximity": 1.0,
+            "fresh_setup": True,
+        })
+        return (
+            "✅ SAIWAN AI TEST OK\n"
+            f"Service: {data.get('service', 'SAIWAN AI')}\n"
+            f"Decision: {test.get('decision')}\n"
+            f"Timing: {test.get('timing')}"
+        )
     except Exception as e:
         return f"❌ AI TEST FAILED\n{type(e).__name__}: {e}"
 
@@ -810,7 +1040,7 @@ def status_text():
             "Scan: 5m closed candles + 15m context\n"
             f"Pending signals: {len(pending_signals)}\n"
             f"Tracked signals: {len(active_signals)}\n"
-            f"AI: {GROQ_MODEL if groq_client else 'NOT CONNECTED'}\n"
+            f"AI: SAIWAN AI v1 {'CONNECTED' if saiwan_ai_client else 'NOT CONNECTED'} · max {AI_MAX_REVIEWS_PER_SCAN}/scan\n"
             "Chart: ICT components annotated\n"
             "TradingView: chart link only"
         )
@@ -830,7 +1060,7 @@ def _error_bucket(exc):
 
 
 def scan_once():
-    """Two-phase market scan: ICT all-market -> AI only top fresh candidates."""
+    """Two-phase scan: full-market ICT pass, then AI reviews only top candidates."""
     global pending_signals
     contracts = get_contracts()
     tickers = get_tickers()
@@ -853,11 +1083,11 @@ def scan_once():
             rows15 = get_klines(symbol, TF_15M, 180)
             if len(rows5) < 120 or len(rows15) < 30:
                 return symbol, [], None
-            return symbol, collect_ict_candidates(symbol, rows5, rows15), None
+            return symbol, build_ict_candidates(symbol, rows5, rows15), None
         except Exception as e:
             return symbol, [], e
 
-    phase1 = []
+    ict_candidates = []
     error_buckets = {}
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
         futures = [pool.submit(check_symbol, symbol) for symbol in pairs]
@@ -867,54 +1097,71 @@ def scan_once():
                 key = _error_bucket(err)
                 error_buckets[key] = error_buckets.get(key, 0) + 1
                 continue
-            phase1.extend(candidates)
+            ict_candidates.extend(candidates)
 
-    # Rank ONLY by ICT freshness/origin quality. No radar, confidence or score.
-    phase1.sort(key=lambda x: (x.get("ict_rank", 0), x.get("time", 0)), reverse=True)
-    ai_candidates = phase1[:3]
-    confirmed = []
+    # AI is deliberately NOT called during the 466-symbol threaded pass.
+    # First select a tiny ICT-only shortlist, then review it sequentially.
+    ict_candidates.sort(key=_ict_candidate_rank, reverse=True)
+    shortlist = ict_candidates[:max(0, AI_MAX_REVIEWS_PER_SCAN)]
+    found = []
+    ai_confirmed = 0
+    ai_wait = 0
+    ai_rejected = 0
     ai_errors = 0
-    for sig in ai_candidates:
-        try:
-            # Do not spend another request on a setup already sent/tracked.
-            setup_key = f"{sig['symbol']}:{sig['setup_key']}"
-            if any(k.startswith(setup_key) for k in seen_signals):
-                continue
-            rows5 = get_klines(sig["symbol"], TF_5M, CANDLE_LIMIT)
-            rows15 = get_klines(sig["symbol"], TF_15M, 180)
-            ai, err = ai_review_setup(sig, rows5, rows15)
-            if err:
-                ai_errors += 1
-                print(f"AI REVIEW {sig['symbol']} {sig['direction']}: {err}")
-                continue
-            if not ai or ai.get("decision") != "CONFIRM":
-                continue
+
+    for sig in shortlist:
+        ai, err = ai_review_setup(
+            sig,
+            sig.get("_ai_rows5", []),
+            sig.get("_ai_rows15", []),
+        )
+        if err:
+            ai_errors += 1
+            print(f"AI REVIEW {sig['symbol']} {sig['direction']}: {err}")
+            continue
+        decision = (ai or {}).get("decision")
+        if decision == "CONFIRM":
+            ai_confirmed += 1
             sig["ai_timing"] = ai.get("timing", "READY")
             sig["ai_reason"] = ai.get("reason", "ICT setup confirmed")
             sig["ai_reversal_watch"] = bool(ai.get("reversal_watch", False))
-            sig["key"] = f"{sig['symbol']}:{sig['direction']}:{sig['time']}"
-            if sig["key"] not in seen_signals:
-                confirmed.append(sig)
-        except Exception as e:
-            ai_errors += 1
-            print(f"AI REVIEW {sig.get('symbol')} {sig.get('direction')}: {_error_bucket(e)} {e}")
+            key = f"{sig['symbol']}:{sig['direction']}:{sig['time']}"
+            if key not in seen_signals:
+                sig["key"] = key
+                sig.pop("_ai_rows5", None)
+                sig.pop("_ai_rows15", None)
+                found.append(sig)
+        elif decision == "WAIT":
+            ai_wait += 1
+        else:
+            ai_rejected += 1
 
     with state_lock:
         active_symbols = {x.get("symbol") for x in active_signals.values()}
-        for sig in confirmed:
+        for sig in found:
             seen_signals.add(sig["key"])
             seen_order.append(sig["key"])
             if sig["symbol"] not in active_symbols:
                 pending_signals.append(sig)
-        # Keep only fresh ICT candidates; no legacy score/radar ordering.
-        pending_signals.sort(key=lambda x: (x.get("ict_rank", 0), x.get("time", 0)), reverse=True)
-        del pending_signals[8:]
+        # Keep the pending queue small and fresh; this is only an ICT timestamp
+        # ordering, not a radar/indicator score.
+        pending_signals.sort(key=lambda x: x.get("time", 0), reverse=True)
+        del pending_signals[12:]
         while len(seen_order) > 4000:
             seen_signals.discard(seen_order.pop(0))
 
     total_errors = sum(error_buckets.values())
     summary = ", ".join(f"{name}={count}" for name, count in sorted(error_buckets.items(), key=lambda kv: kv[1], reverse=True)[:4])
-    print(f"Bitget Move Hunter scan: universe={len(eligible)}, scanned={len(pairs)}, ICT={len(phase1)}, AI_TOP={len(ai_candidates)}, confirmed={len(confirmed)}, AI_errors={ai_errors}, market_errors={total_errors}, workers={SCAN_WORKERS}")
+    print(
+        f"Bitget Move Hunter scan: universe={len(eligible)}, scanned={len(pairs)}, "
+        f"ICT candidates={len(ict_candidates)}, AI shortlist={len(shortlist)}, "
+        f"AI confirmed={ai_confirmed}, wait={ai_wait}, rejected={ai_rejected}, "
+        f"AI errors={ai_errors}, data_errors={total_errors}"
+    )
+    if not contracts:
+        print("Bitget warning: no contracts returned from /api/v2/mix/market/contracts")
+    elif not tickers:
+        print("Bitget warning: no tickers returned from /api/v2/mix/market/tickers")
     if summary:
         print(f"Bitget error summary: {summary}")
 
@@ -1054,7 +1301,7 @@ def sender_loop():
         with state_lock:
             if pending_signals:
                 # One new signal per 10-minute window; send the strongest candidate.
-                pending_signals.sort(key=lambda x: (x.get("ict_rank", 0), x.get("time", 0)), reverse=True)
+                pending_signals.sort(key=lambda x: (x.get("radar_score", 0), x.get("score", 0), x.get("confidence", 0), x.get("time", 0)), reverse=True)
                 sig = pending_signals.pop(0)
                 pending_signals.clear()
         if not sig:
@@ -1114,7 +1361,7 @@ def poll_updates():
                         "/scan - Start scanner\n"
                         "/stop - Stop scanner\n"
                         "/status - Bot status\n"
-                        "/aitest - Test Groq AI connection\n"
+                        "/aitest - Test SAIWAN AI connection\n"
                         "/search SYMBOL - Find saved signals\n\n"
                         "Market: Bitget USDT Perpetual Futures\n"
                         "Timeframe: 5m entry + 15m context\n"
