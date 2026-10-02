@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import requests
-
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -32,6 +31,14 @@ CHART_CANDLES = 70
 HTTP_TIMEOUT = 15
 MIN_SCORE = 5
 
+# SAIWAN AI Market Radar / risk-aware leverage (informational only)
+RADAR_MIN_SCORE = 72
+MAX_SUGGESTED_LEVERAGE = 5
+MIN_SUGGESTED_LEVERAGE = 2
+
+TP1_R = 1.5
+TP2_R = 2.5
+TP3_R = 4.0
 
 app = Flask(__name__)
 stop_event = threading.Event()
@@ -46,23 +53,7 @@ seen_order = []
 next_send_at = 0
 offset = None
 active_signals = {}  # key -> tracked signal state for TP/SL notifications
-signal_history = []  # sent signal summaries for /search
-MAX_SIGNAL_HISTORY = 500
 monitor_thread = None
-
-# Live scanner diagnostics (shown by /status).
-scan_stats_lock = threading.Lock()
-scan_stats = {
-    "last_at": None,
-    "last_duration": 0.0,
-    "universe": 0,
-    "scanned": 0,
-    "confirmed": 0,
-    "ict_candidates": 0,
-    "insufficient_data": 0,
-    "errors": 0,
-    "error_summary": "",
-}
 
 session = requests.Session()
 session.headers.update({"User-Agent": "SAIWAN-Crypto-Signal-Move-Hunter/5.0", "Accept": "application/json"})
@@ -529,92 +520,100 @@ def _context_15m(rows15, direction):
 
 
 def _move_setup(rows, direction):
-    """Pure Liquidity Sweep setup.
-
-    The sweep price itself is the entry.  No MSS/CHOCH/FVG/OB/AI confirmation.
-    LONG = sell-side liquidity sweep; SHORT = buy-side liquidity sweep.
-    SL is the sweep candle extreme. TPs are pre-existing opposing liquidity/swing levels.
-    """
-    if len(rows) < 80:
+    """Early move hunter: sweep -> MSS/CHOCH -> FVG + OB. No retest wait."""
+    if len(rows) < 120:
         return None
     candidates = _sweep_candidates(rows)
     for direction0, sweep_idx, liquidity in reversed(candidates):
-        if direction0 != direction:
+        if direction0 != direction or sweep_idx >= len(rows) - 1:
             continue
-        if sweep_idx >= len(rows) - 1:
+        structure = _structure_break(rows, direction, sweep_idx, len(rows) - 1)
+        if not structure:
             continue
-        sweep = rows[sweep_idx]
-        entry = float(liquidity)
-        if entry <= 0:
+        mss_idx = structure["index"]
+        # FVG is allowed on the MSS candle or within the next few closed candles.
+        fvg = _find_fvg(rows, direction, max(2, mss_idx - 1), min(len(rows), mss_idx + 5))
+        if not fvg:
+            continue
+        ob = _find_order_block(rows, direction, fvg["index"] + 1)
+        if not ob:
+            continue
+        zone = _overlap(fvg, ob) or fvg
+        trigger_idx = max(mss_idx, fvg["index"])
+        if len(rows) - 1 - trigger_idx > 4:
+            continue
+        trigger = rows[trigger_idx]
+        if direction == "LONG" and not _candle_bull(trigger):
+            continue
+        if direction == "SHORT" and not _candle_bear(trigger):
+            continue
+        cur = rows[-1]
+        if direction == "LONG" and cur["close"] <= structure["level"]:
+            continue
+        if direction == "SHORT" and cur["close"] >= structure["level"]:
             continue
 
-        # The sweep candle itself is the structural invalidation reference.
-        sl = float(sweep["low"] if direction == "LONG" else sweep["high"])
-        if direction == "LONG" and sl >= entry:
-            continue
-        if direction == "SHORT" and sl <= entry:
-            continue
-
-        # Targets are opposing liquidity/swing levels that already existed
-        # before the sweep. Never manufacture R-multiple targets.
-        prior = rows[:sweep_idx]
-        highs, lows = swing_points(prior, 2, 2)
+        entry = cur["close"]
         if direction == "LONG":
-            targets = sorted({float(p) for _, p in highs if p > entry})
+            sl = min(liquidity, ob["low"]) * 0.9995
+            if sl >= entry: continue
+            risk = entry - sl
+            highs, _ = swing_points(rows[:-1], 2, 2)
+            targets = sorted({p for _, p in highs if p > entry})
+            tp1 = max(targets[0] if targets else entry + risk*1.5, entry + risk*1.5)
+            tp2 = max(targets[1] if len(targets)>1 else entry + risk*2.5, tp1 + risk*.5)
+            tp3 = max(targets[2] if len(targets)>2 else entry + risk*4.0, tp2 + risk*.5)
         else:
-            targets = sorted({float(p) for _, p in lows if p < entry}, reverse=True)
-        targets = targets[:3]
-        if not targets:
-            continue
-        tp1 = targets[0]
-        tp2 = targets[1] if len(targets) > 1 else None
-        tp3 = targets[2] if len(targets) > 2 else None
+            sl = max(liquidity, ob["high"]) * 1.0005
+            if sl <= entry: continue
+            risk = sl - entry
+            _, lows = swing_points(rows[:-1], 2, 2)
+            targets = sorted({p for _, p in lows if p < entry}, reverse=True)
+            tp1 = min(targets[0] if targets else entry - risk*1.5, entry - risk*1.5)
+            tp2 = min(targets[1] if len(targets)>1 else entry - risk*2.5, tp1 - risk*.5)
+            tp3 = min(targets[2] if len(targets)>2 else entry - risk*4.0, tp2 - risk*.5)
 
-        # Signal identity is the sweep candle timestamp. The same sweep can
-        # therefore never be sent twice on subsequent 60s scans.
         return {
             "symbol": "", "direction": direction,
-            "structure": "Liquidity Sweep ONLY",
-            "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
-            "entry_zone_low": entry, "entry_zone_high": entry,
-            "time": sweep["time"],
-            "liquidity": entry, "sweep_index": sweep_idx,
-            "sweep_high": float(sweep["high"]), "sweep_low": float(sweep["low"]),
-            "rows": rows[max(0, sweep_idx-25):], "full_len": len(rows),
-            "checks": {"Liquidity Sweep": True},
-            "early_entry": True,
-            "entry_pending": True,
+            "structure": "Liquidity Sweep + MSS + CHOCH + FVG + OB",
+            "entry": entry, "trigger_level": structure["level"], "sl": sl,
+            "tp1": tp1, "tp2": tp2, "tp3": tp3,
+            "entry_zone_low": zone["low"], "entry_zone_high": zone["high"],
+            "score": 5, "max_score": 5, "time": cur["time"],
+            "liquidity": liquidity, "sweep_index": sweep_idx,
+            "mss_index": mss_idx, "mss_level": structure["level"],
+            "fvg": fvg, "ob": ob, "entry_zone": zone,
+            "rows": rows[max(0, sweep_idx-18):], "full_len": len(rows),
+            "checks": {"Liquidity Sweep": True, "MSS": True, "FVG": True, "OB": True, "CHOCH": True},
+            "retest_ok": False, "rejection_ok": True, "early_entry": True,
         }
     return None
 
 
-def analyze(symbol, rows5, rows15=None, diagnostics=False):
-    """Pure Liquidity Sweep scanner. No AI and no secondary indicators/structure filters."""
-    diag = {"ict_candidates": 0, "insufficient_data": 0}
-    if len(rows5) < 80:
-        return (None, diag) if diagnostics else None
-    for r in rows5:
-        r["symbol"] = symbol
+def analyze(symbol, rows5, rows15=None):
+    """SAIWAN Move Hunter: 5m entry hunting with 15m context, price action only."""
+    if len(rows5) < 120:
+        return None
+    for r in rows5: r["symbol"] = symbol
     candidates = []
     for direction in ("LONG", "SHORT"):
         sig = _move_setup(rows5, direction)
         if sig:
-            diag["ict_candidates"] += 1
             sig["symbol"] = symbol
-            sig["timeframe"] = "5m Liquidity Sweep"
+            sig["context15"] = _context_15m(rows15, direction)
+            sig["timeframe"] = "5m Entry · 15m Context"
             candidates.append(sig)
-    result = max(candidates, key=lambda x: x["time"]) if candidates else None
-    return (result, diag) if diagnostics else result
+    return max(candidates, key=lambda x: x["time"]) if candidates else None
 
 def make_chart(sig):
-    """Professional 5m chart showing only the Liquidity Sweep and trade levels."""
+    """Render the ICT 2022 setup with every signal component annotated."""
     rows = sig["rows"]
     n = len(rows)
     direction = sig["direction"]
     entry, sl = sig["entry"], sig["sl"]
-    tps = [(sig.get("tp1"), "TP1"), (sig.get("tp2"), "TP2"), (sig.get("tp3"), "TP3")]
+    tp1, tp2, tp3 = sig["tp1"], sig["tp2"], sig["tp3"]
     BG, GRID, TEXT, MUTED = "#f7f7f8", "#e4e6e8", "#17191c", "#73777d"
-    UP, DOWN = "#16a085", "#e14b55"
+    UP, DOWN, GOLD, PURPLE = "#16a085", "#e14b55", "#c8a84e", "#7957d5"
     fig, ax = plt.subplots(figsize=(14.4, 7.8), dpi=170, facecolor=BG)
     ax.set_facecolor(BG)
     width = 0.58
@@ -624,32 +623,56 @@ def make_chart(sig):
         lo = min(r["open"], r["close"])
         bh = max(abs(r["close"]-r["open"]), abs(r["close"])*1e-5)
         ax.add_patch(Rectangle((i-width/2, lo), width, bh, facecolor=c, edgecolor=c, linewidth=.5, zorder=4))
+
     right = n + 14
-    offset = sig.get("full_len", n) - n
-    sweep_local = sig["sweep_index"] - offset
+    fvg = sig["fvg"]; ob = sig["ob"]; zone = sig["entry_zone"]
+    def box(z, color, alpha, label, yoff=0):
+        local_index = z.get("index", 0) - (sig.get("full_len", n) - n) if "index" in z else 0
+        x0 = max(0, min(n-1, local_index - max(3, n//10)))
+        ax.add_patch(Rectangle((x0, z["low"]), right-x0, z["high"]-z["low"], facecolor=color, edgecolor=color, alpha=alpha, linewidth=1.0, zorder=1))
+        ax.text(x0+1, z["high"]+yoff, label, color=color, fontsize=8.2, fontweight="bold", va="bottom", zorder=6)
+
+    box(ob, GOLD, .13, "ORDER BLOCK")
+    box(fvg, PURPLE, .15, "FVG")
+    ax.add_patch(Rectangle((max(0, fvg["index"]-2), zone["low"]), right-max(0, fvg["index"]-2), zone["high"]-zone["low"], facecolor=PURPLE, edgecolor=PURPLE, alpha=.08, linewidth=1.2, zorder=0))
+    ax.text(max(0, fvg["index"]-1), zone["high"], "ENTRY ZONE", color=PURPLE, fontsize=8, fontweight="bold", va="bottom")
+
+    # Map stored indices from full series to chart-local indices using timestamp.
+    times = {r["time"]: i for i, r in enumerate(rows)}
+    full_rows = rows
     sweep_price = sig["liquidity"]
+    # Sweep and MSS indices are converted approximately from the setup's latest
+    # chart window by matching the closest candle timestamp when possible.
+    sweep_local = max(0, n-1)
+    mss_local = max(0, n-1)
+    # The stored setup indices refer to the full scan; derive their local offset
+    # from the visible window size.
+    full_len_hint = sig.get("full_len", n)
+    sweep_local = sig["sweep_index"] - (full_len_hint - n)
+    mss_local = sig["mss_index"] - (full_len_hint - n)
     if 0 <= sweep_local < n:
-        c = DOWN if direction == "SHORT" else UP
-        ax.scatter([sweep_local], [sweep_price], s=65, marker="v" if direction == "SHORT" else "^", color=c, zorder=8)
-        ax.annotate("LIQUIDITY SWEEP / ENTRY", xy=(sweep_local, sweep_price),
-                    xytext=(max(0, sweep_local-12), sweep_price),
-                    arrowprops=dict(arrowstyle="->", color=c, lw=1.5),
-                    color=c, fontsize=8.8, fontweight="bold")
-    ax.axhline(entry, color=TEXT, linewidth=1.2, linestyle="--")
+        ax.scatter([sweep_local], [sweep_price], s=55, marker="v" if direction == "SHORT" else "^", color=DOWN if direction == "SHORT" else UP, zorder=8)
+        ax.annotate("LIQUIDITY SWEEP", xy=(sweep_local, sweep_price), xytext=(max(0,sweep_local-10), sweep_price), arrowprops=dict(arrowstyle="->", color=DOWN if direction=="SHORT" else UP, lw=1.4), color=DOWN if direction=="SHORT" else UP, fontsize=8.4, fontweight="bold")
+    if 0 <= mss_local < n:
+        ax.axhline(sig["mss_level"], color=GOLD, linestyle="--", linewidth=1.0, alpha=.85)
+        ax.annotate("MSS / CHOCH", xy=(mss_local, sig["mss_level"]), xytext=(max(0,mss_local-10), sig["mss_level"]), arrowprops=dict(arrowstyle="->", color=GOLD, lw=1.4), color=GOLD, fontsize=8.4, fontweight="bold")
+
+    ax.axhline(entry, color=TEXT, linewidth=1.15, linestyle="--")
     ax.axhline(sl, color=DOWN, linewidth=1.0)
-    for y, lab in tps:
-        if y is None:
-            continue
-        ax.axhline(y, color=UP, linewidth=.9, linestyle=":")
-        ax.text(right+.3, y, f"{lab} {fmt_price(y)}", color=UP, fontsize=8, fontweight="bold", va="center")
+    for y, lab, c in [(tp1,"TP1",UP),(tp2,"TP2",UP),(tp3,"TP3",UP)]:
+        ax.axhline(y, color=c, linewidth=.9, linestyle=":")
+        ax.text(right+.3, y, f"{lab} {fmt_price(y)}", color=c, fontsize=8, fontweight="bold", va="center")
     ax.text(right+.3, entry, f"ENTRY {fmt_price(entry)}", color=TEXT, fontsize=8, fontweight="bold", va="center")
     ax.text(right+.3, sl, f"SL {fmt_price(sl)}", color=DOWN, fontsize=8, fontweight="bold", va="center")
+
     arrow_color = UP if direction == "LONG" else DOWN
-    ax.scatter([sweep_local], [entry], s=42, color=arrow_color, edgecolor="white", linewidth=.8, zorder=9)
-    ax.text(.01, 1.055, f"{sig['symbol']} · SAIWAN CRYPTO SIGNAL · 5m · Bitget Futures", transform=ax.transAxes, fontsize=15, color=TEXT, fontweight="bold")
-    ax.text(.01, 1.018, "LIQUIDITY SWEEP → ENTRY", transform=ax.transAxes, fontsize=9.5, color=arrow_color, fontweight="bold")
+    ax.scatter([n-1], [entry], s=42, color=arrow_color, edgecolor="white", linewidth=.8, zorder=9)
+    ax.annotate(direction, xy=(n-1, entry), xytext=(max(0,n-15), entry), arrowprops=dict(arrowstyle="->", color=arrow_color, lw=1.7), color=arrow_color, fontsize=10, fontweight="bold")
+    ax.text(.01, 1.055, f"{sig['symbol']} · SAIWAN CRYPTO SIGNAL · 5m ENTRY · Bitget Futures", transform=ax.transAxes, fontsize=15, color=TEXT, fontweight="bold")
+    ax.text(.01, 1.018, "LIQUIDITY SWEEP → MSS → CHOCH → FVG → OB → ENTRY", transform=ax.transAxes, fontsize=9.5, color=PURPLE, fontweight="bold")
     ax.text(.99, 1.018, direction, transform=ax.transAxes, fontsize=11, color=arrow_color, fontweight="bold", ha="right")
-    ax.text(.01, .018, "SAIWAN · Liquidity Sweep only · closed candles", transform=ax.transAxes, fontsize=8.2, color=MUTED)
+    ax.text(.01, .018, "SAIWAN Move Hunter · 5m closed entry · 15m context · ICT price action only", transform=ax.transAxes, fontsize=8.2, color=MUTED)
+
     ax.yaxis.tick_right(); ax.tick_params(axis="y", colors=TEXT, labelsize=8.3, length=0)
     ax.tick_params(axis="x", colors=MUTED, labelsize=8, length=0, pad=8)
     ax.grid(axis="y", color=GRID, linewidth=.6); ax.grid(axis="x", color=GRID, linewidth=.4, alpha=.5)
@@ -658,14 +681,14 @@ def make_chart(sig):
     step=max(1,n//7); ticks=list(range(0,n,step))
     if ticks[-1] != n-1: ticks.append(n-1)
     ax.set_xticks(ticks); ax.set_xticklabels([datetime.fromtimestamp(rows[i]["time"], tz=timezone.utc).strftime("%d\\n%H:%M") for i in ticks])
-    levels=[x for x in [entry,sl]+[p for p,_ in tps if p is not None]]
-    all_lows=[r["low"] for r in rows]+levels
-    all_highs=[r["high"] for r in rows]+levels
+    all_lows=[r["low"] for r in rows]+[sl,tp3,ob["low"],fvg["low"]]
+    all_highs=[r["high"] for r in rows]+[sl,tp3,ob["high"],fvg["high"]]
     ymin,ymax=min(all_lows),max(all_highs); span=max(ymax-ymin,abs(rows[-1]["close"])*.012)
     ax.set_ylim(ymin-span*.06,ymax+span*.12); ax.set_xlim(-1,right+8)
     fig.subplots_adjust(left=.035,right=.86,top=.89,bottom=.09)
     safe="".join(ch if ch.isalnum() else "_" for ch in sig["symbol"])
     path=f"/tmp/chart_{safe}_{sig['time']}.png"; fig.savefig(path,facecolor=BG,edgecolor="none"); plt.close(fig); return path
+
 
 def telegram_url(method):
     if not TOKEN:
@@ -698,53 +721,21 @@ def send_photo(chat_id, photo_path, caption, reply_markup=None):
     return (payload.get("result") or {}).get("message_id")
 
 
-def search_signals(query):
-    q = (query or "").strip().upper().replace("/SEARCH", "").strip()
-    if not q:
-        return "Usage: /search SYMBOL\nExample: /search XRP"
-    with state_lock:
-        matches = [x.copy() for x in signal_history if q in x["symbol"].upper()]
-    if not matches:
-        return f"🔎 No saved SAIWAN signal found for {q}."
-    matches = matches[-8:][::-1]
-    lines = [f"🔎 SAIWAN SIGNAL SEARCH: {q}", ""]
-    for x in matches:
-        dt = datetime.fromtimestamp(x["time"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        arrow = "🟢 LONG" if x["direction"] == "LONG" else "🔴 SHORT"
-        lines.append(f"{arrow} {x['symbol']} · {dt}")
-        lines.append(f"Entry {fmt_price(x['entry'])} · SL {fmt_price(x['sl'])} · TP1 {fmt_price(x['tp1'])}")
-        lines.append("")
-    return "\n".join(lines).strip()
-
-
 def status_text():
     with state_lock:
-        scanner = scanner_running
-        pending = len(pending_signals)
-        tracked = len(active_signals)
-    with scan_stats_lock:
-        st = dict(scan_stats)
-    return (
-        "BOT STATUS: ONLINE\n"
-        f"Scanner: {'RUNNING' if scanner else 'STOPPED'}\n"
-        "Market: Bitget USDT Perpetual Futures\n"
-        "Strategy: LIQUIDITY SWEEP ONLY\n"
-        "Entry: exact liquidity-sweep level\n"
-        "SL: sweep candle extreme\n"
-        "TP: opposing pre-existing liquidity/swing levels\n"
-        "AI: DISABLED / REMOVED\n"
-        f"Pending signals: {pending}\n"
-        f"Tracked signals: {tracked}\n"
-        f"Last scan (UTC): {st.get('last_at') or 'never'}\n"
-        f"Duration: {st.get('last_duration', 0.0):.1f}s\n"
-        f"Universe: {st.get('universe', 0)}\n"
-        f"Scanned: {st.get('scanned', 0)}\n"
-        f"Liquidity sweeps found: {st.get('ict_candidates', 0)}\n"
-        f"Signals confirmed: {st.get('confirmed', 0)}\n"
-        f"Data too short: {st.get('insufficient_data', 0)}\n"
-        f"Scan errors: {st.get('errors', 0)}\n"
-        f"Error summary: {st.get('error_summary') or 'none'}"
-    )
+        return (
+            "BOT STATUS: ONLINE\n"
+            f"Scanner: {'RUNNING' if scanner_running else 'STOPPED'}\n"
+            "Market: Bitget USDT Perpetual Futures (full eligible market)\n"
+            "Strategy: SAIWAN CRYPTO SIGNAL — Move Hunter\n"
+            "Model: SAIWAN Move Hunter — Liquidity Sweep + MSS + CHOCH + FVG + OB\n"
+            "Data source: Bitget Futures market data\n"
+            "Scan: 5m closed candles + 15m context\n"
+            f"Pending signals: {len(pending_signals)}\n"
+            f"Tracked signals: {len(active_signals)}\n"
+            "Chart: ICT components annotated\n"
+            "TradingView: chart link only"
+        )
 
 def _error_bucket(exc):
     msg = str(exc).replace("\n", " ").strip()
@@ -762,7 +753,6 @@ def _error_bucket(exc):
 
 def scan_once():
     global pending_signals
-    started = time.time()
     contracts = get_contracts()
     tickers = get_tickers()
     tv = {x.get("symbol"): x for x in tickers}
@@ -776,73 +766,53 @@ def scan_once():
         if liquidity > 0:
             eligible.append((liquidity, sym))
     eligible.sort(reverse=True)
+    # Scan the whole eligible market by default. MAX_PAIRS > 0 can still cap it if needed.
     pairs = [s for _, s in eligible] if MAX_PAIRS <= 0 else [s for _, s in eligible[:MAX_PAIRS]]
 
     def check_symbol(symbol):
         try:
             rows5 = get_klines(symbol, TF_5M, CANDLE_LIMIT)
-            if len(rows5) < 80:
-                return symbol, None, None, {"insufficient_data": 1}
-            sig, diag = analyze(symbol, rows5, None, diagnostics=True)
-            return symbol, sig, None, diag
+            rows15 = get_klines(symbol, TF_15M, 180)
+            if len(rows5) < 120 or len(rows15) < 30:
+                return symbol, None, None
+            return symbol, analyze(symbol, rows5, rows15), None
         except Exception as e:
-            return symbol, None, e, {}
+            return symbol, None, e
 
     found = []
     error_buckets = {}
-    totals = {"ict_candidates": 0, "insufficient_data": 0}
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
         futures = [pool.submit(check_symbol, symbol) for symbol in pairs]
         for fut in as_completed(futures):
-            symbol, sig, err, diag = fut.result()
-            for key in totals:
-                totals[key] += int(diag.get(key, 0))
+            symbol, sig, err = fut.result()
             if err is not None:
                 key = _error_bucket(err)
                 error_buckets[key] = error_buckets.get(key, 0) + 1
                 continue
             if sig:
-                key = f"{symbol}:{sig['direction']}:SWEEP:{sig['time']}:{sig['entry']}"
+                key = f"{symbol}:{sig['direction']}:{sig['time']}"
                 if key not in seen_signals:
                     sig["key"] = key
                     found.append(sig)
 
     with state_lock:
-        active_keys = set(active_signals.keys())
-        pending_keys = {x.get("key") for x in pending_signals}
+        active_symbols = {x.get("symbol") for x in active_signals.values()}
         for sig in found:
             seen_signals.add(sig["key"])
             seen_order.append(sig["key"])
-            if sig["key"] not in active_keys and sig["key"] not in pending_keys:
+            # Do not queue another signal for a symbol that is already being tracked.
+            if sig["symbol"] not in active_symbols:
                 pending_signals.append(sig)
-        pending_signals.sort(key=lambda x: x.get("time", 0), reverse=True)
+        # Keep only the strongest Radar candidates so the cooldown never creates
+        # a backlog of stale alerts. Radar score is the primary market ranking.
+        pending_signals.sort(key=lambda x: (x.get("radar_score", 0), x.get("score", 0), x.get("confidence", 0), x.get("time", 0)), reverse=True)
         del pending_signals[12:]
         while len(seen_order) > 4000:
             seen_signals.discard(seen_order.pop(0))
 
     total_errors = sum(error_buckets.values())
-    summary = ", ".join(f"{name}={count}" for name, count in sorted(error_buckets.items(), key=lambda kv: kv[1], reverse=True)[:6])
-    duration = time.time() - started
-    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    with scan_stats_lock:
-        scan_stats.update({
-            "last_at": now_utc,
-            "last_duration": duration,
-            "universe": len(eligible),
-            "scanned": len(pairs),
-            "confirmed": len(found),
-            "ict_candidates": totals["ict_candidates"],
-            "insufficient_data": totals["insufficient_data"],
-            "errors": total_errors,
-            "error_summary": summary,
-        })
-
-    print(
-        "Bitget Liquidity Sweep scan: "
-        f"universe={len(eligible)}, scanned={len(pairs)}, "
-        f"sweeps={totals['ict_candidates']}, confirmed={len(found)}, "
-        f"errors={total_errors}, duration={duration:.1f}s, workers={SCAN_WORKERS}"
-    )
+    summary = ", ".join(f"{name}={count}" for name, count in sorted(error_buckets.items(), key=lambda kv: kv[1], reverse=True)[:4])
+    print(f"Bitget Move Hunter scan: universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
     if not contracts:
         print("Bitget warning: no contracts returned from /api/v2/mix/market/contracts")
     elif not tickers:
@@ -850,21 +820,21 @@ def scan_once():
     if summary:
         print(f"Bitget error summary: {summary}")
 
+
 def signal_caption(sig):
     d = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
-    tp_lines = []
-    for name in ("tp1", "tp2", "tp3"):
-        if sig.get(name) is not None:
-            tp_lines.append(f"{name.upper()}: {fmt_price(sig[name])}")
     return (
         f"🚀 SAIWAN CRYPTO SIGNAL\n\n{d}\n"
         f"⭐ {sig['symbol']} · Bitget Futures\n"
-        f"⏱ 5m Liquidity Sweep\n\n"
-        "Liquidity Sweep ✓\n"
-        f"Entry (Sweep): {fmt_price(sig['entry'])}\n"
-        f"SL (Sweep Extreme): {fmt_price(sig['sl'])}\n"
-        + "\n".join(tp_lines) + "\n\n"
-        "⚡ Entry is the exact liquidity-sweep level.\n"
+        f"⏱ 5m Entry · 15m Context\n\n"
+        "Liquidity Sweep ✓  ·  MSS ✓  ·  CHOCH ✓  ·  FVG ✓  ·  OB ✓\n"
+        f"15m Context: {sig.get('context15','UNKNOWN')}\n"
+        f"Entry: {fmt_price(sig['entry'])}\n"
+        f"SL: {fmt_price(sig['sl'])}\n"
+        f"TP1: {fmt_price(sig['tp1'])}\n"
+        f"TP2: {fmt_price(sig['tp2'])}\n"
+        f"TP3: {fmt_price(sig['tp3'])}\n\n"
+        "⚡ Early move setup — closed candles only.\n"
         "⚠️ Signal only — no automatic trading."
     )
 
@@ -882,7 +852,6 @@ def scanner_loop():
 
 
 def track_sent_signal(sig, chat_id, message_id):
-    global signal_history
     if not message_id:
         return
     with state_lock:
@@ -900,28 +869,18 @@ def track_sent_signal(sig, chat_id, message_id):
             "tp1_hit": False,
             "tp2_hit": False,
             "tp3_hit": False,
-            # The signal itself is created by the completed liquidity-sweep candle.
-            # Because Entry is the exact sweep level, the sweep is the entry event;
-            # do not wait for a second future touch of the same level.
-            "entry_pending": False,
-            "entry_filled": True,
             "closed": False,
         }
-        signal_history.append({
-            "key": sig["key"], "symbol": sig["symbol"], "direction": sig["direction"],
-            "time": sig["time"], "entry": sig["entry"], "sl": sig["sl"],
-            "tp1": sig["tp1"], "tp2": sig["tp2"], "tp3": sig["tp3"],
-        })
-        if len(signal_history) > MAX_SIGNAL_HISTORY:
-            del signal_history[:-MAX_SIGNAL_HISTORY]
 
 def _hit_level(direction, price, level):
     return price >= level if direction == "LONG" else price <= level
 
 def monitor_active_signals():
-    """Monitor pending entry first, then structural SL/TP after entry is touched."""
+    global active_signals
+    # Monitoring stays alive even when /stop pauses the scanner, so already-sent
+    # signals can still receive TP/SL replies.
     while True:
-        time.sleep(15)
+        time.sleep(30)
         with state_lock:
             tracked = list(active_signals.values())
         if not tracked:
@@ -929,8 +888,9 @@ def monitor_active_signals():
         try:
             tv = {x.get("symbol"): x for x in get_tickers()}
         except Exception as e:
-            print(f"TP MONITOR ERROR: {type(e).__name__}: {e}")
+            print(f"TP MONITOR ERROR {_error_bucket(e)}: {e}")
             continue
+
         for state in tracked:
             if state.get("closed"):
                 continue
@@ -939,31 +899,35 @@ def monitor_active_signals():
                 price = float(ticker.get("lastPr"))
             except (TypeError, ValueError):
                 continue
-            try:
-                direction = state["direction"]
-                entry = float(state["entry"])
-                # Entry is the exact liquidity-sweep level. The sweep candle itself
-                # is the entry event, so TP/SL monitoring starts immediately.
-                # This prevents missing TP notifications when price has already moved
-                # beyond a TP level by the time the next 15-second monitor tick runs.
 
-                # SL is the sweep candle extreme.
-                if _hit_level(direction, state["sl"], price):
-                    send_message(state["chat_id"], f"🛑 SL Hit\n⭐ {state['symbol']}\n💵 Price: {fmt_price(price)}", reply_to_message_id=state["message_id"])
+            try:
+                # Stop monitoring after SL. This prevents a later TP notification
+                # after the original setup has already been invalidated.
+                if _hit_level(state["direction"], state["sl"], price):
+                    send_message(
+                        state["chat_id"],
+                        f"🛑 SL Hit\n⭐ {state['symbol']}\n💵 Price: {fmt_price(price)}",
+                        reply_to_message_id=state["message_id"],
+                    )
                     with state_lock:
                         active_signals.pop(state["key"], None)
                     continue
 
                 for name in ("tp1", "tp2", "tp3"):
-                    level = state.get(name)
-                    if level is None or state.get(f"{name}_hit"):
+                    hit_key = f"{name}_hit"
+                    if state[hit_key]:
                         continue
-                    if _hit_level(direction, price, level):
-                        send_message(state["chat_id"], f"🎯 {name.upper()} Hit\n⭐ {state['symbol']}\n💵 Price: {fmt_price(price)}", reply_to_message_id=state["message_id"])
+                    if _hit_level(state["direction"], price, state[name]):
+                        label = name.upper().replace("TP", "TP")
+                        send_message(
+                            state["chat_id"],
+                            f"🎯 {label} Hit\n⭐ {state['symbol']}\n💵 Price: {fmt_price(price)}",
+                            reply_to_message_id=state["message_id"],
+                        )
                         with state_lock:
                             if state["key"] in active_signals:
-                                active_signals[state["key"]][f"{name}_hit"] = True
-                                if name == "tp3" or all(state.get(f"{n}_hit") or state.get(n) is None for n in ("tp1","tp2","tp3")):
+                                active_signals[state["key"]][hit_key] = True
+                                if name == "tp3":
                                     active_signals.pop(state["key"], None)
                                     break
             except Exception as e:
@@ -982,7 +946,7 @@ def sender_loop():
         with state_lock:
             if pending_signals:
                 # One new signal per 10-minute window; send the strongest candidate.
-                pending_signals.sort(key=lambda x: x.get("time", 0), reverse=True)
+                pending_signals.sort(key=lambda x: (x.get("radar_score", 0), x.get("score", 0), x.get("confidence", 0), x.get("time", 0)), reverse=True)
                 sig = pending_signals.pop(0)
                 pending_signals.clear()
         if not sig:
@@ -1041,30 +1005,24 @@ def poll_updates():
                         "🚀 SAIWAN CRYPTO SIGNAL\n\n"
                         "/scan - Start scanner\n"
                         "/stop - Stop scanner\n"
-                        "/status - Bot status\n"
-                        "/search SYMBOL - Find saved signals\n\n"
+                        "/status - Bot status\n\n"
                         "Market: Bitget USDT Perpetual Futures\n"
-                        "Timeframe: 5m closed candles\n"
-                        "Strategy: Liquidity Sweep ONLY\n"
-                        "Entry: exact sweep level\n"
-                        "SL: sweep candle extreme\n"
-                        "TP: opposing liquidity/swing levels\n"
+                        "Timeframe: 5m entry + 15m context\n"
+                        "Model: SAIWAN Move Hunter — Liquidity Sweep + MSS + CHOCH + FVG + OB\n"
+                        "Chart: professional 5m setup map with all ICT components\n"
                         "TP/SL monitoring: ENABLED")
                 elif text.startswith("/scan"):
                     start_scanner(active_chat_id)
                     send_message(active_chat_id,
                         "🚀 SAIWAN CRYPTO SIGNAL SCANNER STARTED\n\n"
-                        "5m closed candles.\n"
-                        "Signal rule: Liquidity Sweep ONLY.\n"
-                        "Sweep level = Entry; sweep extreme = SL.\n"
-                        "TPs = opposing pre-existing liquidity/swing levels.\n"
+                        "5m closed candles for early entries + 15m context.\n"
+                        "Signal hunts: Liquidity Sweep + MSS + CHOCH + FVG + OB.\n"
+                        "The chart will mark every ICT component used.\n"
                         "TP/SL monitoring is enabled.")
                 elif text.startswith("/stop"):
                     stop_scanner(); send_message(active_chat_id, "🛑 Scanner stopped.")
                 elif text.startswith("/status"):
                     send_message(active_chat_id, status_text())
-                elif text.startswith("/search"):
-                    send_message(active_chat_id, search_signals(text))
         except Exception as e:
             print(f"TELEGRAM ERROR {type(e).__name__}: {e}")
             time.sleep(3)
