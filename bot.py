@@ -1127,17 +1127,16 @@ def _analysis_verdict(blocks):
 
 
 def analysis_report(raw_symbol, requested_timeframes=None):
-    """On-demand multi-timeframe analysis for /analysis SYMBOL [1h] [4h].
+    """On-demand single-timeframe analysis for /analysis SYMBOL TIMEFRAME.
 
     Examples:
-      /analysis BTC
+      /analysis BTC 5m
+      /analysis BTC 15m
       /analysis BTC 1h
       /analysis BTC 4h
-      /analysis BTC 1h 4h
 
-    If no timeframe is supplied, the original 5m + 15m analysis is used.
-    1h/4h analysis uses the same closed-candle price-action model and EMA bias
-    checks as the bot's existing scanner, but does not place trades.
+    The requested timeframe is analyzed directly with closed candles, EMA bias,
+    price-action/ICT setup checks, and a matching chart. No trade is placed.
     """
     symbol = _normalize_analysis_symbol(raw_symbol)
     if not symbol or len(symbol) < 6:
@@ -1546,10 +1545,8 @@ def poll_updates():
                         "/scan - Start scanner\n"
                         "/stop - Stop scanner\n"
                         "/status - Bot status\n"
-                        "/analysis COIN - Analyze one coin now\n"
-                        "/analysis COIN 1h - Higher-timeframe analysis\n"
-                        "/analysis COIN 4h - Higher-timeframe analysis\n"
-                        "/analysis COIN 1h 4h - Multi-timeframe analysis\n\n"
+                        "/analysis COIN TIMEFRAME - Analyze one coin on one timeframe\n"
+                        "Example: /analysis BTC 1h  |  /analysis BTC 4h\n\n"
                         "Market: Bitget USDT Perpetual Futures\n"
                         "Timeframe: 5m entry + 15m context\n"
                         "Model: SAIWAN Move Hunter — Liquidity Sweep + MSS + CHOCH + FVG + OB\n"
@@ -1567,25 +1564,23 @@ def poll_updates():
                     stop_scanner(); send_message(active_chat_id, "🛑 Scanner stopped.")
                 elif text.startswith("/analysis"):
                     parts = text.split()
-                    if len(parts) < 2:
-                        send_message(active_chat_id, "🔎 نموونە:\n/analysis BTCUSDT\n/analysis AVAX 1h\n/analysis ETH 4h\n/analysis BTC 1h 4h")
+                    if len(parts) != 3:
+                        send_message(active_chat_id, "🔎 نموونە:\n/analysis BTC 5m\n/analysis AVAX 15m\n/analysis ETH 1h\n/analysis BTC 4h")
                     else:
                         try:
                             symbol = _normalize_analysis_symbol(parts[1])
-                            timeframes = parts[2:]
-                            valid_tfs = [_normalize_analysis_timeframe(x) for x in timeframes]
-                            invalid = [x for x, tf in zip(timeframes, valid_tfs) if tf is None]
-                            if invalid:
-                                send_message(active_chat_id, "❌ Timeframe ـی دروست: 5m, 15m, 1h, 4h\n\nنموونە: /analysis BTC 1h 4h")
+                            tf = _normalize_analysis_timeframe(parts[2])
+                            if tf is None:
+                                send_message(active_chat_id, "❌ Timeframe ـی دروست: 5m, 15m, 1h, 4h\n\nنموونە: /analysis BTC 1h")
                             else:
-                                mode = " + ".join(valid_tfs) if valid_tfs else "5m + 15m"
-                                send_message(active_chat_id, f"🔎 خەریکم {symbol} شیکاری دەکەم...\n⏱ {mode}")
+                                valid_tfs = [tf]
+                                send_message(active_chat_id, f"🔎 خەریکم {symbol} شیکاری دەکەم...\n⏱ {tf.upper()}")
                                 report = analysis_report(parts[1], valid_tfs)
                                 send_message(active_chat_id, report)
                                 try:
                                     chart_paths = make_analysis_charts(parts[1], valid_tfs)
                                     for chart_path in chart_paths:
-                                        send_photo(active_chat_id, chart_path, f"📊 SAIWAN CHART — {_normalize_analysis_symbol(parts[1])}")
+                                        send_photo(active_chat_id, chart_path, f"📊 SAIWAN CHART — {_normalize_analysis_symbol(parts[1])} · {tf.upper()}")
                                 except Exception as chart_error:
                                     print(f"ANALYSIS CHART ERROR {type(chart_error).__name__}: {chart_error}")
                                     send_message(active_chat_id, "⚠️ شیکاریەکە هات، بەڵام چارتەکە نەدروستکرا.")
