@@ -64,7 +64,7 @@ MOM_MAX_RISK_ATR = 3.50
 # Primary trigger: anchored VWAP retest after price has spent enough bars away
 # from VWAP in the current structural leg. Risk preset mirrors the source's
 # Balanced preset: 1.5 ATR SL and 1R / 2R / 3R targets, with BE after TP1.
-SA_VWAP_ENABLED = False  # Momentum Engine is the primary scanner; SA-VWAP code is retained for compatibility.
+SA_VWAP_ENABLED = True
 SA_VWAP_PIVOT_LEFT = 55
 SA_VWAP_PIVOT_RIGHT = 55
 SA_VWAP_MIN_SWING_ATR = 1.50
@@ -985,12 +985,10 @@ def _sa_vwap_setup(rows, direction):
 
 
 def _move_setup(rows, direction):
-    """SA-VWAP is the primary signal engine; Momentum remains the fallback."""
-    if SA_VWAP_ENABLED:
-        sig = _sa_vwap_setup(rows, direction)
-        if sig:
-            return sig
-    return _momentum_setup(rows, direction)
+    """Use the supplied TradingView SA-VWAP logic as the bot's signal engine."""
+    if not SA_VWAP_ENABLED:
+        return None
+    return _sa_vwap_setup(rows, direction)
 
 
 def analyze(symbol, rows5=None, rows15=None, timeframe=SIGNAL_TIMEFRAME):
@@ -1006,6 +1004,10 @@ def analyze(symbol, rows5=None, rows15=None, timeframe=SIGNAL_TIMEFRAME):
         if sig:
             sig["symbol"] = symbol
             sig["timeframe"] = timeframe
+            # SA-VWAP setup objects are built from closed candles and must carry
+            # the closed candle timestamp for de-duplication / ordering.
+            sig["time"] = rows[-1]["time"]
+            sig["candle_time"] = rows[-1]["time"]
             candidates.append(sig)
     return max(candidates, key=lambda x: x["time"]) if candidates else None
 
@@ -1291,7 +1293,7 @@ def _inline_button(text, callback_data):
 def main_menu_markup():
     return {
         "inline_keyboard": [
-            [_inline_button("🔥 SCAN MARKET", "menu_scan"), _inline_button("🎯 TOP MOMENTUM", "scan_top")],
+            [_inline_button("🔥 SCAN MARKET", "menu_scan"), _inline_button("🎯 TOP SA-VWAP", "scan_top")],
             [_inline_button("📈 MOVERS", "movers"), _inline_button("🔎 ANALYSIS", "menu_analysis")],
             [_inline_button("👁 WATCHLIST", "watchlist"), _inline_button("🔔 ALERTS", "alerts")],
             [_inline_button("📜 HISTORY", "history"), _inline_button("📊 STATS", "stats")],
@@ -1332,15 +1334,13 @@ def settings_menu_markup():
 
 
 def welcome_text():
-    label = _scan_timeframe_label(active_scan_timeframe)
     return (
         "🚀 SAIWAN CRYPTO SIGNALS\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "⚡ MOMENTUM ENGINE\n"
-        f"📊 {label} • BITGET FUTURES\n"
+        "📐 SA-VWAP ENGINE\n"
+        "📊 15M • BITGET FUTURES\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        "🎯 Breakout • Pullback • Volume • ATR\n"
-        "🔒 Anti-chase filter: ON\n"
+        "🎯 Anchored VWAP • Retest • ATR • Break-even\n"
         "🔔 Signal + TP/SL monitoring: ACTIVE\n\n"
         "Choose an action from the buttons below."
     )
@@ -1423,11 +1423,10 @@ def _handle_callback_query(query):
             start_scanner(chat_id, tf)
             edit_message(
                 chat_id, message_id,
-                f"🚀 MOMENTUM {label} SCANNER STARTED\n\n"
-                f"The Momentum Engine is now scanning {label} closed candles.\n\n"
-                "⚡ Breakout + Pullback + Volume + ATR\n"
+                f"🚀 {label} SCANNER STARTED\n\n"
+                f"The SA-VWAP Engine is now scanning {label} closed candles.\n\n"
+                "📐 Anchored VWAP + Retest + ATR + BE\n"
                 "🔒 Anti-chase filter: ON\n"
-                "🎯 TP1 1.5R • TP2 2.5R • TP3 4R\n"
                 "🎯 TP/SL monitoring: ON",
                 main_menu_markup(),
             )
@@ -2195,11 +2194,9 @@ def status_text():
         f"Scanner: {'RUNNING' if scanner else 'STOPPED'}\n"
         f"Smart Watch: {'ON' if watch_on else 'OFF'} ({watched}/{MAX_WATCH_ITEMS})\n"
         "Market: Bitget USDT Perpetual Futures\n"
-        "Strategy: SAIWAN MOMENTUM ENGINE\n"
-        "Engine: Breakout + Pullback + Volume + ATR\n"
-        f"Scan timeframe: {_scan_timeframe_label(active_scan_timeframe)}\n"
-        f"Analysis timeframe: {_scan_timeframe_label(active_scan_timeframe)}\n"
-        "Risk: SL 0.50 ATR buffer · TP 1.5R / 2.5R / 4R\n"
+        "Strategy: SAIWAN SA-VWAP — Anchored VWAP + Retest + ATR + BE\n"
+        f"Scan timeframe: {active_scan_timeframe.upper()}\n"
+        "Analysis: 15m only\n"
         f"Pending signals: {pending}\n"
         f"Tracked signals: {tracked}\n"
         f"History: {hist}\n"
@@ -2282,7 +2279,7 @@ def scan_once(timeframe=None):
 
     total_errors = sum(error_buckets.values())
     summary = ", ".join(f"{name}={count}" for name, count in sorted(error_buckets.items(), key=lambda kv: kv[1], reverse=True)[:4])
-    print(f"Bitget Momentum Engine scan: timeframe={timeframe}, universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
+    print(f"Bitget SA-VWAP scan: timeframe={timeframe}, universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
     if not contracts:
         print("Bitget warning: no contracts returned from /api/v2/mix/market/contracts")
     elif not tickers:
@@ -2295,11 +2292,13 @@ def signal_caption(sig):
     d = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
     m = _setup_metrics(sig)
     return (
-        f"🚀 SAIWAN MOMENTUM SIGNAL\n\n{d}\n"
+        f"🚀 SAIWAN SA-VWAP SIGNAL\n\n{d}\n"
         f"⭐ {sig['symbol']} · Bitget Futures\n"
         f"⏱ {sig.get('timeframe', SIGNAL_TIMEFRAME).upper()} · CLOSED CANDLES\n\n"
         f"Pattern: {sig.get('pattern','MOMENTUM')}\n"
-        + "Range → Breakout/Breakdown → Pullback/Continuation\n"
+        + (f"VWAP: {fmt_price(sig.get('sa_vwap', 0))} · Strength: {sig.get('strength', 0):.0f}/100\n"
+           if sig.get('pattern') == 'SA-VWAP RETEST' else
+           "Range → Breakout/Breakdown → Pullback/Continuation\n")
         + f"Volume: {sig.get('volume_mult',0):.2f}× avg · Extension: {sig.get('extension_atr',0):.2f}× ATR\n\n"
         f"Entry: {fmt_price(sig['entry'])}\n"
         f"SL: {fmt_price(sig['sl'])}\n"
@@ -2307,7 +2306,7 @@ def signal_caption(sig):
         f"TP2: {fmt_price(sig['tp2'])}\n"
         f"TP3: {fmt_price(sig['tp3'])}\n"
         f"⭐ Quality: {m['quality']}/10 · R:R {m['rr1']:.2f} / {m['rr2']:.2f} / {m['rr3']:.2f}\n\n"
-        + "🛡️ Anti-chase filter: ON\n"
+        + ("🛡️ TP1 → SL moved to BE\n" if sig.get('pattern') == 'SA-VWAP RETEST' and SA_VWAP_USE_BE else "🛡️ Anti-chase filter: ON\n")
         + "⚠️ Signal only — no automatic trading."
     )
 
@@ -2509,7 +2508,7 @@ def poll_updates():
                     elif cmd == "/scan":
                         if len(parts) == 1:
                             start_scanner(active_chat_id, TF_15M)
-                            send_message(active_chat_id, "🚀 SAIWAN MOMENTUM SCANNER STARTED\n\n15m closed candles · Breakout + Pullback + Volume + ATR. Anti-chase filter is enabled. TP/SL monitoring is enabled.")
+                            send_message(active_chat_id, "🚀 SAIWAN SA-VWAP SCANNER STARTED\n\n15m closed candles · Anchored VWAP + Retest + ATR + BE. TP/SL monitoring is enabled.")
                         elif parts[1].lower() in ("top", "smart", "smartscan"):
                             send_message(active_chat_id, "📊 Smart Scan خەریکە بازارەکە پشکنین دەکات...")
                             send_message(active_chat_id, _smart_scan_report())
