@@ -55,6 +55,18 @@ offset = None
 active_signals = {}  # key -> tracked signal state for TP/SL notifications
 monitor_thread = None
 
+# Smart Watch / history / settings state
+watchlist = {}  # symbol -> {symbol, timeframe, chat_id, last_key, last_alert_at}
+watch_alerts = []  # recent alert/event records
+signal_history = []  # closed signal outcomes for current process
+watch_lock = threading.Lock()
+watch_stop_event = threading.Event()
+watch_thread = None
+MAX_WATCH_ITEMS = 20
+WATCH_INTERVAL = 60
+WATCH_ALERT_COOLDOWN = 300
+bot_settings = {"alerts": True, "watch_interval": WATCH_INTERVAL}
+
 session = requests.Session()
 session.headers.update({"User-Agent": "SAIWAN-Crypto-Signal-Move-Hunter/5.0", "Accept": "application/json"})
 bitget_rate_lock = threading.Lock()
@@ -1260,21 +1272,275 @@ def analysis_report(raw_symbol, requested_timeframes=None):
     return "\n".join(lines)
 
 
+def _record_alert(event, **data):
+    item = {"event": event, "time": time.time(), **data}
+    with state_lock:
+        watch_alerts.append(item)
+        del watch_alerts[:-100]
+
+
+def _record_history(state, outcome, level=None):
+    item = {
+        "time": time.time(),
+        "symbol": state.get("symbol"),
+        "direction": state.get("direction"),
+        "entry": state.get("entry"),
+        "sl": state.get("sl"),
+        "tp1": state.get("tp1"),
+        "tp2": state.get("tp2"),
+        "tp3": state.get("tp3"),
+        "outcome": outcome,
+        "level": level,
+        "source": state.get("source", "scanner"),
+        "timeframe": state.get("timeframe", "5m"),
+    }
+    with state_lock:
+        signal_history.append(item)
+        del signal_history[:-500]
+
+
+def _watch_detect(symbol, timeframe):
+    rows = get_klines(symbol, timeframe, 260)
+    if len(rows) < 80:
+        return None
+    long_sig = _move_setup(rows, "LONG")
+    short_sig = _move_setup(rows, "SHORT")
+    if long_sig and not short_sig:
+        sig = dict(long_sig)
+        sig["direction"] = "LONG"
+    elif short_sig and not long_sig:
+        sig = dict(short_sig)
+        sig["direction"] = "SHORT"
+    elif long_sig and short_sig:
+        # Do not alert on an ambiguous candle.
+        return None
+    else:
+        return None
+    sig["symbol"] = symbol
+    sig["timeframe"] = timeframe
+    sig["candle_time"] = rows[-1]["time"]
+    sig["key"] = f"watch:{symbol}:{timeframe}:{sig['direction']}:{sig['candle_time']}"
+    return sig
+
+
+def _start_watch_thread():
+    global watch_thread
+    with watch_lock:
+        if watch_thread and watch_thread.is_alive():
+            return
+        watch_stop_event.clear()
+        watch_thread = threading.Thread(target=watch_loop, name="smart-watch", daemon=True)
+        watch_thread.start()
+
+
+def watch_loop():
+    while not watch_stop_event.is_set():
+        with watch_lock:
+            items = [dict(v) for v in watchlist.values()]
+            interval = int(bot_settings.get("watch_interval", WATCH_INTERVAL))
+            alerts_enabled = bool(bot_settings.get("alerts", True))
+        for item in items:
+            if not alerts_enabled:
+                continue
+            try:
+                sig = _watch_detect(item["symbol"], item["timeframe"])
+                if not sig:
+                    continue
+                now = time.time()
+                with watch_lock:
+                    current = watchlist.get(item["symbol"])
+                    if not current:
+                        continue
+                    if current.get("last_key") == sig["key"]:
+                        continue
+                    if now - float(current.get("last_alert_at", 0)) < WATCH_ALERT_COOLDOWN:
+                        current["last_key"] = sig["key"]
+                        continue
+                    current["last_key"] = sig["key"]
+                    current["last_alert_at"] = now
+                    chat_id = current["chat_id"]
+                caption = (
+                    "📡 SAIWAN SMART WATCH\n\n"
+                    f"{'🟢' if sig['direction']=='LONG' else '🔴'} {sig['direction']} — ⭐ {sig['symbol']}\n"
+                    f"⏱ {sig['timeframe'].upper()}\n"
+                    f"💵 Entry: {fmt_price(sig['entry'])}\n"
+                    f"🛑 SL: {fmt_price(sig['sl'])}\n"
+                    f"🎯 TP1: {fmt_price(sig['tp1'])}\n"
+                    f"🎯 TP2: {fmt_price(sig['tp2'])}\n"
+                    f"🎯 TP3: {fmt_price(sig['tp3'])}\n\n"
+                    "✅ Liquidity Sweep · MSS · CHOCH · FVG · OB"
+                )
+                path = None
+                try:
+                    charts = make_analysis_charts(sig["symbol"], [sig["timeframe"]])
+                    path = charts[0] if charts else None
+                except Exception as chart_error:
+                    print(f"WATCH CHART ERROR {sig['symbol']}: {type(chart_error).__name__}: {chart_error}")
+                if path:
+                    msg_id = send_photo(chat_id, path, caption)
+                else:
+                    msg_id = send_message(chat_id, caption)
+                sig["source"] = "watch"
+                sig["key"] = f"watch:{sig['symbol']}:{sig['timeframe']}:{sig['direction']}:{sig['candle_time']}"
+                track_sent_signal(sig, chat_id, msg_id, source="watch")
+                _record_alert("WATCH", symbol=sig["symbol"], timeframe=sig["timeframe"], direction=sig["direction"], key=sig["key"])
+            except Exception as e:
+                print(f"WATCH ERROR {item.get('symbol')}: {type(e).__name__}: {e}")
+        watch_stop_event.wait(max(15, interval))
+
+
+def _watch_text():
+    with watch_lock:
+        items = list(watchlist.values())
+    if not items:
+        return "📋 WATCHLIST\n\nهیچ کۆینێک لە watchlist ـدا نییە.\n\nنموونە: /watch BTC 5m"
+    lines = ["📋 SAIWAN WATCHLIST", ""]
+    for i in items:
+        lines.append(f"⭐ {i['symbol']} · ⏱ {i['timeframe'].upper()}")
+    lines += ["", f"Total: {len(items)}/{MAX_WATCH_ITEMS}"]
+    return "\n".join(lines)
+
+
+def _alerts_text():
+    with state_lock:
+        items = list(watch_alerts[-10:])
+    if not items:
+        return "🔔 ALERTS\n\nهێشتا هیچ alert ـێک نییە."
+    lines = ["🔔 SAIWAN ALERTS", ""]
+    for x in reversed(items):
+        dt = datetime.fromtimestamp(x["time"], tz=timezone.utc).strftime("%H:%M")
+        if x["event"] == "WATCH":
+            lines.append(f"{dt} · {x.get('symbol')} {x.get('timeframe','').upper()} · {x.get('direction')}")
+        else:
+            lines.append(f"{dt} · {x.get('event')} · {x.get('symbol')}")
+    return "\n".join(lines)
+
+
+def _risk_text(parts):
+    if len(parts) not in (4, 6):
+        return ("💰 RISK CALCULATOR\n\n"
+                "نموونەی سادە: /risk BTC 1000 1\n"
+                "بۆ position size: /risk BTC 1000 1 105000 103800")
+    symbol = _normalize_analysis_symbol(parts[1])
+    try:
+        balance = float(parts[2]); risk_pct = float(parts[3])
+        if balance <= 0 or risk_pct <= 0:
+            raise ValueError
+    except ValueError:
+        return "❌ Balance و Risk percentage دەبێت ژمارەی positive بن."
+    risk_amount = balance * risk_pct / 100.0
+    lines = ["💰 SAIWAN RISK CALCULATOR", "", f"⭐ {symbol}", f"Balance: ${balance:,.2f}", f"Risk: {risk_pct:.2f}%", f"Max risk: ${risk_amount:,.2f}"]
+    if len(parts) == 6:
+        try:
+            entry = float(parts[4]); sl = float(parts[5])
+            distance = abs(entry - sl)
+            if entry <= 0 or sl <= 0 or distance <= 0:
+                raise ValueError
+            qty = risk_amount / distance
+            notional = qty * entry
+            lines += [f"Entry: {fmt_price(entry)}", f"SL: {fmt_price(sl)}", f"Stop distance: {fmt_price(distance)}", f"Position size: {qty:.6f} {symbol.replace('USDT','')}", f"Notional: ${notional:,.2f}", "ℹ️ This is risk sizing only; leverage/margin rules are not included."]
+        except ValueError:
+            return "❌ Entry و SL دەبێت ژمارەی دروست و جیاواز بن."
+    else:
+        lines.append("ℹ️ بۆ position size، Entry و SL زیاد بکە.")
+    return "\n".join(lines)
+
+
+def _history_text(symbol_filter=None):
+    with state_lock:
+        items = list(signal_history)
+    if symbol_filter:
+        sym = _normalize_analysis_symbol(symbol_filter)
+        items = [x for x in items if x.get("symbol") == sym]
+    items = items[-10:]
+    if not items:
+        return "📚 HISTORY\n\nهیچ signal ـێکی داخراو نییە."
+    lines = ["📚 SAIWAN HISTORY", ""]
+    for x in reversed(items):
+        dt = datetime.fromtimestamp(x["time"], tz=timezone.utc).strftime("%m-%d %H:%M")
+        lines.append(f"{dt} · {x.get('symbol')} · {x.get('direction')} · {x.get('timeframe')} · {x.get('outcome')}")
+    return "\n".join(lines)
+
+
+def _stats_text():
+    with state_lock:
+        items = list(signal_history)
+        active = len(active_signals)
+    total = len(items)
+    sl = sum(x.get("outcome") == "SL" for x in items)
+    tp3 = sum(x.get("outcome") == "TP3" for x in items)
+    partial = sum(x.get("outcome") in ("TP1", "TP2") for x in items)
+    terminal = sl + tp3
+    rate = (tp3 / terminal * 100) if terminal else 0.0
+    return ("📈 SAIWAN STATISTICS\n\n"
+            f"Closed: {total}\nActive: {active}\n🟢 TP3: {tp3}\n🔴 SL: {sl}\n🎯 Partial: {partial}\n"
+            f"TP3 / (TP3+SL): {rate:.1f}%\n\n"
+            "ℹ️ Statistics are historical records from the current bot process.")
+
+
+def _settings_text():
+    with watch_lock:
+        alerts = bool(bot_settings.get("alerts", True))
+        interval = int(bot_settings.get("watch_interval", WATCH_INTERVAL))
+        watched = len(watchlist)
+    with state_lock:
+        scanner = scanner_running
+    return ("⚙️ SAIWAN SETTINGS\n\n"
+            f"Scanner: {'ON' if scanner else 'OFF'}\n"
+            f"Smart Watch alerts: {'ON' if alerts else 'OFF'}\n"
+            f"Watch interval: {interval}s\n"
+            f"Watched coins: {watched}/{MAX_WATCH_ITEMS}\n\n"
+            "Change: /settings alerts on\n"
+            "Change: /settings alerts off\n"
+            "Change: /settings watch_interval 60")
+
+
+def _quick_scan(raw_symbol):
+    symbol = _normalize_analysis_symbol(raw_symbol)
+    try:
+        rows5 = get_klines(symbol, TF_5M, 180)
+        rows15 = get_klines(symbol, TF_15M, 120)
+        if len(rows5) < 80 or len(rows15) < 30:
+            return f"❌ داتای پێویست بۆ {symbol} بەردەست نییە."
+        *_, bias5 = _timeframe_bias(rows5)
+        *_, bias15 = _timeframe_bias(rows15)
+        long5 = _move_setup(rows5, "LONG")
+        short5 = _move_setup(rows5, "SHORT")
+        setup5 = long5 if long5 and not short5 else short5 if short5 and not long5 else None
+        lines = [f"📊 QUICK SCAN — {symbol}", "", f"💵 Price: {fmt_price(rows5[-1]['close'])}", f"5m: {bias5}", f"15m: {bias15}"]
+        if setup5:
+            direction = "LONG" if setup5 is long5 else "SHORT"
+            lines += [f"🎯 Setup: {direction}", f"Entry: {fmt_price(setup5['entry'])}", f"SL: {fmt_price(setup5['sl'])}", f"TP1: {fmt_price(setup5['tp1'])}", f"TP2: {fmt_price(setup5['tp2'])}", f"TP3: {fmt_price(setup5['tp3'])}"]
+        else:
+            lines.append("🟡 WAIT — complete setup نییە.")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ Quick scan سەرکەوتوو نەبوو: {_error_bucket(e)}"
+
+
 def status_text():
     with state_lock:
-        return (
-            "BOT STATUS: ONLINE\n"
-            f"Scanner: {'RUNNING' if scanner_running else 'STOPPED'}\n"
-            "Market: Bitget USDT Perpetual Futures (full eligible market)\n"
-            "Strategy: SAIWAN CRYPTO SIGNAL — Move Hunter\n"
-            "Model: SAIWAN Move Hunter — Liquidity Sweep + MSS + CHOCH + FVG + OB\n"
-            "Data source: Bitget Futures market data\n"
-            "Scan: 5m closed candles + 15m context\n"
-            f"Pending signals: {len(pending_signals)}\n"
-            f"Tracked signals: {len(active_signals)}\n"
-            "Chart: ICT components annotated\n"
-            "TradingView: chart link only"
-        )
+        scanner = scanner_running
+        pending = len(pending_signals)
+        tracked = len(active_signals)
+        hist = len(signal_history)
+    with watch_lock:
+        watched = len(watchlist)
+        alerts = len(watch_alerts)
+        watch_on = bool(bot_settings.get("alerts", True))
+    return (
+        "BOT STATUS: ONLINE\n"
+        f"Scanner: {'RUNNING' if scanner else 'STOPPED'}\n"
+        f"Smart Watch: {'ON' if watch_on else 'OFF'} ({watched}/{MAX_WATCH_ITEMS})\n"
+        "Market: Bitget USDT Perpetual Futures\n"
+        "Strategy: SAIWAN Move Hunter — Liquidity Sweep + MSS + CHOCH + FVG + OB\n"
+        "Analysis: 5m / 15m / 1h / 4h\n"
+        f"Pending signals: {pending}\n"
+        f"Tracked signals: {tracked}\n"
+        f"History: {hist}\n"
+        f"Alerts: {alerts}\n"
+        "TP/SL monitoring: ENABLED"
+    )
 
 def _error_bucket(exc):
     msg = str(exc).replace("\n", " ").strip()
@@ -1390,7 +1656,7 @@ def scanner_loop():
     scanner_running=False
 
 
-def track_sent_signal(sig, chat_id, message_id):
+def track_sent_signal(sig, chat_id, message_id, source="scanner"):
     if not message_id:
         return
     with state_lock:
@@ -1405,6 +1671,8 @@ def track_sent_signal(sig, chat_id, message_id):
             "tp1": sig["tp1"],
             "tp2": sig["tp2"],
             "tp3": sig["tp3"],
+            "timeframe": sig.get("timeframe", "5m"),
+            "source": source,
             "tp1_hit": False,
             "tp2_hit": False,
             "tp3_hit": False,
@@ -1448,6 +1716,8 @@ def monitor_active_signals():
                         f"🛑 SL Hit\n⭐ {state['symbol']}\n💵 Price: {fmt_price(price)}",
                         reply_to_message_id=state["message_id"],
                     )
+                    _record_history(state, "SL", "SL")
+                    _record_alert("SL", symbol=state["symbol"], timeframe=state.get("timeframe", "5m"), direction=state["direction"])
                     with state_lock:
                         active_signals.pop(state["key"], None)
                     continue
@@ -1463,6 +1733,12 @@ def monitor_active_signals():
                             f"🎯 {label} Hit\n⭐ {state['symbol']}\n💵 Price: {fmt_price(price)}",
                             reply_to_message_id=state["message_id"],
                         )
+                        if name == "tp3":
+                            _record_history(state, "TP3", "TP3")
+                            _record_alert("TP3", symbol=state["symbol"], timeframe=state.get("timeframe", "5m"), direction=state["direction"])
+                        else:
+                            _record_history(state, name.upper(), name.upper())
+                            _record_alert(name.upper(), symbol=state["symbol"], timeframe=state.get("timeframe", "5m"), direction=state["direction"])
                         with state_lock:
                             if state["key"] in active_signals:
                                 active_signals[state["key"]][hit_key] = True
@@ -1539,56 +1815,114 @@ def poll_updates():
                 if not chat.get("id"):
                     continue
                 active_chat_id = chat["id"]
-                if text.startswith("/start"):
-                    send_message(active_chat_id,
-                        "🚀 SAIWAN CRYPTO SIGNAL\n\n"
-                        "/scan - Start scanner\n"
-                        "/stop - Stop scanner\n"
-                        "/status - Bot status\n"
-                        "/analysis COIN TIMEFRAME - Analyze one coin on one timeframe\n"
-                        "Example: /analysis BTC 1h  |  /analysis BTC 4h\n\n"
-                        "Market: Bitget USDT Perpetual Futures\n"
-                        "Timeframe: 5m entry + 15m context\n"
-                        "Model: SAIWAN Move Hunter — Liquidity Sweep + MSS + CHOCH + FVG + OB\n"
-                        "Chart: professional 5m setup map with all ICT components\n"
-                        "TP/SL monitoring: ENABLED")
-                elif text.startswith("/scan"):
-                    start_scanner(active_chat_id)
-                    send_message(active_chat_id,
-                        "🚀 SAIWAN CRYPTO SIGNAL SCANNER STARTED\n\n"
-                        "5m closed candles for early entries + 15m context.\n"
-                        "Signal hunts: Liquidity Sweep + MSS + CHOCH + FVG + OB.\n"
-                        "The chart will mark every ICT component used.\n"
-                        "TP/SL monitoring is enabled.")
-                elif text.startswith("/stop"):
-                    stop_scanner(); send_message(active_chat_id, "🛑 Scanner stopped.")
-                elif text.startswith("/analysis"):
-                    parts = text.split()
-                    if len(parts) != 3:
-                        send_message(active_chat_id, "🔎 نموونە:\n/analysis BTC 5m\n/analysis AVAX 15m\n/analysis ETH 1h\n/analysis BTC 4h")
-                    else:
-                        try:
-                            symbol = _normalize_analysis_symbol(parts[1])
-                            tf = _normalize_analysis_timeframe(parts[2])
-                            if tf is None:
-                                send_message(active_chat_id, "❌ Timeframe ـی دروست: 5m, 15m, 1h, 4h\n\nنموونە: /analysis BTC 1h")
+                parts = text.split()
+                cmd = parts[0].split("@")[0].lower() if parts else ""
+                try:
+                    if cmd == "/start":
+                        send_message(active_chat_id,
+                            "🚀 SAIWAN CRYPTO SIGNAL\n\n"
+                            "/scan - Start full scanner\n"
+                            "/scan BTC - Quick market scan\n"
+                            "/stop - Stop scanner\n"
+                            "/watch BTC 5m - Smart Watch\n"
+                            "/unwatch BTC - Remove watch\n"
+                            "/watchlist - Watched coins\n"
+                            "/alerts - Recent alerts\n"
+                            "/analysis BTC 5m - One timeframe only\n"
+                            "/risk BTC 1000 1 - Risk amount\n"
+                            "/risk BTC 1000 1 105000 103800 - Position size\n"
+                            "/history - Closed signal history\n"
+                            "/stats - Signal statistics\n"
+                            "/settings - Bot settings\n"
+                            "/status - Bot status\n\n"
+                            "Market: Bitget USDT Perpetual Futures\n"
+                            "Model: Liquidity Sweep + MSS + CHOCH + FVG + OB\n"
+                            "TP/SL monitoring: ENABLED")
+                    elif cmd == "/scan":
+                        if len(parts) == 1:
+                            start_scanner(active_chat_id)
+                            send_message(active_chat_id, "🚀 SAIWAN CRYPTO SIGNAL SCANNER STARTED\n\n5m + 15m context. TP/SL monitoring is enabled.")
+                        else:
+                            send_message(active_chat_id, _quick_scan(parts[1]))
+                    elif cmd == "/stop":
+                        stop_scanner(); send_message(active_chat_id, "🛑 Scanner stopped. Smart Watch keeps running if it is enabled.")
+                    elif cmd == "/watch":
+                        if len(parts) != 3:
+                            send_message(active_chat_id, "📡 نموونە:\n/watch BTC 5m\n/watch AVAX 15m\n/watch ETH 1h")
+                        else:
+                            symbol = _normalize_analysis_symbol(parts[1]); tf = _normalize_analysis_timeframe(parts[2])
+                            if not symbol or not tf:
+                                send_message(active_chat_id, "❌ Coin یان timeframe هەڵەیە. Timeframe: 5m, 15m, 1h, 4h")
                             else:
-                                valid_tfs = [tf]
+                                with watch_lock:
+                                    if symbol not in watchlist and len(watchlist) >= MAX_WATCH_ITEMS:
+                                        send_message(active_chat_id, f"❌ Watchlist پڕە. Maximum: {MAX_WATCH_ITEMS}")
+                                        continue
+                                    watchlist[symbol] = {"symbol": symbol, "timeframe": tf, "chat_id": active_chat_id, "last_key": None, "last_alert_at": 0}
+                                _start_watch_thread()
+                                send_message(active_chat_id, f"📡 Smart Watch enabled\n⭐ {symbol}\n⏱ {tf.upper()}\n\nAlert تەنها بۆ complete setup ـی نوێ دێت.")
+                    elif cmd == "/unwatch":
+                        if len(parts) != 2:
+                            send_message(active_chat_id, "نموونە: /unwatch BTC\nیان /unwatch all")
+                        else:
+                            target = _normalize_analysis_symbol(parts[1]) if parts[1].lower() != "all" else "all"
+                            with watch_lock:
+                                if target == "all":
+                                    watchlist.clear()
+                                    watch_stop_event.set()
+                                    reply = "🛑 All Smart Watch items removed."
+                                elif target in watchlist:
+                                    watchlist.pop(target, None)
+                                    if not watchlist: watch_stop_event.set()
+                                    reply = f"🛑 {target} removed from watchlist."
+                                else:
+                                    reply = f"ℹ️ {target} لە watchlist ـدا نییە."
+                            send_message(active_chat_id, reply)
+                    elif cmd == "/watchlist":
+                        send_message(active_chat_id, _watch_text())
+                    elif cmd == "/alerts":
+                        send_message(active_chat_id, _alerts_text())
+                    elif cmd == "/analysis":
+                        if len(parts) != 3:
+                            send_message(active_chat_id, "🔎 نموونە:\n/analysis BTC 5m\n/analysis AVAX 15m\n/analysis ETH 1h\n/analysis BTC 4h")
+                        else:
+                            symbol = _normalize_analysis_symbol(parts[1]); tf = _normalize_analysis_timeframe(parts[2])
+                            if not tf:
+                                send_message(active_chat_id, "❌ Timeframe ـی دروست: 5m, 15m, 1h, 4h")
+                            else:
                                 send_message(active_chat_id, f"🔎 خەریکم {symbol} شیکاری دەکەم...\n⏱ {tf.upper()}")
-                                report = analysis_report(parts[1], valid_tfs)
-                                send_message(active_chat_id, report)
+                                send_message(active_chat_id, analysis_report(symbol, [tf]))
                                 try:
-                                    chart_paths = make_analysis_charts(parts[1], valid_tfs)
-                                    for chart_path in chart_paths:
-                                        send_photo(active_chat_id, chart_path, f"📊 SAIWAN CHART — {_normalize_analysis_symbol(parts[1])} · {tf.upper()}")
-                                except Exception as chart_error:
-                                    print(f"ANALYSIS CHART ERROR {type(chart_error).__name__}: {chart_error}")
-                                    send_message(active_chat_id, "⚠️ شیکاریەکە هات، بەڵام چارتەکە نەدروستکرا.")
-                        except Exception as e:
-                            print(f"ANALYSIS ERROR {type(e).__name__}: {e}")
-                            send_message(active_chat_id, f"❌ شیکاری سەرکەوتوو نەبوو: {type(e).__name__}")
-                elif text.startswith("/status"):
-                    send_message(active_chat_id, status_text())
+                                    for chart_path in make_analysis_charts(symbol, [tf]):
+                                        send_photo(active_chat_id, chart_path, f"📊 SAIWAN CHART — {symbol} · {tf.upper()}")
+                                except Exception as e:
+                                    print(f"ANALYSIS CHART ERROR {type(e).__name__}: {e}")
+                    elif cmd == "/risk":
+                        send_message(active_chat_id, _risk_text(parts))
+                    elif cmd == "/history":
+                        send_message(active_chat_id, _history_text(parts[1] if len(parts) == 2 else None))
+                    elif cmd == "/stats":
+                        send_message(active_chat_id, _stats_text())
+                    elif cmd == "/settings":
+                        if len(parts) == 1:
+                            send_message(active_chat_id, _settings_text())
+                        elif len(parts) == 3 and parts[1].lower() == "alerts" and parts[2].lower() in ("on", "off"):
+                            with watch_lock: bot_settings["alerts"] = parts[2].lower() == "on"
+                            send_message(active_chat_id, f"⚙️ Smart Watch alerts: {parts[2].upper()}")
+                        elif len(parts) == 3 and parts[1].lower() == "watch_interval":
+                            try:
+                                value = max(15, min(900, int(parts[2])))
+                                with watch_lock: bot_settings["watch_interval"] = value
+                                send_message(active_chat_id, f"⚙️ Watch interval set to {value}s")
+                            except ValueError:
+                                send_message(active_chat_id, "❌ Interval دەبێت ژمارە بێت.")
+                        else:
+                            send_message(active_chat_id, "❌ Settings syntax هەڵەیە. /settings")
+                    elif cmd == "/status":
+                        send_message(active_chat_id, status_text())
+                except Exception as cmd_error:
+                    print(f"COMMAND ERROR {cmd}: {type(cmd_error).__name__}: {cmd_error}")
+                    send_message(active_chat_id, f"❌ هەڵە لە command ـەکەدا: {type(cmd_error).__name__}")
         except Exception as e:
             print(f"TELEGRAM ERROR {type(e).__name__}: {e}")
             time.sleep(3)
@@ -1614,6 +1948,7 @@ def start_background_services():
         threading.Thread(target=poll_updates, name="telegram-poller", daemon=True).start()
         threading.Thread(target=sender_loop, name="signal-sender", daemon=True).start()
         threading.Thread(target=monitor_active_signals, name="tp-sl-monitor", daemon=True).start()
+        # Smart Watch thread is started on the first /watch command.
         _services_started = True
         print("SAIWAN services started: Telegram poller + signal sender + TP/SL monitor")
 
