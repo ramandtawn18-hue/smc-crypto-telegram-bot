@@ -40,7 +40,7 @@ CHART_BARS = min(150, max(70, int(os.getenv("CHART_BARS", "110"))))
 
 app = Flask(__name__)
 http = requests.Session()
-http.headers.update({"User-Agent": "SAIWAN-1H-Pattern-Bot/4.0"})
+http.headers.update({"User-Agent": "SAIWAN-1H-Pattern-Bot/3.0"})
 
 state = {"running": False, "last_scan": None, "last_error": None,
          "signals_sent": 0, "symbols": 0, "last_signal": None}
@@ -49,6 +49,12 @@ scan_lock = threading.Lock()
 processed = set()
 last_signal_at = {}
 telegram_offset = None
+
+# Active signals are tracked after they are sent. Each signal stores the
+# Telegram message id so TP/SL updates can be posted as replies to that
+# exact signal message.
+active_signals = {}
+active_lock = threading.Lock()
 
 
 def now_utc():
@@ -163,6 +169,11 @@ def best_line(c, indices, atr, mode, direction):
             p2 = c[i2]["high"] if mode=="high" else c[i2]["low"]
             if direction=="resistance" and p2 >= p1: continue
             if direction=="support" and p2 <= p1: continue
+            # resistance_any is used for rising-wedge upper boundaries.
+            # A resistance line may slope up or down; price still stays at or
+            # below it during the pattern.
+            if direction=="resistance_any":
+                pass
             line=(i1,p1,i2,p2)
             tol = max(med([atr[i] for i in pts])*0.45, abs(p2)*0.001)
             touches = sum(abs((c[i]["high"] if mode=="high" else c[i]["low"])-lv(line,i)) <= tol for i in pts)
@@ -182,7 +193,7 @@ def detect_patterns(c, hs, ls, atr):
     rh=[i for i in hs if i < len(c)-2][-9:]
     rl=[i for i in ls if i < len(c)-2][-9:]
     if len(rh)>=3 and len(rl)>=3:
-        upper=best_line(c,rh,atr,"high","resistance")
+        upper=best_line(c,rh,atr,"high","resistance_any")
         lower=best_line(c,rl,atr,"low","support")
         if upper and lower:
             ul, ll = upper[2], lower[2]
@@ -192,12 +203,17 @@ def detect_patterns(c, hs, ls, atr):
             if d1>0 and d2 < d1*.88:
                 price=med([x["close"] for x in c[-40:]]) or c[-1]["close"]
                 sp_u=su/price; sp_l=sl/price
-                if sp_u<0 and sp_l>0:
+                if sp_u < 0 and sp_l > 0:
                     typ="Falling Wedge"
                     bias="BULLISH"
-                elif sp_u<0 and sp_l<0:
-                    typ="Falling Wedge"
-                    bias="BULLISH"
+                elif sp_u > 0 and sp_l > 0:
+                    # Both boundaries rise while the distance between them
+                    # contracts: rising wedge.
+                    typ="Rising Wedge"
+                    bias="BEARISH"
+                elif sp_u < 0 and sp_l < 0:
+                    typ="Descending Channel"
+                    bias="NEUTRAL"
                 else:
                     typ="Symmetrical Triangle"
                     bias="NEUTRAL"
@@ -248,7 +264,7 @@ def detect_patterns(c, hs, ls, atr):
 
 def levels(p, i):
     t=p["type"]
-    if t in ("Falling Wedge","Symmetrical Triangle"):
+    if t in ("Falling Wedge","Rising Wedge","Descending Channel","Symmetrical Triangle"):
         return lv(p["upper"],i),lv(p["lower"],i)
     if t=="Descending Triangle": return lv(p["upper"],i),p["lower_level"]
     if t in ("Double Bottom","Triple Bottom"): return p["level"],None
@@ -335,204 +351,190 @@ def find_signal(symbol,c):
     return max(found,key=lambda x:(x["score"],x["rr"],x["touches"])) if found else None
 
 
-def chart(c, s):
-    """Create a TradingView-like chart with the actual pattern geometry and trade plan."""
-    if not SEND_CHART:
-        return None
+def chart(c,s):
+    if not SEND_CHART:return None
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from matplotlib.patches import Rectangle
-
-        n = min(CHART_BARS, len(c))
-        data = c[-n:]
-        off = len(c) - n
-        fig, ax = plt.subplots(figsize=(13.5, 7.6), dpi=160)
-        fig.patch.set_facecolor("#0b0f14")
-        ax.set_facecolor("#0b0f14")
-
-        # Candles
-        for x, k in enumerate(data):
-            o, h, lo, cl = k["open"], k["high"], k["low"], k["close"]
-            col = "#00d084" if cl >= o else "#ff4d6d"
-            ax.vlines(x, lo, h, color=col, lw=.9, zorder=2)
-            body = max(abs(cl-o), (h-lo)*.008)
-            ax.add_patch(Rectangle((x-.30, min(o, cl)), .60, body,
-                                   facecolor=col, edgecolor=col, lw=.3, zorder=3))
-
-        p = s["pattern_data"]
-
-        def plot_line(line, label, col, lw=2.2, end_idx=None):
-            if not line:
-                return
-            a, p1, b, p2 = line
-            x1 = max(a, off)
-            x2 = min(len(c)-1, end_idx if end_idx is not None else len(c)-1)
-            if x2 <= x1:
-                return
-            ax.plot([x1-off, x2-off], [lv(line, x1), lv(line, x2)],
-                    color=col, lw=lw, zorder=4, solid_capstyle="round")
-            # label near the right end, inside the visible chart
-            yy = lv(line, x2)
-            ax.text(min(x2-off+1, n-8), yy, label, color=col, fontsize=8,
-                    fontweight="bold", va="center", zorder=7,
-                    bbox=dict(boxstyle="round,pad=.20", fc="#0b0f14", ec="none", alpha=.75))
-
-        # Draw the REAL pattern trendlines, not just horizontal levels.
-        if p["type"] in ("Falling Wedge", "Symmetrical Triangle"):
-            plot_line(p["upper"], "RESISTANCE", "#f0c36a", end_idx=min(len(c)-1, s["breakout_idx"]))
-            plot_line(p["lower"], "SUPPORT", "#5ec8ff", end_idx=min(len(c)-1, s["breakout_idx"]))
-            # Extend the broken line a little past the breakout to make the break obvious.
-            plot_line(p["upper"], "", "#f0c36a", lw=1.0, end_idx=min(len(c)-1, s["breakout_idx"]+5))
-            plot_line(p["lower"], "", "#5ec8ff", lw=1.0, end_idx=min(len(c)-1, s["breakout_idx"]+5))
-        elif p["type"] == "Descending Triangle":
-            plot_line(p["upper"], "RESISTANCE", "#f0c36a", end_idx=min(len(c)-1, s["breakout_idx"]))
-            ax.axhline(p["lower_level"], color="#5ec8ff", lw=2.2, zorder=4)
-            ax.text(n-8, p["lower_level"], "SUPPORT", color="#5ec8ff", fontsize=8,
-                    fontweight="bold", va="center")
-        elif p["type"] in ("Double Bottom", "Triple Bottom"):
-            ax.axhline(p["level"], color="#5ec8ff", lw=2.2, zorder=4)
-            ax.text(n-8, p["level"], "NECKLINE", color="#5ec8ff", fontsize=8,
-                    fontweight="bold", va="center")
-        elif p["type"] == "Double Top":
-            # Double-top resistance is horizontal by definition; neckline is also shown.
-            peaks = p.get("points", [])
-            if peaks:
-                peak_level = med([c[i]["high"] for i in peaks])
-                ax.axhline(peak_level, color="#f0c36a", lw=2.2, zorder=4)
-                ax.text(n-8, peak_level, "RESISTANCE", color="#f0c36a", fontsize=8,
-                        fontweight="bold", va="center")
-            ax.axhline(p["level"], color="#8ea6b8", lw=1.8, ls="-.", zorder=4)
-            ax.text(n-8, p["level"], "NECKLINE", color="#8ea6b8", fontsize=8,
-                    fontweight="bold", va="center")
-
-        # Mark pattern pivots.
-        for i in p.get("points", []):
-            if off <= i < len(c):
-                y = c[i]["low"] if "Bottom" in p["type"] else c[i]["high"]
-                ax.scatter([i-off], [y], s=70, facecolors="none", edgecolors="white",
-                           lw=1.3, zorder=8)
-
-        # Breakout / retest / confirmation markers.
-        bx = s["breakout_idx"]-off
-        rx = s["retest_idx"]-off
-        ex = s["confirm_idx"]-off
-        if 0 <= bx < n:
-            by = c[s["breakout_idx"]]["close"]
-            ax.scatter([bx], [by], s=55, marker="D", color="#ffffff", zorder=9)
-            ax.annotate("BREAKOUT", (bx, by), xytext=(bx-10, by),
-                        arrowprops=dict(arrowstyle="->", color="white", lw=1.2),
-                        color="white", fontsize=9, fontweight="bold", zorder=10)
-        if 0 <= rx < n:
-            ry = c[s["retest_idx"]]["close"]
-            ax.scatter([rx], [ry], s=55, marker="o", facecolors="none",
-                       edgecolors="#ffffff", lw=1.4, zorder=9)
-            ax.annotate("RETEST", (rx, ry), xytext=(rx-8, ry),
-                        arrowprops=dict(arrowstyle="->", color="white", lw=1.2),
-                        color="white", fontsize=9, fontweight="bold", zorder=10)
-        if 0 <= ex < n:
-            ax.scatter([ex], [s["entry"]], s=85, marker="*", color="white", zorder=10)
-            ax.annotate("ENTRY", (ex, s["entry"]), xytext=(ex+2, s["entry"]),
-                        color="white", fontsize=10, fontweight="bold", zorder=10)
-
-        # Trade plan levels.
-        levels_to_draw = [
-            (s["entry"], "#ffffff", "ENTRY"),
-            (s["sl"], "#ff4d6d", "SL"),
-            (s["tp1"], "#00d084", f"TP1 {MIN_RR:.1f}R"),
-            (s["tp2"], "#00d084", f"TP2 {TP2_R:.1f}R"),
-        ]
-        for y, col, label in levels_to_draw:
-            ax.axhline(y, color=col, lw=1.25, ls="--", alpha=.95, zorder=5)
-            ax.text(n+0.4, y, f"{label}  {fmt(y)}", va="center", color=col,
-                    fontsize=8.5, fontweight="bold", zorder=10,
-                    bbox=dict(boxstyle="round,pad=.22", fc="#0b0f14", ec="none", alpha=.85))
-
-        side_arrow = "LONG ↑" if s["side"] == "LONG" else "SHORT ↓"
-        ax.set_title(
-            f"SAIWAN • {s['symbol']} • 1H • {p['type']} • {side_arrow} • Score {s['score']}/100",
-            color="white", fontsize=13, fontweight="bold", pad=12)
-        ax.text(.01, .98,
-                f"Breakout → Retest → Confirmation   |   RR {s['rr']:.2f}   |   Risk {s['risk_pct']:.2f}%",
-                transform=ax.transAxes, va="top", color="#cfd8e3", fontsize=9)
-
-        ax.set_xlim(-1, n+10)
-        ax.grid(True, alpha=.12, color="#8a98a8")
-        ax.tick_params(colors="#aeb8c4", labelsize=8)
-        for sp in ax.spines.values():
-            sp.set_color("#26313c")
-        fig.tight_layout()
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
-        plt.close(fig)
-        buf.seek(0)
-        return buf
+        n=min(CHART_BARS,len(c)); data=c[-n:]; off=len(c)-n
+        fig,ax=plt.subplots(figsize=(13,7.2),dpi=150)
+        fig.patch.set_facecolor("#0b0f14"); ax.set_facecolor("#0b0f14")
+        for x,k in enumerate(data):
+            o,h,l,cl=k["open"],k["high"],k["low"],k["close"]
+            col="#00d084" if cl>=o else "#ff4d6d"
+            ax.vlines(x,l,h,color=col,lw=.9)
+            ax.add_patch(Rectangle((x-.31,min(o,cl)),.62,max(abs(cl-o),(h-l)*.006),facecolor=col,edgecolor=col,lw=.3))
+        p=s["pattern_data"]
+        def pl(line,label,col):
+            if not line:return
+            x1=line[0]-off; x2=n-1
+            if x2<0 or x1>n-1:return
+            ax.plot([x1,x2],[lv(line,line[0]),lv(line,len(c)-1)],color=col,lw=2,label=label)
+        if p["type"] in ("Falling Wedge","Rising Wedge","Descending Channel","Symmetrical Triangle"):
+            pl(p["upper"],"Resistance","#f0c36a"); pl(p["lower"],"Support","#5ec8ff")
+        elif p["type"]=="Descending Triangle":
+            pl(p["upper"],"Resistance","#f0c36a"); ax.axhline(p["lower_level"],color="#5ec8ff",lw=2)
+        elif p["type"] in ("Double Bottom","Triple Bottom"):
+            ax.axhline(p["level"],color="#5ec8ff",lw=2)
+        elif p["type"]=="Double Top":
+            ax.axhline(p["level"],color="#f0c36a",lw=2)
+        for i in p.get("points",[]):
+            if off<=i<len(c):
+                y=c[i]["low"] if "Bottom" in p["type"] else c[i]["high"]
+                ax.scatter([i-off],[y],s=48,facecolors="none",edgecolors="white",lw=1.2,zorder=5)
+        bx=s["breakout_idx"]-off; rx=s["retest_idx"]-off; ex=s["confirm_idx"]-off
+        if 0<=bx<n: ax.annotate("BREAKOUT",(bx,c[s["breakout_idx"]]["close"]),xytext=(max(0,bx-10),c[s["breakout_idx"]]["close"]),arrowprops=dict(arrowstyle="->",color="white"),color="white",fontsize=9,fontweight="bold")
+        if 0<=rx<n: ax.annotate("RETEST",(rx,c[s["retest_idx"]]["close"]),xytext=(max(0,rx-9),c[s["retest_idx"]]["close"]),arrowprops=dict(arrowstyle="->",color="white"),color="white",fontsize=9,fontweight="bold")
+        if 0<=ex<n: ax.scatter([ex],[s["entry"]],s=70,color="white",zorder=6); ax.annotate("ENTRY",(ex,s["entry"]),xytext=(min(n-15,ex+2),s["entry"]),color="white",fontsize=10,fontweight="bold")
+        for y,col,label in [(s["entry"],"white","ENTRY"),(s["sl"],"#ff4d6d","SL"),(s["tp1"],"#00d084",f"TP1 {MIN_RR:.1f}R"),(s["tp2"],"#00d084",f"TP2 {TP2_R:.1f}R")]:
+            ax.axhline(y,color=col,lw=1.15,ls="--"); ax.text(n-1,y,f"  {label} {fmt(y)}",va="center",color=col,fontsize=8.5,fontweight="bold")
+        ax.set_title(f"SAIWAN • {s['symbol']} • 1H • {s['pattern']} • {s['side']} • Score {s['score']}/100",color="white",fontsize=13,fontweight="bold")
+        ax.text(.01,.98,f"Breakout → Retest → Confirmation | RR {s['rr']:.2f} | Risk {s['risk_pct']:.2f}%",transform=ax.transAxes,va="top",color="#cfd8e3",fontsize=9)
+        ax.set_xlim(-1,n+8); ax.grid(True,alpha=.12,color="#8a98a8"); ax.tick_params(colors="#aeb8c4",labelsize=8)
+        for sp in ax.spines.values():sp.set_color("#26313c")
+        fig.tight_layout(); buf=io.BytesIO(); fig.savefig(buf,format="png",bbox_inches="tight",facecolor=fig.get_facecolor()); plt.close(fig); buf.seek(0); return buf
     except Exception as e:
-        with state_lock:
-            state["last_error"] = f"chart: {e}"
+        with state_lock: state["last_error"]=f"chart: {e}"
         return None
 
 
 def tg_text(s):
-    icon = "🟢" if s["side"] == "LONG" else "🔴"
-    dt = datetime.fromtimestamp(s["candle_ts"]/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    return (
-        f"📊 SAIWAN 1H PATTERN SIGNAL\n\n"
-        f"{icon} {s['side']} • {s['symbol']}\n"
-        f"🔎 Pattern: {s['pattern']}\n"
-        f"⭐ Score: {s['score']}/100\n"
-        f"📐 Touches: {s['touches']}\n"
-        f"⏱ Timeframe: 1H CLOSED\n\n"
-        f"🎯 ENTRY: {fmt(s['entry'])}\n"
-        f"🛑 SL: {fmt(s['sl'])}\n"
-        f"✅ TP1: {fmt(s['tp1'])} ({MIN_RR:.1f}R)\n"
-        f"✅ TP2: {fmt(s['tp2'])} ({TP2_R:.1f}R)\n"
-        f"📏 Risk: {s['risk_pct']:.2f}%\n"
-        f"⚖️ RR: {s['rr']:.2f}\n\n"
-        f"🔹 Breakout → Retest → Confirmation\n"
-        f"🏦 Bitget USDT Perpetual\n"
-        f"🕒 {dt}\n\n"
-        f"⚠️ Signal only — no automatic order."
-    )
+    icon="🟢" if s["side"]=="LONG" else "🔴"
+    dt=datetime.fromtimestamp(s["candle_ts"]/1000,tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return (f"📊 SAIWAN 1H PATTERN SIGNAL\n\n{icon} {s['side']} • {s['symbol']}\n"
+            f"🔎 Pattern: {s['pattern']}\n⭐ Score: {s['score']}/100\n📐 Touches: {s['touches']}\n"
+            f"⏱ Timeframe: 1H CLOSED\n\n🎯 ENTRY: {fmt(s['entry'])}\n🛑 SL: {fmt(s['sl'])}\n"
+            f"✅ TP1: {fmt(s['tp1'])} ({MIN_RR:.1f}R)\n✅ TP2: {fmt(s['tp2'])} ({TP2_R:.1f}R)\n"
+            f"📏 Risk: {s['risk_pct']:.2f}%\n⚖️ RR: {s['rr']:.2f}\n\n"
+            f"🔹 Breakout → Retest → Confirmation\n🏦 Bitget USDT Perpetual\n🕒 {dt}\n\n⚠️ Signal only — no automatic order.")
 
 
-def tg_send(text):
-    if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("Telegram variables are missing")
-    r = http.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True},
-        timeout=20,
-    )
-    r.raise_for_status()
+def tg_send(text, reply_to=None, parse_mode=None):
+    if not BOT_TOKEN or not CHAT_ID: raise RuntimeError("Telegram variables are missing")
+    payload={"chat_id":CHAT_ID,"text":text,"disable_web_page_preview":True}
+    if reply_to:
+        payload["reply_parameters"]={"message_id":int(reply_to),"allow_sending_without_reply":True}
+    if parse_mode:
+        payload["parse_mode"]=parse_mode
+    r=http.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",json=payload,timeout=20); r.raise_for_status()
+    return (r.json().get("result") or {}).get("message_id")
 
 
-def tg_send_photo(image, caption):
-    if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("Telegram variables are missing")
-    r = http.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-        data={"chat_id": CHAT_ID, "caption": caption},
-        files={"photo": ("saiwan_1h.png", image, "image/png")},
-        timeout=30,
-    )
-    r.raise_for_status()
+def tg_reply(text, message_id):
+    return tg_send(text, reply_to=message_id, parse_mode="HTML")
 
 
-def send_signal(s, c):
-    """Send exactly ONE Telegram message when a chart is available: photo + full caption."""
-    text = tg_text(s)
-    im = chart(c, s)
+def send_signal(s,c):
+    # One Telegram message: the chart carries the full signal as its caption.
+    # This gives every future TP/SL update a single message to reply to.
+    im=chart(c,s)
     if im is not None:
         try:
-            tg_send_photo(im, text)
+            payload={"chat_id":CHAT_ID,"caption":tg_text(s),"parse_mode":"HTML"}
+            r=http.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",data=payload,files={"photo":("saiwan_1h.png",im,"image/png")},timeout=30)
+            r.raise_for_status()
+            msg_id=(r.json().get("result") or {}).get("message_id")
+            if not msg_id: raise RuntimeError("Telegram did not return message_id")
+            s["telegram_message_id"]=int(msg_id)
             return
         except Exception as e:
-            with state_lock:
-                state["last_error"] = f"telegram chart: {e}"
-    # Fallback: if image generation/upload fails, never lose the signal.
-    tg_send(text)
+            with state_lock: state["last_error"]=f"telegram chart: {e}"
+    msg_id=tg_send(tg_text(s))
+    s["telegram_message_id"]=int(msg_id) if msg_id else None
+
+
+def register_active_signal(s):
+    mid=s.get("telegram_message_id")
+    if not mid:
+        return
+    key=f"{s['symbol']}|{s['candle_ts']}|{s['side']}|{s['pattern']}|{s['breakout_idx']}"
+    item=dict(s)
+    item["tracking_key"]=key
+    item["tp1_hit"]=False
+    item["tp2_hit"]=False
+    item["sl_hit"]=False
+    item["last_checked_ts"]=0
+    with active_lock:
+        active_signals[key]=item
+
+
+def hit_update_text(s, event, price, ts):
+    icon={"TP1":"🎯","TP2":"🏁","SL":"🛑"}[event]
+    when=datetime.fromtimestamp(ts/1000,tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return (f"{icon} <b>{event} HIT</b>\n"
+            f"{s['symbol']} • {s['side']} • {s['pattern']}\n"
+            f"Price: <b>{fmt(price)}</b>\n"
+            f"Time: {when}")
+
+
+def track_active_signals():
+    with active_lock:
+        snapshot=list(active_signals.items())
+    for key,s in snapshot:
+        try:
+            c=get_candles(s["symbol"])
+            if not c: continue
+            # Only inspect candles that appeared after the signal candle.
+            candles=[k for k in c if k["ts"]>s["candle_ts"]]
+            if not candles: continue
+            for k in candles:
+                ts=k["ts"]
+                if ts<=s.get("last_checked_ts",0): continue
+                high,low=k["high"],k["low"]
+                events=[]
+                if s["side"]=="LONG":
+                    tp1_hit=high>=s["tp1"]
+                    tp2_hit=high>=s["tp2"]
+                    sl_hit=low<=s["sl"]
+                else:
+                    tp1_hit=low<=s["tp1"]
+                    tp2_hit=low<=s["tp2"]
+                    sl_hit=high>=s["sl"]
+
+                # If SL and a target are both inside the same 1H candle, the
+                # API gives OHLC but not the intrabar order. Do not invent an
+                # order; report the candle as ambiguous and keep tracking.
+                both_target_sl = sl_hit and (tp1_hit or tp2_hit)
+                if both_target_sl:
+                    if not s.get("ambiguous_logged"):
+                        tg_reply(f"⚠️ <b>Same 1H candle touched SL and target</b>\n{ s['symbol'] }\nIntrabar order is unknown, so no HIT is declared for this candle.", s["telegram_message_id"])
+                        s["ambiguous_logged"]=True
+                    s["last_checked_ts"]=ts
+                    continue
+
+                if tp1_hit and not s.get("tp1_hit"):
+                    events.append(("TP1",s["tp1"]))
+                    s["tp1_hit"]=True
+                if tp2_hit and not s.get("tp2_hit"):
+                    # If TP2 is reached directly, TP1 is necessarily crossed
+                    # for normal long/short geometry, so report both in order.
+                    if not s.get("tp1_hit"):
+                        events.append(("TP1",s["tp1"]))
+                        s["tp1_hit"]=True
+                    events.append(("TP2",s["tp2"]))
+                    s["tp2_hit"]=True
+                if sl_hit and not s.get("sl_hit"):
+                    events.append(("SL",s["sl"]))
+                    s["sl_hit"]=True
+
+                for event,price in events:
+                    tg_reply(hit_update_text(s,event,price,ts),s["telegram_message_id"])
+
+                s["last_checked_ts"]=ts
+                # SL ends the trade. TP2 also ends the trade. TP1 remains
+                # active so a later TP2 or SL can still be reported.
+                if s.get("sl_hit") or s.get("tp2_hit"):
+                    with active_lock:
+                        active_signals.pop(key,None)
+                    break
+            with active_lock:
+                if key in active_signals:
+                    active_signals[key]=s
+        except Exception as e:
+            with state_lock: state["last_error"]=f"tracker {s['symbol']}: {e}"
+
 
 def scan_once():
     if not scan_lock.acquire(False):return
@@ -550,7 +552,7 @@ def scan_once():
                 if not s:continue
                 if s["key"] in processed:continue
                 if COOLDOWN_HOURS and time.time()-last_signal_at.get(symbol,0)<COOLDOWN_HOURS*3600:continue
-                send_signal(s,c); processed.add(s["key"]); last_signal_at[symbol]=time.time()
+                send_signal(s,c); register_active_signal(s); processed.add(s["key"]); last_signal_at[symbol]=time.time()
                 with state_lock:
                     state["signals_sent"]+=1; state["last_signal"]=f"{symbol} {s['side']} {s['pattern']} @ {fmt(s['entry'])}"
             except Exception as e:
@@ -563,6 +565,7 @@ def scanner_loop():
     while True:
         try:
             scan_once()
+            track_active_signals()
             with state_lock:state["last_scan"]=now_utc()
         except Exception as e:
             with state_lock:state["last_error"]=str(e)
@@ -587,7 +590,8 @@ def telegram_loop():
                     except Exception as e:tg_send(f"❌ Scan error: {e}")
                 elif text=="/status":
                     with state_lock:s=dict(state)
-                    tg_send("🤖 SAIWAN STATUS\n\nBot: ONLINE\nScanner: %s\nMarket: Bitget USDT Perpetual\nTimeframe: 1H\nSymbols: %s\nSignals sent: %s\nLast scan: %s\nLast signal: %s\nLast error: %s" % ("RUNNING" if s["running"] else "STARTING",s["symbols"],s["signals_sent"],s["last_scan"] or "not yet",s["last_signal"] or "none",s["last_error"] or "none"))
+                    with active_lock: active_count=len(active_signals)
+                    tg_send("🤖 SAIWAN STATUS\n\nBot: ONLINE\nScanner: %s\nMarket: Bitget USDT Perpetual\nTimeframe: 1H\nSymbols: %s\nSignals sent: %s\nActive tracked signals: %s\nLast scan: %s\nLast signal: %s\nLast error: %s" % ("RUNNING" if s["running"] else "STARTING",s["symbols"],s["signals_sent"],active_count,s["last_scan"] or "not yet",s["last_signal"] or "none",s["last_error"] or "none"))
         except Exception as e:
             with state_lock:state["last_error"]=f"Telegram: {e}"
             time.sleep(5)
