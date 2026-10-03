@@ -136,14 +136,29 @@ def get_tickers():
 
 
 def get_klines(symbol, interval=TIMEFRAME, limit=CANDLE_LIMIT):
+    # Bitget requires 1H/4H for hourly candles; minute intervals stay lowercase.
+    api_granularity = {
+        "5m": "5m",
+        "15m": "15m",
+        "1h": "1H",
+        "4h": "4H",
+    }.get(str(interval).lower(), interval)
+
     payload = bitget_get(
         "/api/v2/mix/market/candles",
-        {"symbol": symbol, "productType": BITGET_PRODUCT, "granularity": interval,
+        {"symbol": symbol, "productType": BITGET_PRODUCT, "granularity": api_granularity,
          "limit": min(limit, 1000), "kLineType": "market"},
     )
     raw = payload.get("data") or []
     now_ms = int(time.time() * 1000)
-    candle_ms = (5 if interval == TF_5M else 15) * 60 * 1000
+    candle_ms = {
+        "5m": 5 * 60 * 1000,
+        "15m": 15 * 60 * 1000,
+        "1h": 60 * 60 * 1000,
+        "4h": 4 * 60 * 60 * 1000,
+    }.get(str(interval).lower())
+    if candle_ms is None:
+        raise RuntimeError(f"unsupported timeframe: {interval}")
     rows = []
     for v in raw:
         try:
