@@ -606,88 +606,211 @@ def analyze(symbol, rows5, rows15=None):
     return max(candidates, key=lambda x: x["time"]) if candidates else None
 
 def make_chart(sig):
-    """Render the ICT 2022 setup with every signal component annotated."""
+    """Render a clean dark TradingView-style ICT/SMC setup chart."""
     rows = sig["rows"]
     n = len(rows)
     direction = sig["direction"]
     entry, sl = sig["entry"], sig["sl"]
     tp1, tp2, tp3 = sig["tp1"], sig["tp2"], sig["tp3"]
-    BG, GRID, TEXT, MUTED = "#f7f7f8", "#e4e6e8", "#17191c", "#73777d"
-    UP, DOWN, GOLD, PURPLE = "#16a085", "#e14b55", "#c8a84e", "#7957d5"
+
+    # Dark TradingView-style palette.
+    BG = "#07101d"
+    PANEL = "#0b1626"
+    GRID = "#1a293b"
+    TEXT = "#e7eef7"
+    MUTED = "#7f93a8"
+    UP = "#12d6a0"
+    DOWN = "#ff3d57"
+    GOLD = "#ffd21f"
+    BLUE = "#4f7cff"
+    PURPLE = "#7c5cff"
+    PINK = "#ff4f87"
+    CYAN = "#31d7ff"
+
     fig, ax = plt.subplots(figsize=(14.4, 7.8), dpi=170, facecolor=BG)
     ax.set_facecolor(BG)
-    width = 0.58
+
+    width = 0.62
     for i, r in enumerate(rows):
         c = UP if r["close"] >= r["open"] else DOWN
-        ax.vlines(i, r["low"], r["high"], color=c, linewidth=1.0, zorder=3)
+        ax.vlines(i, r["low"], r["high"], color=c, linewidth=1.15, zorder=5)
         lo = min(r["open"], r["close"])
-        bh = max(abs(r["close"]-r["open"]), abs(r["close"])*1e-5)
-        ax.add_patch(Rectangle((i-width/2, lo), width, bh, facecolor=c, edgecolor=c, linewidth=.5, zorder=4))
+        bh = max(abs(r["close"] - r["open"]), abs(r["close"]) * 1e-5)
+        ax.add_patch(Rectangle(
+            (i - width / 2, lo), width, bh,
+            facecolor=c, edgecolor=c, linewidth=.65, zorder=6
+        ))
 
-    right = n + 14
-    fvg = sig["fvg"]; ob = sig["ob"]; zone = sig["entry_zone"]
-    def box(z, color, alpha, label, yoff=0):
-        local_index = z.get("index", 0) - (sig.get("full_len", n) - n) if "index" in z else 0
-        x0 = max(0, min(n-1, local_index - max(3, n//10)))
-        ax.add_patch(Rectangle((x0, z["low"]), right-x0, z["high"]-z["low"], facecolor=color, edgecolor=color, alpha=alpha, linewidth=1.0, zorder=1))
-        ax.text(x0+1, z["high"]+yoff, label, color=color, fontsize=8.2, fontweight="bold", va="bottom", zorder=6)
+    right = n + 13
+    fvg = sig["fvg"]
+    ob = sig["ob"]
+    zone = sig["entry_zone"]
+    offset = sig.get("full_len", n) - n
 
-    box(ob, GOLD, .13, "ORDER BLOCK")
-    box(fvg, PURPLE, .15, "FVG")
-    ax.add_patch(Rectangle((max(0, fvg["index"]-2), zone["low"]), right-max(0, fvg["index"]-2), zone["high"]-zone["low"], facecolor=PURPLE, edgecolor=PURPLE, alpha=.08, linewidth=1.2, zorder=0))
-    ax.text(max(0, fvg["index"]-1), zone["high"], "ENTRY ZONE", color=PURPLE, fontsize=8, fontweight="bold", va="bottom")
+    def local_idx(z):
+        if not isinstance(z, dict) or "index" not in z:
+            return max(0, n - 1)
+        return int(z.get("index", 0)) - offset
 
-    # Map stored indices from full series to chart-local indices using timestamp.
-    times = {r["time"]: i for i, r in enumerate(rows)}
-    full_rows = rows
-    sweep_price = sig["liquidity"]
-    # Sweep and MSS indices are converted approximately from the setup's latest
-    # chart window by matching the closest candle timestamp when possible.
-    sweep_local = max(0, n-1)
-    mss_local = max(0, n-1)
-    # The stored setup indices refer to the full scan; derive their local offset
-    # from the visible window size.
-    full_len_hint = sig.get("full_len", n)
-    sweep_local = sig["sweep_index"] - (full_len_hint - n)
-    mss_local = sig["mss_index"] - (full_len_hint - n)
+    def zone_box(z, color, alpha, label, text_color=None):
+        idx = local_idx(z)
+        x0 = max(0, min(n - 1, idx - max(4, n // 12)))
+        low, high = float(z["low"]), float(z["high"])
+        if high < low:
+            low, high = high, low
+        ax.add_patch(Rectangle(
+            (x0, low), right - x0, max(high - low, 1e-9),
+            facecolor=color, edgecolor=color, alpha=alpha,
+            linewidth=1.1, zorder=1
+        ))
+        tc = text_color or color
+        ax.text(
+            x0 + (right - x0) * .58, high - (high - low) * .22,
+            label, color=tc, fontsize=9.2, fontweight="bold",
+            ha="center", va="center", zorder=8,
+            bbox=dict(boxstyle="round,pad=.28", facecolor=BG,
+                      edgecolor=tc, linewidth=.8, alpha=.88)
+        )
+        return x0
+
+    # Order Block and FVG zones.
+    zone_box(ob, PINK, .18, "SUPPLY / ORDER BLOCK", PINK)
+    zone_box(fvg, PURPLE, .17, "FVG", "#a995ff")
+
+    # Entry zone is subtle so it does not overpower the actual FVG/OB.
+    ez_idx = local_idx(fvg)
+    ez_x = max(0, min(n - 1, ez_idx - 2))
+    ez_low, ez_high = float(zone["low"]), float(zone["high"])
+    ax.add_patch(Rectangle(
+        (ez_x, ez_low), right - ez_x, max(ez_high - ez_low, 1e-9),
+        facecolor=BLUE, edgecolor=BLUE, alpha=.055, linewidth=.8, zorder=0
+    ))
+
+    # Convert setup indices into visible chart indices.
+    sweep_local = int(sig.get("sweep_index", n - 1)) - offset
+    mss_local = int(sig.get("mss_index", n - 1)) - offset
+    sweep_price = float(sig["liquidity"])
+
+    # Liquidity sweep: strong yellow callout above the sweep.
     if 0 <= sweep_local < n:
-        ax.scatter([sweep_local], [sweep_price], s=55, marker="v" if direction == "SHORT" else "^", color=DOWN if direction == "SHORT" else UP, zorder=8)
-        ax.annotate("LIQUIDITY SWEEP", xy=(sweep_local, sweep_price), xytext=(max(0,sweep_local-10), sweep_price), arrowprops=dict(arrowstyle="->", color=DOWN if direction=="SHORT" else UP, lw=1.4), color=DOWN if direction=="SHORT" else UP, fontsize=8.4, fontweight="bold")
+        ax.scatter(
+            [sweep_local], [sweep_price], s=58,
+            marker="v" if direction == "SHORT" else "^",
+            color=GOLD, edgecolor=BG, linewidth=.7, zorder=10
+        )
+        tx = max(2, sweep_local - 12)
+        ty = sweep_price + (max(r["high"] for r in rows) - min(r["low"] for r in rows)) * .07
+        ax.annotate(
+            "Liquidity Sweep", xy=(sweep_local, sweep_price),
+            xytext=(tx, ty), color=GOLD, fontsize=10, fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color=GOLD, lw=1.5), zorder=10
+        )
+
+    # MSS / CHOCH is a clean structural line rather than a large label over candles.
     if 0 <= mss_local < n:
-        ax.axhline(sig["mss_level"], color=GOLD, linestyle="--", linewidth=1.0, alpha=.85)
-        ax.annotate("MSS / CHOCH", xy=(mss_local, sig["mss_level"]), xytext=(max(0,mss_local-10), sig["mss_level"]), arrowprops=dict(arrowstyle="->", color=GOLD, lw=1.4), color=GOLD, fontsize=8.4, fontweight="bold")
+        ax.axhline(sig["mss_level"], color=CYAN, linestyle="--",
+                   linewidth=1.0, alpha=.72, zorder=2)
+        ax.annotate(
+            "MSS / CHOCH", xy=(mss_local, sig["mss_level"]),
+            xytext=(max(1, mss_local - 10), sig["mss_level"]),
+            color=CYAN, fontsize=8.8, fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color=CYAN, lw=1.25), zorder=9
+        )
 
-    ax.axhline(entry, color=TEXT, linewidth=1.15, linestyle="--")
-    ax.axhline(sl, color=DOWN, linewidth=1.0)
-    for y, lab, c in [(tp1,"TP1",UP),(tp2,"TP2",UP),(tp3,"TP3",UP)]:
-        ax.axhline(y, color=c, linewidth=.9, linestyle=":")
-        ax.text(right+.3, y, f"{lab} {fmt_price(y)}", color=c, fontsize=8, fontweight="bold", va="center")
-    ax.text(right+.3, entry, f"ENTRY {fmt_price(entry)}", color=TEXT, fontsize=8, fontweight="bold", va="center")
-    ax.text(right+.3, sl, f"SL {fmt_price(sl)}", color=DOWN, fontsize=8, fontweight="bold", va="center")
-
+    # Risk/reward levels with right-side pill labels.
     arrow_color = UP if direction == "LONG" else DOWN
-    ax.scatter([n-1], [entry], s=42, color=arrow_color, edgecolor="white", linewidth=.8, zorder=9)
-    ax.annotate(direction, xy=(n-1, entry), xytext=(max(0,n-15), entry), arrowprops=dict(arrowstyle="->", color=arrow_color, lw=1.7), color=arrow_color, fontsize=10, fontweight="bold")
-    ax.text(.01, 1.055, f"{sig['symbol']} · SAIWAN CRYPTO SIGNAL · 5m ENTRY · Bitget Futures", transform=ax.transAxes, fontsize=15, color=TEXT, fontweight="bold")
-    ax.text(.01, 1.018, "LIQUIDITY SWEEP → MSS → CHOCH → FVG → OB → ENTRY", transform=ax.transAxes, fontsize=9.5, color=PURPLE, fontweight="bold")
-    ax.text(.99, 1.018, direction, transform=ax.transAxes, fontsize=11, color=arrow_color, fontweight="bold", ha="right")
-    ax.text(.01, .018, "SAIWAN Move Hunter · 5m closed entry · 15m context · ICT price action only", transform=ax.transAxes, fontsize=8.2, color=MUTED)
+    ax.axhline(entry, color=BLUE, linewidth=1.15, linestyle="--", alpha=.95, zorder=3)
+    ax.axhline(sl, color=DOWN, linewidth=1.15, alpha=.95, zorder=3)
+    for y, lab in [(tp1, "TP1"), (tp2, "TP2"), (tp3, "TP3")]:
+        ax.axhline(y, color=UP, linewidth=.95, linestyle="--", alpha=.8, zorder=2)
 
-    ax.yaxis.tick_right(); ax.tick_params(axis="y", colors=TEXT, labelsize=8.3, length=0)
-    ax.tick_params(axis="x", colors=MUTED, labelsize=8, length=0, pad=8)
-    ax.grid(axis="y", color=GRID, linewidth=.6); ax.grid(axis="x", color=GRID, linewidth=.4, alpha=.5)
-    for side in ["top","left","bottom"]: ax.spines[side].set_visible(False)
-    ax.spines["right"].set_color("#cfd3d7")
-    step=max(1,n//7); ticks=list(range(0,n,step))
-    if ticks[-1] != n-1: ticks.append(n-1)
-    ax.set_xticks(ticks); ax.set_xticklabels([datetime.fromtimestamp(rows[i]["time"], tz=timezone.utc).strftime("%d\\n%H:%M") for i in ticks])
-    all_lows=[r["low"] for r in rows]+[sl,tp3,ob["low"],fvg["low"]]
-    all_highs=[r["high"] for r in rows]+[sl,tp3,ob["high"],fvg["high"]]
-    ymin,ymax=min(all_lows),max(all_highs); span=max(ymax-ymin,abs(rows[-1]["close"])*.012)
-    ax.set_ylim(ymin-span*.06,ymax+span*.12); ax.set_xlim(-1,right+8)
-    fig.subplots_adjust(left=.035,right=.86,top=.89,bottom=.09)
-    safe="".join(ch if ch.isalnum() else "_" for ch in sig["symbol"])
-    path=f"/tmp/chart_{safe}_{sig['time']}.png"; fig.savefig(path,facecolor=BG,edgecolor="none"); plt.close(fig); return path
+    def right_label(y, label, color):
+        ax.text(
+            right + .25, y, f"{label} {fmt_price(y)}",
+            color=TEXT, fontsize=8.7, fontweight="bold", va="center", ha="left",
+            bbox=dict(boxstyle="round,pad=.34", facecolor=color,
+                      edgecolor=color, linewidth=.8, alpha=.95), zorder=12
+        )
+
+    right_label(sl, "SL", DOWN)
+    right_label(entry, "Entry", BLUE)
+    right_label(tp1, "TP1", "#008f70")
+    right_label(tp2, "TP2", "#008f70")
+    right_label(tp3, "TP3", "#008f70")
+
+    # Entry marker.
+    ax.scatter([n - 1], [entry], s=56, color=arrow_color,
+               edgecolor=TEXT, linewidth=.9, zorder=11)
+
+    # Header.
+    context = sig.get("context15", "")
+    context_text = str(context).upper() if context else ""
+    ax.text(.018, 1.065, f"{sig['symbol']} · 5m", transform=ax.transAxes,
+            fontsize=16, color=TEXT, fontweight="bold", va="top")
+    ax.text(.018, 1.025, "SAIWAN CRYPTO SIGNAL  ·  BITGET FUTURES",
+            transform=ax.transAxes, fontsize=8.8, color=MUTED,
+            fontweight="bold", va="top")
+    ax.text(.985, 1.055, direction, transform=ax.transAxes,
+            fontsize=12, color=arrow_color, fontweight="bold", ha="right", va="top",
+            bbox=dict(boxstyle="round,pad=.38", facecolor=BG,
+                      edgecolor=arrow_color, linewidth=1.0))
+
+    # Compact trade summary panel, matching the requested sample style.
+    panel_text = (
+        f"{sig['symbol']}  ·  {direction}\n"
+        f"5m Entry  |  15m Context\n\n"
+        f"Entry   :  {fmt_price(entry)}\n"
+        f"SL      :  {fmt_price(sl)}\n"
+        f"TP1     :  {fmt_price(tp1)}\n"
+        f"TP2     :  {fmt_price(tp2)}\n"
+        f"TP3     :  {fmt_price(tp3)}\n"
+        f"\n✓ Liquidity Sweep\n✓ MSS   ✓ CHOCH\n✓ FVG   ✓ OB"
+    )
+    ax.text(
+        .022, .035, panel_text, transform=ax.transAxes,
+        fontsize=8.8, color=TEXT, va="bottom", ha="left", linespacing=1.45,
+        bbox=dict(boxstyle="round,pad=.72", facecolor=PANEL,
+                  edgecolor="#2a4664", linewidth=1.0, alpha=.97), zorder=20
+    )
+
+    if context_text:
+        ax.text(.50, .018, f"15m Context: {context_text}", transform=ax.transAxes,
+                fontsize=8.5, color=MUTED, ha="center", va="bottom")
+
+    # Axes/grid styling.
+    ax.yaxis.tick_right()
+    ax.tick_params(axis="y", colors="#9bb0c5", labelsize=8.2, length=0, pad=7)
+    ax.tick_params(axis="x", colors="#71879d", labelsize=7.8, length=0, pad=8)
+    ax.grid(axis="y", color=GRID, linewidth=.65, alpha=.8)
+    ax.grid(axis="x", color=GRID, linewidth=.35, alpha=.35)
+    for side in ["top", "left", "bottom"]:
+        ax.spines[side].set_visible(False)
+    ax.spines["right"].set_color("#22364b")
+    ax.spines["right"].set_linewidth(.8)
+
+    step = max(1, n // 7)
+    ticks = list(range(0, n, step))
+    if not ticks or ticks[-1] != n - 1:
+        ticks.append(n - 1)
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([
+        datetime.fromtimestamp(rows[i]["time"], tz=timezone.utc).strftime("%H:%M")
+        for i in ticks
+    ])
+
+    all_lows = [r["low"] for r in rows] + [sl, tp1, tp2, tp3, ob["low"], fvg["low"]]
+    all_highs = [r["high"] for r in rows] + [sl, tp1, tp2, tp3, ob["high"], fvg["high"]]
+    ymin, ymax = min(all_lows), max(all_highs)
+    span = max(ymax - ymin, abs(rows[-1]["close"]) * .012)
+    ax.set_ylim(ymin - span * .06, ymax + span * .16)
+    ax.set_xlim(-1, right + 5)
+
+    fig.subplots_adjust(left=.025, right=.865, top=.86, bottom=.085)
+    safe = "".join(ch if ch.isalnum() else "_" for ch in sig["symbol"])
+    path = f"/tmp/chart_{safe}_{sig['time']}.png"
+    fig.savefig(path, facecolor=BG, edgecolor="none", bbox_inches="tight", pad_inches=.08)
+    plt.close(fig)
+    return path
 
 
 def telegram_url(method):
