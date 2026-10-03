@@ -65,7 +65,11 @@ watch_thread = None
 MAX_WATCH_ITEMS = 20
 WATCH_INTERVAL = 60
 WATCH_ALERT_COOLDOWN = 300
-bot_settings = {"alerts": True, "watch_interval": WATCH_INTERVAL}
+bot_settings = {
+    "alerts": True,
+    "watch_interval": WATCH_INTERVAL,
+    "watch_cooldown": WATCH_ALERT_COOLDOWN,
+}
 
 session = requests.Session()
 session.headers.update({"User-Agent": "SAIWAN-Crypto-Signal-Move-Hunter/5.0", "Accept": "application/json"})
@@ -772,7 +776,8 @@ def make_chart(sig):
     # Header.
     context = sig.get("context15", "")
     context_text = str(context).upper() if context else ""
-    ax.text(.018, 1.065, f"{sig['symbol']} · 5m", transform=ax.transAxes,
+    tf_label = str(sig.get("timeframe", "5m"))
+    ax.text(.018, 1.065, f"{sig['symbol']} · {tf_label}", transform=ax.transAxes,
             fontsize=16, color=TEXT, fontweight="bold", va="top")
     ax.text(.018, 1.025, "SAIWAN CRYPTO SIGNAL  ·  BITGET FUTURES",
             transform=ax.transAxes, fontsize=8.8, color=MUTED,
@@ -785,12 +790,14 @@ def make_chart(sig):
     # Compact trade summary panel, matching the requested sample style.
     panel_text = (
         f"{sig['symbol']}  ·  {direction}\n"
-        f"5m Entry  |  15m Context\n\n"
+        f"Timeframe: {tf_label}\n\n"
         f"Entry   :  {fmt_price(entry)}\n"
         f"SL      :  {fmt_price(sl)}\n"
         f"TP1     :  {fmt_price(tp1)}\n"
         f"TP2     :  {fmt_price(tp2)}\n"
         f"TP3     :  {fmt_price(tp3)}\n"
+        f"{_setup_detail_lines(sig)[0]}\n"
+        f"{_setup_detail_lines(sig)[1]}\n"
         f"\n✓ Liquidity Sweep\n✓ MSS   ✓ CHOCH\n✓ FVG   ✓ OB"
     )
     ax.text(
@@ -1272,6 +1279,37 @@ def analysis_report(raw_symbol, requested_timeframes=None):
     return "\n".join(lines)
 
 
+def _setup_metrics(sig):
+    """Return transparent, rule-based trade metrics for a detected setup."""
+    entry = float(sig["entry"])
+    sl = float(sig["sl"])
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return {"risk": 0.0, "rr1": 0.0, "rr2": 0.0, "rr3": 0.0, "quality": 0}
+    rr1 = abs(float(sig["tp1"]) - entry) / risk
+    rr2 = abs(float(sig["tp2"]) - entry) / risk
+    rr3 = abs(float(sig["tp3"]) - entry) / risk
+    # Quality is a heuristic, not a probability: all five structural checks are
+    # required by the setup model, then RR and candle confirmation add points.
+    checks = sig.get("checks") or {}
+    structural = sum(bool(checks.get(k)) for k in ("Liquidity Sweep", "MSS", "CHOCH", "FVG", "OB"))
+    quality = structural
+    quality += 1 if rr1 >= 1.5 else 0
+    quality += 1 if rr2 >= 2.5 else 0
+    quality += 1 if rr3 >= 4.0 else 0
+    quality += 1 if sig.get("rejection_ok") else 0
+    quality += 1 if sig.get("early_entry") else 0
+    return {"risk": risk, "rr1": rr1, "rr2": rr2, "rr3": rr3, "quality": min(10, quality)}
+
+
+def _setup_detail_lines(sig):
+    m = _setup_metrics(sig)
+    return [
+        f"⭐ Quality: {m['quality']}/10 (rule-based)",
+        f"📐 R:R — TP1 {m['rr1']:.2f}R · TP2 {m['rr2']:.2f}R · TP3 {m['rr3']:.2f}R",
+    ]
+
+
 def _record_alert(event, **data):
     item = {"event": event, "time": time.time(), **data}
     with state_lock:
@@ -1338,6 +1376,7 @@ def watch_loop():
         with watch_lock:
             items = [dict(v) for v in watchlist.values()]
             interval = int(bot_settings.get("watch_interval", WATCH_INTERVAL))
+            cooldown = int(bot_settings.get("watch_cooldown", WATCH_ALERT_COOLDOWN))
             alerts_enabled = bool(bot_settings.get("alerts", True))
         for item in items:
             if not alerts_enabled:
@@ -1353,27 +1392,29 @@ def watch_loop():
                         continue
                     if current.get("last_key") == sig["key"]:
                         continue
-                    if now - float(current.get("last_alert_at", 0)) < WATCH_ALERT_COOLDOWN:
+                    if now - float(current.get("last_alert_at", 0)) < cooldown:
                         current["last_key"] = sig["key"]
                         continue
                     current["last_key"] = sig["key"]
                     current["last_alert_at"] = now
                     chat_id = current["chat_id"]
+                details = _setup_detail_lines(sig)
                 caption = (
-                    "📡 SAIWAN SMART WATCH\n\n"
+                    "📡 SAIWAN SMART WATCH PRO\n\n"
                     f"{'🟢' if sig['direction']=='LONG' else '🔴'} {sig['direction']} — ⭐ {sig['symbol']}\n"
-                    f"⏱ {sig['timeframe'].upper()}\n"
+                    f"⏱ {sig['timeframe'].upper()} · CLOSED CANDLES\n"
                     f"💵 Entry: {fmt_price(sig['entry'])}\n"
                     f"🛑 SL: {fmt_price(sig['sl'])}\n"
                     f"🎯 TP1: {fmt_price(sig['tp1'])}\n"
                     f"🎯 TP2: {fmt_price(sig['tp2'])}\n"
-                    f"🎯 TP3: {fmt_price(sig['tp3'])}\n\n"
-                    "✅ Liquidity Sweep · MSS · CHOCH · FVG · OB"
+                    f"🎯 TP3: {fmt_price(sig['tp3'])}\n"
+                    f"{details[0]}\n{details[1]}\n\n"
+                    "✅ Liquidity Sweep · MSS · CHOCH · FVG · OB\n"
+                    "⚠️ Signal only — no automatic trading."
                 )
                 path = None
                 try:
-                    charts = make_analysis_charts(sig["symbol"], [sig["timeframe"]])
-                    path = charts[0] if charts else None
+                    path = make_chart(sig)
                 except Exception as chart_error:
                     print(f"WATCH CHART ERROR {sig['symbol']}: {type(chart_error).__name__}: {chart_error}")
                 if path:
@@ -1462,26 +1503,38 @@ def _history_text(symbol_filter=None):
     return "\n".join(lines)
 
 
-def _stats_text():
+def _stats_text(symbol_filter=None):
+    sym = _normalize_analysis_symbol(symbol_filter) if symbol_filter else None
     with state_lock:
         items = list(signal_history)
-        active = len(active_signals)
+        active_states = list(active_signals.values())
+        alerts = list(watch_alerts)
+    if sym:
+        items = [x for x in items if x.get("symbol") == sym]
+        active_states = [x for x in active_states if x.get("symbol") == sym]
+        alerts = [x for x in alerts if x.get("symbol") == sym]
     total = len(items)
     sl = sum(x.get("outcome") == "SL" for x in items)
     tp3 = sum(x.get("outcome") == "TP3" for x in items)
-    partial = sum(x.get("outcome") in ("TP1", "TP2") for x in items)
+    tp1_events = sum(x.get("event") == "TP1" for x in alerts)
+    tp2_events = sum(x.get("event") == "TP2" for x in alerts)
     terminal = sl + tp3
     rate = (tp3 / terminal * 100) if terminal else 0.0
-    return ("📈 SAIWAN STATISTICS\n\n"
-            f"Closed: {total}\nActive: {active}\n🟢 TP3: {tp3}\n🔴 SL: {sl}\n🎯 Partial: {partial}\n"
-            f"TP3 / (TP3+SL): {rate:.1f}%\n\n"
-            "ℹ️ Statistics are historical records from the current bot process.")
+    scope = f" · {sym}" if sym else ""
+    return (f"📈 SAIWAN STATISTICS{scope}\n\n"
+            f"Closed: {total}\nActive: {len(active_states)}\n"
+            f"🟢 TP3: {tp3}\n🔴 SL: {sl}\n"
+            f"🎯 TP1 events: {tp1_events}\n🎯 TP2 events: {tp2_events}\n"
+            f"Terminal TP3 rate: {rate:.1f}%\n\n"
+            "ℹ️ TP3 rate = TP3 / (TP3 + SL), using closed terminal records only.\n"
+            "Statistics are historical records from the current bot process.")
 
 
 def _settings_text():
     with watch_lock:
         alerts = bool(bot_settings.get("alerts", True))
         interval = int(bot_settings.get("watch_interval", WATCH_INTERVAL))
+        cooldown = int(bot_settings.get("watch_cooldown", WATCH_ALERT_COOLDOWN))
         watched = len(watchlist)
     with state_lock:
         scanner = scanner_running
@@ -1489,10 +1542,12 @@ def _settings_text():
             f"Scanner: {'ON' if scanner else 'OFF'}\n"
             f"Smart Watch alerts: {'ON' if alerts else 'OFF'}\n"
             f"Watch interval: {interval}s\n"
+            f"Alert cooldown: {cooldown}s\n"
             f"Watched coins: {watched}/{MAX_WATCH_ITEMS}\n\n"
             "Change: /settings alerts on\n"
             "Change: /settings alerts off\n"
-            "Change: /settings watch_interval 60")
+            "Change: /settings watch_interval 60\n"
+            "Change: /settings cooldown 300")
 
 
 def _quick_scan(raw_symbol):
@@ -1511,11 +1566,91 @@ def _quick_scan(raw_symbol):
         if setup5:
             direction = "LONG" if setup5 is long5 else "SHORT"
             lines += [f"🎯 Setup: {direction}", f"Entry: {fmt_price(setup5['entry'])}", f"SL: {fmt_price(setup5['sl'])}", f"TP1: {fmt_price(setup5['tp1'])}", f"TP2: {fmt_price(setup5['tp2'])}", f"TP3: {fmt_price(setup5['tp3'])}"]
+            lines += _setup_detail_lines(setup5)
         else:
             lines.append("🟡 WAIT — complete setup نییە.")
         return "\n".join(lines)
     except Exception as e:
         return f"❌ Quick scan سەرکەوتوو نەبوو: {_error_bucket(e)}"
+
+
+def _smart_scan_report(limit=8):
+    """Manual market radar: scan the most liquid contracts and return confirmed setups."""
+    contracts = get_contracts()
+    tickers = get_tickers()
+    tv = {x.get("symbol"): x for x in tickers}
+    ranked = []
+    for c in contracts:
+        sym = c.get("symbol", "")
+        try:
+            vol = float(tv.get(sym, {}).get("usdtVolume", tv.get(sym, {}).get("quoteVolume", 0)))
+        except (TypeError, ValueError):
+            vol = 0.0
+        if vol > 0:
+            ranked.append((vol, sym))
+    ranked.sort(reverse=True)
+    universe = [sym for _, sym in ranked[:20]]
+
+    def one(symbol):
+        try:
+            rows5 = get_klines(symbol, TF_5M, CANDLE_LIMIT)
+            rows15 = get_klines(symbol, TF_15M, 180)
+            sig = analyze(symbol, rows5, rows15)
+            return sig
+        except Exception:
+            return None
+
+    found = []
+    with ThreadPoolExecutor(max_workers=min(SCAN_WORKERS, 8)) as pool:
+        futures = [pool.submit(one, sym) for sym in universe]
+        for fut in as_completed(futures):
+            sig = fut.result()
+            if sig:
+                m = _setup_metrics(sig)
+                sig["quality"] = m["quality"]
+                sig["rr3"] = m["rr3"]
+                found.append(sig)
+    found.sort(key=lambda x: (x.get("quality", 0), x.get("radar_score", 0), x.get("rr3", 0), x.get("time", 0)), reverse=True)
+    found = found[:max(1, min(limit, 10))]
+    if not found:
+        return "📊 SAIWAN SMART SCAN\\n\\n🟡 No complete setup found in the top liquid market contracts right now.\\n\\nTry again after the next closed candles."
+    lines = ["📊 SAIWAN SMART SCAN", "", f"Scanned top {len(universe)} liquid contracts", ""]
+    for i, sig in enumerate(found, 1):
+        m = _setup_metrics(sig)
+        d = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
+        lines += [
+            f"{i}. {d} · ⭐ {sig['symbol']}",
+            f"   Entry {fmt_price(sig['entry'])} · SL {fmt_price(sig['sl'])}",
+            f"   TP1 {fmt_price(sig['tp1'])} · TP2 {fmt_price(sig['tp2'])} · TP3 {fmt_price(sig['tp3'])}",
+            f"   Quality {m['quality']}/10 · TP3 {m['rr3']:.2f}R · 15m {sig.get('context15','UNKNOWN')}",
+            "",
+        ]
+    lines.append("⚠️ Radar is informational; no automatic trading.")
+    return "\\n".join(lines)
+
+
+def _movers_report(limit=10):
+    """Show 24h percentage movers among live USDT perpetuals."""
+    tickers = get_tickers()
+    rows = []
+    for t in tickers:
+        sym = t.get("symbol", "")
+        if not sym.endswith("USDT"):
+            continue
+        try:
+            change = float(t.get("change24h", t.get("chgUtc", 0))) * 100.0
+            price = float(t.get("lastPr"))
+            volume = float(t.get("usdtVolume", t.get("quoteVolume", 0)))
+        except (TypeError, ValueError):
+            continue
+        rows.append((change, volume, sym, price))
+    rows.sort(key=lambda x: abs(x[0]), reverse=True)
+    lines = ["🔥 SAIWAN TOP MOVERS · 24H", ""]
+    for i, (change, volume, sym, price) in enumerate(rows[:limit], 1):
+        icon = "🟢" if change >= 0 else "🔴"
+        lines.append(f"{i}. {icon} {sym} · {change:+.2f}% · {fmt_price(price)}")
+    lines.append("\nℹ️ Price movement only; not a trade signal.")
+    return "\n".join(lines)
 
 
 def status_text():
@@ -1638,7 +1773,9 @@ def signal_caption(sig):
         f"SL: {fmt_price(sig['sl'])}\n"
         f"TP1: {fmt_price(sig['tp1'])}\n"
         f"TP2: {fmt_price(sig['tp2'])}\n"
-        f"TP3: {fmt_price(sig['tp3'])}\n\n"
+        f"TP3: {fmt_price(sig['tp3'])}\n"
+        f"{_setup_detail_lines(sig)[0]}\n"
+        f"{_setup_detail_lines(sig)[1]}\n\n"
         "⚡ Early move setup — closed candles only.\n"
         "⚠️ Signal only — no automatic trading."
     )
@@ -1737,7 +1874,8 @@ def monitor_active_signals():
                             _record_history(state, "TP3", "TP3")
                             _record_alert("TP3", symbol=state["symbol"], timeframe=state.get("timeframe", "5m"), direction=state["direction"])
                         else:
-                            _record_history(state, name.upper(), name.upper())
+                            # TP1/TP2 are milestones, not closed trades. Keep them in alerts,
+                            # while /history remains a terminal-outcome history.
                             _record_alert(name.upper(), symbol=state["symbol"], timeframe=state.get("timeframe", "5m"), direction=state["direction"])
                         with state_lock:
                             if state["key"] in active_signals:
@@ -1823,6 +1961,8 @@ def poll_updates():
                             "🚀 SAIWAN CRYPTO SIGNAL\n\n"
                             "/scan - Start full scanner\n"
                             "/scan BTC - Quick market scan\n"
+                            "/scan top - Smart Scan\n"
+                            "/movers - Top 24h movers\n"
                             "/stop - Stop scanner\n"
                             "/watch BTC 5m - Smart Watch\n"
                             "/unwatch BTC - Remove watch\n"
@@ -1832,7 +1972,7 @@ def poll_updates():
                             "/risk BTC 1000 1 - Risk amount\n"
                             "/risk BTC 1000 1 105000 103800 - Position size\n"
                             "/history - Closed signal history\n"
-                            "/stats - Signal statistics\n"
+                            "/stats [BTC] - Signal statistics\n"
                             "/settings - Bot settings\n"
                             "/status - Bot status\n\n"
                             "Market: Bitget USDT Perpetual Futures\n"
@@ -1842,8 +1982,13 @@ def poll_updates():
                         if len(parts) == 1:
                             start_scanner(active_chat_id)
                             send_message(active_chat_id, "🚀 SAIWAN CRYPTO SIGNAL SCANNER STARTED\n\n5m + 15m context. TP/SL monitoring is enabled.")
+                        elif parts[1].lower() in ("top", "smart", "smartscan"):
+                            send_message(active_chat_id, "📊 Smart Scan خەریکە بازارەکە پشکنین دەکات...")
+                            send_message(active_chat_id, _smart_scan_report())
                         else:
                             send_message(active_chat_id, _quick_scan(parts[1]))
+                    elif cmd == "/movers":
+                        send_message(active_chat_id, _movers_report())
                     elif cmd == "/stop":
                         stop_scanner(); send_message(active_chat_id, "🛑 Scanner stopped. Smart Watch keeps running if it is enabled.")
                     elif cmd == "/watch":
@@ -1902,7 +2047,10 @@ def poll_updates():
                     elif cmd == "/history":
                         send_message(active_chat_id, _history_text(parts[1] if len(parts) == 2 else None))
                     elif cmd == "/stats":
-                        send_message(active_chat_id, _stats_text())
+                        if len(parts) > 2:
+                            send_message(active_chat_id, "نموونە: /stats یان /stats BTC")
+                        else:
+                            send_message(active_chat_id, _stats_text(parts[1] if len(parts) == 2 else None))
                     elif cmd == "/settings":
                         if len(parts) == 1:
                             send_message(active_chat_id, _settings_text())
@@ -1916,6 +2064,13 @@ def poll_updates():
                                 send_message(active_chat_id, f"⚙️ Watch interval set to {value}s")
                             except ValueError:
                                 send_message(active_chat_id, "❌ Interval دەبێت ژمارە بێت.")
+                        elif len(parts) == 3 and parts[1].lower() == "cooldown":
+                            try:
+                                value = max(30, min(3600, int(parts[2])))
+                                with watch_lock: bot_settings["watch_cooldown"] = value
+                                send_message(active_chat_id, f"⚙️ Alert cooldown set to {value}s")
+                            except ValueError:
+                                send_message(active_chat_id, "❌ Cooldown دەبێت ژمارە بێت.")
                         else:
                             send_message(active_chat_id, "❌ Settings syntax هەڵەیە. /settings")
                     elif cmd == "/status":
