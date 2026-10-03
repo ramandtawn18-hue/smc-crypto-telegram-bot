@@ -844,6 +844,105 @@ def send_photo(chat_id, photo_path, caption, reply_markup=None):
     return (payload.get("result") or {}).get("message_id")
 
 
+def _normalize_analysis_symbol(raw):
+    """Normalize a Telegram /analysis symbol to a Bitget USDT perpetual symbol."""
+    symbol = (raw or "").strip().upper().replace("/", "").replace("-", "")
+    if not symbol:
+        return None
+    if symbol.endswith("USDT"):
+        return symbol
+    return symbol + "USDT"
+
+
+def analysis_report(raw_symbol):
+    """On-demand market analysis for /analysis SYMBOL.
+
+    Uses the same Bitget closed-candle data and price-action model as the scanner.
+    If a complete LONG/SHORT setup is not present, the report explicitly says WAIT
+    instead of inventing a trade signal.
+    """
+    symbol = _normalize_analysis_symbol(raw_symbol)
+    if not symbol or len(symbol) < 6:
+        return "❌ تکایە ناوی کۆین بنووسە.\n\nنموونە:\n/analysis BTCUSDT\n/analysis AVAX"
+
+    rows5 = get_klines(symbol, TF_5M, CANDLE_LIMIT)
+    rows15 = get_klines(symbol, TF_15M, 180)
+    if len(rows5) < 120 or len(rows15) < 30:
+        return f"❌ داتای بەشی پێویست بۆ {symbol} بەردەست نییە. دڵنیابە کۆینەکە لە Bitget USDT Futures هەیە."
+
+    cur = rows5[-1]["close"]
+    e20_5 = ema([r["close"] for r in rows5], 20)[-1]
+    e50_5 = ema([r["close"] for r in rows5], 50)[-1]
+    e20_15 = ema([r["close"] for r in rows15], 20)[-1]
+    e50_15 = ema([r["close"] for r in rows15], 50)[-1]
+
+    long_sig = _move_setup(rows5, "LONG")
+    short_sig = _move_setup(rows5, "SHORT")
+
+    long_score = int(cur > e20_5) + int(e20_5 > e50_5) + int(e20_15 > e50_15)
+    short_score = int(cur < e20_5) + int(e20_5 < e50_5) + int(e20_15 < e50_15)
+
+    if long_sig and not short_sig:
+        verdict = "🟢 LONG setup موجودە"
+        setup = long_sig
+    elif short_sig and not long_sig:
+        verdict = "🔴 SHORT setup موجودە"
+        setup = short_sig
+    elif long_sig and short_sig:
+        if long_score > short_score:
+            verdict = "🟢 LONG bias — بەڵام هەردوو لایەن setup هەیە"
+            setup = long_sig
+        elif short_score > long_score:
+            verdict = "🔴 SHORT bias — بەڵام هەردوو لایەن setup هەیە"
+            setup = short_sig
+        else:
+            verdict = "🟡 WAIT — هەردوو لایەن نزیکن"
+            setup = None
+    else:
+        if long_score >= 2 and short_score == 0:
+            verdict = "🟢 LONG bias — setupی تەواو نییە"
+        elif short_score >= 2 and long_score == 0:
+            verdict = "🔴 SHORT bias — setupی تەواو نییە"
+        else:
+            verdict = "🟡 WAIT — setupی تەواو نییە"
+        setup = None
+
+    context_long = _context_15m(rows15, "LONG")
+    context_short = _context_15m(rows15, "SHORT")
+    lines = [
+        f"🔎 SAIWAN ANALYSIS — {symbol}",
+        "",
+        verdict,
+        f"💵 Price: {fmt_price(cur)}",
+        "⏱ Timeframe: 5m + 15m context",
+        "",
+        f"5m EMA20: {fmt_price(e20_5)} | EMA50: {fmt_price(e50_5)}",
+        f"15m EMA20: {fmt_price(e20_15)} | EMA50: {fmt_price(e50_15)}",
+        f"15m Long context: {context_long}",
+        f"15m Short context: {context_short}",
+        "",
+        f"📊 Bias checks — LONG {long_score}/3 · SHORT {short_score}/3",
+    ]
+    if setup:
+        lines += [
+            "",
+            f"🎯 Entry: {fmt_price(setup['entry'])}",
+            f"🛑 SL: {fmt_price(setup['sl'])}",
+            f"🎯 TP1: {fmt_price(setup['tp1'])}",
+            f"🎯 TP2: {fmt_price(setup['tp2'])}",
+            f"🎯 TP3: {fmt_price(setup['tp3'])}",
+            "",
+            "✅ Liquidity Sweep · MSS · CHOCH · FVG · OB",
+        ]
+    else:
+        lines += [
+            "",
+            "ℹ️ هیچ setupی تەواوی Liquidity Sweep + MSS + FVG + OB لە ئێستادا نییە.",
+            "باشترە بۆ triggerی تەواو چاوەڕێ بکرێت لە جیاتی دروستکردنی سیگناڵی ناڕاست.",
+        ]
+    return "\n".join(lines)
+
+
 def status_text():
     with state_lock:
         return (
@@ -1128,7 +1227,8 @@ def poll_updates():
                         "🚀 SAIWAN CRYPTO SIGNAL\n\n"
                         "/scan - Start scanner\n"
                         "/stop - Stop scanner\n"
-                        "/status - Bot status\n\n"
+                        "/status - Bot status\n"
+                        "/analysis COIN - Analyze one coin now\n\n"
                         "Market: Bitget USDT Perpetual Futures\n"
                         "Timeframe: 5m entry + 15m context\n"
                         "Model: SAIWAN Move Hunter — Liquidity Sweep + MSS + CHOCH + FVG + OB\n"
@@ -1144,6 +1244,17 @@ def poll_updates():
                         "TP/SL monitoring is enabled.")
                 elif text.startswith("/stop"):
                     stop_scanner(); send_message(active_chat_id, "🛑 Scanner stopped.")
+                elif text.startswith("/analysis"):
+                    parts = text.split(maxsplit=1)
+                    if len(parts) < 2:
+                        send_message(active_chat_id, "🔎 نموونە:\n/analysis BTCUSDT\n/analysis AVAX")
+                    else:
+                        try:
+                            send_message(active_chat_id, "🔎 خەریکم {0} شیکاری دەکەم...".format(_normalize_analysis_symbol(parts[1])))
+                            send_message(active_chat_id, analysis_report(parts[1]))
+                        except Exception as e:
+                            print(f"ANALYSIS ERROR {type(e).__name__}: {e}")
+                            send_message(active_chat_id, f"❌ شیکاری سەرکەوتوو نەبوو: {type(e).__name__}")
                 elif text.startswith("/status"):
                     send_message(active_chat_id, status_text())
         except Exception as e:
