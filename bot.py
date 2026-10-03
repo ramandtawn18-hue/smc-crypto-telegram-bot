@@ -20,7 +20,7 @@ TELEGRAM_API = "https://api.telegram.org/bot"
 
 TF_15M = "15m"
 TF_5M = "5m"
-TIMEFRAME = TF_5M
+TIMEFRAME = TF_15M
 CANDLE_LIMIT = 260
 # 0 = scan every eligible Bitget USDT perpetual contract (no top-N cap)
 MAX_PAIRS = 0
@@ -28,7 +28,7 @@ SCAN_WORKERS = 6
 SCAN_INTERVAL = 60
 SEND_INTERVAL = 600  # minimum 10 minutes between sent signals
 SIGNAL_TIMEFRAME = TF_15M
-CHART_CANDLES = 70
+CHART_CANDLES = 80
 HTTP_TIMEOUT = 15
 MIN_SCORE = 5
 
@@ -762,7 +762,7 @@ def _move_setup(rows, direction):
 
 def analyze(symbol, rows5, rows15=None):
     """SAIWAN Momentum Engine: 15m primary signal timeframe, closed candles only."""
-    rows = rows15 if rows15 and len(rows15) >= 90 else rows5
+    rows = rows15 if rows15 and len(rows15) >= 90 else None
     if not rows or len(rows) < 90:
         return None
     for r in rows:
@@ -772,7 +772,7 @@ def analyze(symbol, rows5, rows15=None):
         sig = _momentum_setup(rows, direction)
         if sig:
             sig["symbol"] = symbol
-            sig["timeframe"] = SIGNAL_TIMEFRAME if rows is rows15 else TF_5M
+            sig["timeframe"] = SIGNAL_TIMEFRAME
             candidates.append(sig)
     return max(candidates, key=lambda x: x["time"]) if candidates else None
 
@@ -1074,23 +1074,19 @@ def _normalize_analysis_symbol(raw):
 
 
 def _normalize_analysis_timeframe(raw):
-    """Normalize an analysis timeframe. Supports 5m/15m/1h/4h."""
+    """Normalize analysis to the bot's single 15-minute timeframe."""
     tf = (raw or "").strip().lower()
-    aliases = {
-        "5": "5m", "5m": "5m",
-        "15": "15m", "15m": "15m",
-        "1h": "1h", "1hr": "1h", "60m": "1h", "60": "1h",
-        "4h": "4h", "4hr": "4h", "240m": "4h", "240": "4h",
-    }
+    aliases = {"15": "15m", "15m": "15m"}
     return aliases.get(tf)
 
 
 def _analysis_tf_data(symbol, timeframe):
     """Fetch closed candles for an on-demand analysis timeframe."""
-    limits = {"5m": CANDLE_LIMIT, "15m": 180, "1h": 180, "4h": 180}
-    rows = get_klines(symbol, timeframe, limits.get(timeframe, 180))
-    if len(rows) < 60:
-        raise RuntimeError(f"not enough {timeframe} candles")
+    if timeframe != TF_15M:
+        raise RuntimeError("SAIWAN is configured for 15m only")
+    rows = get_klines(symbol, TF_15M, max(CANDLE_LIMIT, 180))
+    if len(rows) < 90:
+        raise RuntimeError("not enough 15m candles")
     return rows
 
 
@@ -1161,138 +1157,56 @@ def _analysis_verdict(blocks):
 
 
 def analysis_report(raw_symbol, requested_timeframes=None):
-    """On-demand single-timeframe analysis for /analysis SYMBOL TIMEFRAME.
-
-    Examples:
-      /analysis BTC 5m
-      /analysis BTC 15m
-      /analysis BTC 1h
-      /analysis BTC 4h
-
-    The requested timeframe is analyzed directly with closed candles, EMA bias,
-    momentum breakout/pullback checks, and a matching chart. No trade is placed.
-    """
+    """On-demand analysis for the bot's single 15-minute timeframe."""
     symbol = _normalize_analysis_symbol(raw_symbol)
     if not symbol or len(symbol) < 6:
-        return "❌ تکایە ناوی کۆین بنووسە.\n\nنموونە:\n/analysis BTC\n/analysis BTC 1h\n/analysis BTC 4h\n/analysis BTC 1h 4h"
+        return "❌ تکایە ناوی کۆین بنووسە.\n\nنموونە: /analysis BTC 15m"
 
     requested = []
-    for raw_tf in (requested_timeframes or []):
+    for raw_tf in (requested_timeframes or [SIGNAL_TIMEFRAME]):
         tf = _normalize_analysis_timeframe(raw_tf)
-        if tf and tf not in requested:
+        if tf == TF_15M and tf not in requested:
             requested.append(tf)
-    requested = requested[:3]
-
-    # No timeframe means legacy fallback mode; normal /analysis requires one timeframe.
-    if not requested:
-        rows5 = get_klines(symbol, TF_5M, CANDLE_LIMIT)
-        rows15 = get_klines(symbol, TF_15M, 180)
-        if len(rows5) < 120 or len(rows15) < 30:
-            return f"❌ داتای بەشی پێویست بۆ {symbol} بەردەست نییە. دڵنیابە کۆینەکە لە Bitget USDT Futures هەیە."
-
-        cur = rows5[-1]["close"]
-        e20_5 = ema([r["close"] for r in rows5], 20)[-1]
-        e50_5 = ema([r["close"] for r in rows5], 50)[-1]
-        e20_15 = ema([r["close"] for r in rows15], 20)[-1]
-        e50_15 = ema([r["close"] for r in rows15], 50)[-1]
-
-        long_sig = _move_setup(rows5, "LONG")
-        short_sig = _move_setup(rows5, "SHORT")
-        long_score = int(cur > e20_5) + int(e20_5 > e50_5) + int(e20_15 > e50_15)
-        short_score = int(cur < e20_5) + int(e20_5 < e50_5) + int(e20_15 < e50_15)
-
-        if long_sig and not short_sig:
-            verdict = "🟢 LONG setup موجودە"
-            setup = long_sig
-        elif short_sig and not long_sig:
-            verdict = "🔴 SHORT setup موجودە"
-            setup = short_sig
-        elif long_sig and short_sig:
-            if long_score > short_score:
-                verdict = "🟢 LONG bias — بەڵام هەردوو لایەن setup هەیە"
-                setup = long_sig
-            elif short_score > long_score:
-                verdict = "🔴 SHORT bias — بەڵام هەردوو لایەن setup هەیە"
-                setup = short_sig
-            else:
-                verdict = "🟡 WAIT — هەردوو لایەن نزیکن"
-                setup = None
-        else:
-            if long_score >= 2 and short_score == 0:
-                verdict = "🟢 LONG bias — setupی تەواو نییە"
-            elif short_score >= 2 and long_score == 0:
-                verdict = "🔴 SHORT bias — setupی تەواو نییە"
-            else:
-                verdict = "🟡 WAIT — setupی تەواو نییە"
-            setup = None
-
-        context_long = _context_15m(rows15, "LONG")
-        context_short = _context_15m(rows15, "SHORT")
-        lines = [
-            f"🔎 SAIWAN ANALYSIS — {symbol}", "", verdict,
-            f"💵 Price: {fmt_price(cur)}",
-            "⏱ Timeframe: 15m Momentum Engine", "",
-            f"5m EMA20: {fmt_price(e20_5)} | EMA50: {fmt_price(e50_5)}",
-            f"15m EMA20: {fmt_price(e20_15)} | EMA50: {fmt_price(e50_15)}",
-            f"15m Long context: {context_long}",
-            f"15m Short context: {context_short}", "",
-            f"📊 Bias checks — LONG {long_score}/3 · SHORT {short_score}/3",
-        ]
-        if setup:
-            lines += [
-                "", f"🎯 Entry: {fmt_price(setup['entry'])}",
-                f"🛑 SL: {fmt_price(setup['sl'])}",
-                f"🎯 TP1: {fmt_price(setup['tp1'])}",
-                f"🎯 TP2: {fmt_price(setup['tp2'])}",
-                f"🎯 TP3: {fmt_price(setup['tp3'])}", "",
-                f"✅ {setup.get('pattern','MOMENTUM')} · volume {setup.get('volume_mult',0):.2f}× · extension {setup.get('extension_atr',0):.2f}×ATR",
-            ]
-        else:
-            lines += [
-                "",
-                "ℹ️ هیچ Momentum setup ـێکی تەواو لە ئێستادا نییە.",
-                "باشترە بۆ triggerی تەواو چاوەڕێ بکرێت لە جیاتی دروستکردنی سیگناڵی ناڕاست.",
-            ]
-        return "\n".join(lines)
+    if requested != [TF_15M]:
+        return "❌ SAIWAN تەنها لەسەر 15m کار دەکات.\nنموونە: /analysis BTC 15m"
 
     try:
-        blocks = [_format_htf_block(symbol, tf) for tf in requested]
-    except Exception as e:
-        return f"❌ نەتوانرا شیکاری {symbol} بکرێت بۆ {', '.join(requested)}. دڵنیابە کۆینەکە لە Bitget USDT Futures هەیە."
+        block = _format_htf_block(symbol, TF_15M)
+    except Exception:
+        return f"❌ نەتوانرا شیکاری {symbol} لە 15m بکرێت. دڵنیابە کۆینەکە لە Bitget USDT Futures هەیە."
+
+    setup = block["long_sig"] or block["short_sig"]
+    if block["bias"] == "LONG":
+        verdict = "🟢 LONG bias"
+    elif block["bias"] == "SHORT":
+        verdict = "🔴 SHORT bias"
+    else:
+        verdict = "🟡 MIXED bias"
 
     lines = [
-        f"🔎 SAIWAN HTF ANALYSIS — {symbol}", "",
-        _analysis_verdict(blocks),
-        "📌 This is market analysis only — no automatic trading.", "",
+        f"🔎 SAIWAN ANALYSIS — {symbol}",
+        "",
+        verdict,
+        "⏱ Timeframe: 15M ONLY · CLOSED CANDLES",
+        f"💵 Price: {fmt_price(block['price'])}",
+        f"EMA20: {fmt_price(block['ema20'])} | EMA50: {fmt_price(block['ema50'])}",
+        f"📊 Checks — LONG {block['long_score']}/2 · SHORT {block['short_score']}/2",
+        f"Setup: {block['setup']}",
     ]
-    for b in blocks:
+    if setup:
         lines += [
-            f"━━ {b['timeframe'].upper()} ━━",
-            f"💵 Price: {fmt_price(b['price'])}",
-            f"EMA20: {fmt_price(b['ema20'])} | EMA50: {fmt_price(b['ema50'])}",
-            f"Bias: {'🟢 LONG' if b['bias']=='LONG' else '🔴 SHORT' if b['bias']=='SHORT' else '🟡 MIXED'}",
-            f"📊 Checks — LONG {b['long_score']}/2 · SHORT {b['short_score']}/2",
-            f"Setup: {b['setup']}",
+            "",
+            f"🎯 Entry: {fmt_price(setup['entry'])}",
+            f"🛑 SL: {fmt_price(setup['sl'])}",
+            f"🎯 TP1: {fmt_price(setup['tp1'])}",
+            f"🎯 TP2: {fmt_price(setup['tp2'])}",
+            f"🎯 TP3: {fmt_price(setup['tp3'])}",
+            "",
+            f"⚡ {setup.get('pattern','MOMENTUM')} · volume {setup.get('volume_mult',0):.2f}× · extension {setup.get('extension_atr',0):.2f}× ATR",
         ]
-        setup = b["long_sig"] or b["short_sig"]
-        if setup:
-            lines += [
-                f"Entry: {fmt_price(setup['entry'])}",
-                f"SL: {fmt_price(setup['sl'])}",
-                f"TP1: {fmt_price(setup['tp1'])}",
-                f"TP2: {fmt_price(setup['tp2'])}",
-                f"TP3: {fmt_price(setup['tp3'])}",
-            ]
-        lines.append("")
-
-    if len(blocks) >= 2:
-        b1, b2 = blocks[0], blocks[1]
-        if b1["bias"] == b2["bias"] and b1["bias"] in ("LONG", "SHORT"):
-            lines += [f"🎯 HTF ALIGNMENT: {b1['bias']} — {b1['timeframe']} + {b2['timeframe']} agree."]
-        else:
-            lines += ["⚠️ HTF ALIGNMENT: Mixed — wait for the timeframes to agree before treating it as a directional setup."]
+    else:
+        lines += ["", "ℹ️ هیچ Momentum setup ـێکی تەواو لە ئێستادا نییە."]
     return "\n".join(lines)
-
 
 def _setup_metrics(sig):
     """Transparent Momentum Engine metrics; quality is a rule count, not probability."""
@@ -1341,7 +1255,7 @@ def _record_history(state, outcome, level=None):
         "outcome": outcome,
         "level": level,
         "source": state.get("source", "scanner"),
-        "timeframe": state.get("timeframe", "5m"),
+        "timeframe": state.get("timeframe", "15m"),
     }
     with state_lock:
         signal_history.append(item)
@@ -1505,10 +1419,10 @@ def _get_historical_klines(symbol, timeframe, days=30):
     Bitget's historical-candle endpoint returns up to 200 rows per request, so
     we walk backward from now. The exact available history depends on timeframe.
     """
-    granularity = {"5m":"5m","15m":"15m","1h":"1H","4h":"4H"}.get(str(timeframe).lower())
+    granularity = {"15m":"15m"}.get(str(timeframe).lower())
     if not granularity:
         raise ValueError("unsupported timeframe")
-    candle_ms = {"5m":300000,"15m":900000,"1h":3600000,"4h":14400000}[str(timeframe).lower()]
+    candle_ms = {"15m":900000}[str(timeframe).lower()]
     now_ms = int(time.time()*1000)
     start_ms = now_ms - int(days*86400000)
     cursor_end = now_ms
@@ -1614,8 +1528,8 @@ def _backtest_text(parts):
     if len(parts) not in (2,3,4):
         return ("🧪 BACKTEST\n\n"
                 "نموونە: /backtest BTC 15m 30\n"
-                "Timeframe: 5m, 15m, 1h, 4h\n"
-                "Days: 7–52 (15m supports up to the available Bitget history).")
+                "Timeframe: 15m only\n"
+                "Days: 7–52 · Strategy timeframe: 15m only.")
     symbol=_normalize_analysis_symbol(parts[1])
     tf=_normalize_analysis_timeframe(parts[2]) if len(parts)>=3 else SIGNAL_TIMEFRAME
     try:
@@ -1824,7 +1738,7 @@ def status_text():
         f"Smart Watch: {'ON' if watch_on else 'OFF'} ({watched}/{MAX_WATCH_ITEMS})\n"
         "Market: Bitget USDT Perpetual Futures\n"
         "Strategy: SAIWAN Momentum Engine — Breakout + Pullback + Volume + ATR\n"
-        "Analysis: 5m / 15m / 1h / 4h\n"
+        "Analysis: 15m only\n"
         f"Pending signals: {pending}\n"
         f"Tracked signals: {tracked}\n"
         f"History: {hist}\n"
@@ -1964,7 +1878,7 @@ def track_sent_signal(sig, chat_id, message_id, source="scanner"):
             "tp1": sig["tp1"],
             "tp2": sig["tp2"],
             "tp3": sig["tp3"],
-            "timeframe": sig.get("timeframe", "5m"),
+            "timeframe": sig.get("timeframe", "15m"),
             "source": source,
             "tp1_hit": False,
             "tp2_hit": False,
@@ -2010,7 +1924,7 @@ def monitor_active_signals():
                         reply_to_message_id=state["message_id"],
                     )
                     _record_history(state, "SL", "SL")
-                    _record_alert("SL", symbol=state["symbol"], timeframe=state.get("timeframe", "5m"), direction=state["direction"])
+                    _record_alert("SL", symbol=state["symbol"], timeframe=state.get("timeframe", "15m"), direction=state["direction"])
                     with state_lock:
                         active_signals.pop(state["key"], None)
                     continue
@@ -2028,11 +1942,11 @@ def monitor_active_signals():
                         )
                         if name == "tp3":
                             _record_history(state, "TP3", "TP3")
-                            _record_alert("TP3", symbol=state["symbol"], timeframe=state.get("timeframe", "5m"), direction=state["direction"])
+                            _record_alert("TP3", symbol=state["symbol"], timeframe=state.get("timeframe", "15m"), direction=state["direction"])
                         else:
                             # TP1/TP2 are milestones, not closed trades. Keep them in alerts,
                             # while /history remains a terminal-outcome history.
-                            _record_alert(name.upper(), symbol=state["symbol"], timeframe=state.get("timeframe", "5m"), direction=state["direction"])
+                            _record_alert(name.upper(), symbol=state["symbol"], timeframe=state.get("timeframe", "15m"), direction=state["direction"])
                         with state_lock:
                             if state["key"] in active_signals:
                                 active_signals[state["key"]][hit_key] = True
@@ -2124,7 +2038,7 @@ def poll_updates():
                             "/unwatch BTC - Remove watch\n"
                             "/watchlist - Watched coins\n"
                             "/alerts - Recent alerts\n"
-                            "/analysis BTC 5m - One timeframe only\n"
+                            "/analysis BTC 15m - 15m analysis only\n"
                             "/risk BTC 1000 1 - Risk amount\n"
                             "/risk BTC 1000 1 105000 103800 - Position size\n"
                             "/history - Closed signal history\n"
@@ -2153,7 +2067,7 @@ def poll_updates():
                         else:
                             symbol = _normalize_analysis_symbol(parts[1]); tf = _normalize_analysis_timeframe(parts[2])
                             if not symbol or not tf:
-                                send_message(active_chat_id, "❌ Coin یان timeframe هەڵەیە. Timeframe: 5m, 15m, 1h, 4h")
+                                send_message(active_chat_id, "❌ Coin یان timeframe هەڵەیە. Timeframe: 15m only")
                             else:
                                 with watch_lock:
                                     if symbol not in watchlist and len(watchlist) >= MAX_WATCH_ITEMS:
@@ -2185,11 +2099,11 @@ def poll_updates():
                         send_message(active_chat_id, _alerts_text())
                     elif cmd == "/analysis":
                         if len(parts) != 3:
-                            send_message(active_chat_id, "🔎 نموونە:\n/analysis BTC 5m\n/analysis AVAX 15m\n/analysis ETH 1h\n/analysis BTC 4h")
+                            send_message(active_chat_id, "🔎 نموونە:\n/analysis BTC 15m\n/analysis AVAX 15m")
                         else:
                             symbol = _normalize_analysis_symbol(parts[1]); tf = _normalize_analysis_timeframe(parts[2])
                             if not tf:
-                                send_message(active_chat_id, "❌ Timeframe ـی دروست: 5m, 15m, 1h, 4h")
+                                send_message(active_chat_id, "❌ Timeframe ـی بۆتەکە تەنها 15m ـە. نموونە: /analysis BTC 15m")
                             else:
                                 send_message(active_chat_id, f"🔎 خەریکم {symbol} شیکاری دەکەم...\n⏱ {tf.upper()}")
                                 send_message(active_chat_id, analysis_report(symbol, [tf]))
