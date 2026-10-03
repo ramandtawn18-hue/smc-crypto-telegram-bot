@@ -27,6 +27,7 @@ MAX_PAIRS = 0
 SCAN_WORKERS = 6
 SCAN_INTERVAL = 60
 SEND_INTERVAL = 600  # minimum 10 minutes between sent signals
+SIGNAL_TIMEFRAME = TF_15M
 CHART_CANDLES = 70
 HTTP_TIMEOUT = 15
 MIN_SCORE = 5
@@ -39,6 +40,21 @@ MIN_SUGGESTED_LEVERAGE = 2
 TP1_R = 1.5
 TP2_R = 2.5
 TP3_R = 4.0
+
+# SAIWAN Momentum Engine — tuned as a starting point for backtesting.
+MOM_RANGE_LOOKBACK = 20
+MOM_BREAKOUT_WINDOW = 12
+MOM_MAX_PULLBACK_BARS = 8
+MOM_MIN_VOLUME_MULT = 1.30
+MOM_TRIGGER_VOLUME_MULT = 1.05
+MOM_MIN_BODY_RATIO = 0.55
+MOM_MIN_BREAKOUT_ATR = 0.10
+MOM_MAX_EXTENSION_ATR = 1.20
+MOM_PULLBACK_ATR = 0.20
+MOM_SL_ATR_BUFFER = 0.25
+MOM_EMA_FAST = 9
+MOM_EMA_MID = 21
+MOM_EMA_SLOW = 50
 
 app = Flask(__name__)
 stop_event = threading.Event()
@@ -550,302 +566,322 @@ def _context_15m(rows15, direction):
     return ("BULLISH CONTEXT" if rows15[-1]["close"] >= mid else "MIXED CONTEXT") if direction == "LONG" else ("BEARISH CONTEXT" if rows15[-1]["close"] <= mid else "MIXED CONTEXT")
 
 
-def _move_setup(rows, direction):
-    """Early move hunter: sweep -> MSS/CHOCH -> FVG + OB. No retest wait."""
-    if len(rows) < 120:
+def _rolling_mean(values, period):
+    if not values:
+        return 0.0
+    return sum(values[-period:]) / min(period, len(values))
+
+
+def _atr_at(rows, index, period=14):
+    if index < period + 1:
         return None
-    candidates = _sweep_candidates(rows)
-    for direction0, sweep_idx, liquidity in reversed(candidates):
-        if direction0 != direction or sweep_idx >= len(rows) - 1:
+    chunk = rows[:index + 1]
+    return atr(chunk, period)
+
+
+def _ema_alignment(rows, direction):
+    closes = [r["close"] for r in rows]
+    if len(closes) < MOM_EMA_SLOW + 2:
+        return False, None
+    e9 = ema(closes, MOM_EMA_FAST)[-1]
+    e21 = ema(closes, MOM_EMA_MID)[-1]
+    e50 = ema(closes, MOM_EMA_SLOW)[-1]
+    cur = closes[-1]
+    if direction == "LONG":
+        return cur > e9 > e21 > e50, (e9, e21, e50)
+    return cur < e9 < e21 < e50, (e9, e21, e50)
+
+
+def _momentum_setup(rows, direction, sl_atr_buffer=MOM_SL_ATR_BUFFER,
+                    tp_multipliers=(TP1_R, TP2_R, TP3_R)):
+    """SAIWAN Momentum Engine: breakout/breakdown -> controlled pullback -> continuation.
+
+    Only closed candles in ``rows`` are used. The current last candle is the
+    confirmed trigger. Signals are rejected when price is already too extended,
+    so the engine does not chase a long move after several large candles.
+    """
+    if len(rows) < max(90, MOM_EMA_SLOW + MOM_RANGE_LOOKBACK + 10):
+        return None
+
+    cur_i = len(rows) - 1
+    cur = rows[cur_i]
+    atr_now = _atr_at(rows, cur_i, 14)
+    if not atr_now or atr_now <= 0:
+        return None
+    aligned, emas = _ema_alignment(rows, direction)
+    if not aligned:
+        return None
+
+    closes = [r["close"] for r in rows]
+    vols = [r.get("vol", 0.0) for r in rows]
+    avg_vol = _rolling_mean(vols[:-1], 20)
+    if avg_vol <= 0:
+        return None
+
+    # Search recent confirmed breakout/breakdown candles, newest first.
+    first = max(MOM_RANGE_LOOKBACK, cur_i - MOM_BREAKOUT_WINDOW)
+    candidates = []
+    for b in range(cur_i, first - 1, -1):
+        if b < MOM_RANGE_LOOKBACK:
             continue
-        structure = _structure_break(rows, direction, sweep_idx, len(rows) - 1)
-        if not structure:
+        atr_b = _atr_at(rows, b, 14)
+        if not atr_b or atr_b <= 0:
             continue
-        mss_idx = structure["index"]
-        # FVG is allowed on the MSS candle or within the next few closed candles.
-        fvg = _find_fvg(rows, direction, max(2, mss_idx - 1), min(len(rows), mss_idx + 5))
-        if not fvg:
+        base = rows[b - MOM_RANGE_LOOKBACK:b]
+        range_high = max(r["high"] for r in base)
+        range_low = min(r["low"] for r in base)
+        rb = rows[b]
+        body_ratio = _body_ratio(rb)
+        prior_avg_vol = _rolling_mean(vols[max(0, b-20):b], 20)
+        if prior_avg_vol <= 0:
             continue
-        ob = _find_order_block(rows, direction, fvg["index"] + 1)
-        if not ob:
-            continue
-        zone = _overlap(fvg, ob) or fvg
-        trigger_idx = max(mss_idx, fvg["index"])
-        if len(rows) - 1 - trigger_idx > 4:
-            continue
-        trigger = rows[trigger_idx]
-        if direction == "LONG" and not _candle_bull(trigger):
-            continue
-        if direction == "SHORT" and not _candle_bear(trigger):
-            continue
-        cur = rows[-1]
-        if direction == "LONG" and cur["close"] <= structure["level"]:
-            continue
-        if direction == "SHORT" and cur["close"] >= structure["level"]:
+        vol_mult = rb.get("vol", 0.0) / prior_avg_vol
+        body = abs(rb["close"] - rb["open"])
+        if direction == "LONG":
+            breakout_ok = rb["close"] > range_high and rb["close"] - range_high >= MOM_MIN_BREAKOUT_ATR * atr_b
+            candle_ok = _candle_bull(rb)
+        else:
+            breakout_ok = rb["close"] < range_low and range_low - rb["close"] >= MOM_MIN_BREAKOUT_ATR * atr_b
+            candle_ok = _candle_bear(rb)
+        if breakout_ok and candle_ok and body / max(atr_b, 1e-12) >= 0.25 and body_ratio >= MOM_MIN_BODY_RATIO and vol_mult >= MOM_MIN_VOLUME_MULT:
+            candidates.append((b, range_high, range_low, atr_b, vol_mult))
+
+    if not candidates:
+        return None
+
+    # Prefer the latest valid breakout, then decide whether we have a direct
+    # early entry or a controlled pullback/continuation entry.
+    for b, range_high, range_low, atr_b, breakout_vol in candidates:
+        age = cur_i - b
+        if age > MOM_MAX_PULLBACK_BARS:
             continue
 
-        entry = cur["close"]
-        if direction == "LONG":
-            sl = min(liquidity, ob["low"]) * 0.9995
-            if sl >= entry: continue
-            risk = entry - sl
-            highs, _ = swing_points(rows[:-1], 2, 2)
-            targets = sorted({p for _, p in highs if p > entry})
-            tp1 = max(targets[0] if targets else entry + risk*1.5, entry + risk*1.5)
-            tp2 = max(targets[1] if len(targets)>1 else entry + risk*2.5, tp1 + risk*.5)
-            tp3 = max(targets[2] if len(targets)>2 else entry + risk*4.0, tp2 + risk*.5)
+        # Direct breakout entry is allowed only on the breakout candle itself.
+        if age == 0:
+            trigger = cur
+            extension = abs(trigger["close"] - (range_high if direction == "LONG" else range_low)) / atr_now
+            if extension > MOM_MAX_EXTENSION_ATR:
+                continue
+            entry = trigger["close"]
+            swing_low = min(r["low"] for r in rows[max(0, b-3):b+1])
+            swing_high = max(r["high"] for r in rows[max(0, b-3):b+1])
+            pullback_idx = None
+            pattern = "EXPLOSIVE BREAKOUT" if body_ratio >= 0.65 and breakout_vol >= 1.7 else "BREAKOUT MOMENTUM"
         else:
-            sl = max(liquidity, ob["high"]) * 1.0005
-            if sl <= entry: continue
+            post = rows[b+1:cur_i+1]
+            if not post:
+                continue
+            # Pullback must actually retrace part of the impulse, but not destroy
+            # the breakout level. This is the anti-chase gate.
+            if direction == "LONG":
+                pull_low = min(r["low"] for r in post)
+                pullback_depth = max(0.0, range_high - pull_low)
+                if pull_low < range_high - 0.35 * atr_b:
+                    # Too deep: breakout has likely failed.
+                    continue
+                if pullback_depth < MOM_PULLBACK_ATR * atr_b:
+                    # No meaningful reset; avoid buying the top of a straight move.
+                    continue
+                continuation_level = max(r["high"] for r in rows[b:cur_i])
+                trigger_ok = cur["close"] > continuation_level and _candle_bull(cur)
+                swing_low = pull_low
+                swing_high = max(r["high"] for r in rows[b:cur_i+1])
+            else:
+                pull_high = max(r["high"] for r in post)
+                pullback_depth = max(0.0, pull_high - range_low)
+                if pull_high > range_low + 0.35 * atr_b:
+                    continue
+                if pullback_depth < MOM_PULLBACK_ATR * atr_b:
+                    continue
+                continuation_level = min(r["low"] for r in rows[b:cur_i])
+                trigger_ok = cur["close"] < continuation_level and _candle_bear(cur)
+                swing_high = pull_high
+                swing_low = min(r["low"] for r in rows[b:cur_i+1])
+            cur_vol = cur.get("vol", 0.0)
+            cur_vol_mult = cur_vol / max(avg_vol, 1e-12)
+            if not trigger_ok or cur_vol_mult < MOM_TRIGGER_VOLUME_MULT or _body_ratio(cur) < MOM_MIN_BODY_RATIO:
+                continue
+            extension = abs(cur["close"] - (range_high if direction == "LONG" else range_low)) / atr_now
+            if extension > MOM_MAX_EXTENSION_ATR:
+                continue
+            entry = cur["close"]
+            pullback_idx = cur_i
+            pattern = "MOMENTUM CONTINUATION"
+
+        if direction == "LONG":
+            sl = swing_low - sl_atr_buffer * atr_now
+            if sl >= entry:
+                continue
+            risk = entry - sl
+            t1, t2, t3 = [entry + risk * float(x) for x in tp_multipliers]
+        else:
+            sl = swing_high + sl_atr_buffer * atr_now
+            if sl <= entry:
+                continue
             risk = sl - entry
-            _, lows = swing_points(rows[:-1], 2, 2)
-            targets = sorted({p for _, p in lows if p < entry}, reverse=True)
-            tp1 = min(targets[0] if targets else entry - risk*1.5, entry - risk*1.5)
-            tp2 = min(targets[1] if len(targets)>1 else entry - risk*2.5, tp1 - risk*.5)
-            tp3 = min(targets[2] if len(targets)>2 else entry - risk*4.0, tp2 - risk*.5)
+            t1, t2, t3 = [entry - risk * float(x) for x in tp_multipliers]
+
+        if risk <= 0 or risk > entry * 0.12:
+            continue
+        cur_vol_mult = cur.get("vol", 0.0) / max(avg_vol, 1e-12)
+        score = 0
+        score += 1 if breakout_vol >= 1.30 else 0
+        score += 1 if cur_vol_mult >= 1.10 else 0
+        score += 1 if body_ratio >= 0.60 else 0
+        score += 1 if atr_now >= atr_b * 0.85 else 0
+        score += 1 if age <= 4 else 0
 
         return {
             "symbol": "", "direction": direction,
-            "structure": "Liquidity Sweep + MSS + CHOCH + FVG + OB",
-            "entry": entry, "trigger_level": structure["level"], "sl": sl,
-            "tp1": tp1, "tp2": tp2, "tp3": tp3,
-            "entry_zone_low": zone["low"], "entry_zone_high": zone["high"],
-            "score": 5, "max_score": 5, "time": cur["time"],
-            "liquidity": liquidity, "sweep_index": sweep_idx,
-            "mss_index": mss_idx, "mss_level": structure["level"],
-            "fvg": fvg, "ob": ob, "entry_zone": zone,
-            "rows": rows[max(0, sweep_idx-18):], "full_len": len(rows),
-            "checks": {"Liquidity Sweep": True, "MSS": True, "FVG": True, "OB": True, "CHOCH": True},
-            "retest_ok": False, "rejection_ok": True, "early_entry": True,
+            "structure": pattern,
+            "pattern": pattern,
+            "entry": entry, "trigger_level": range_high if direction == "LONG" else range_low,
+            "sl": sl, "tp1": t1, "tp2": t2, "tp3": t3,
+            "score": score, "max_score": 5, "time": cur["time"],
+            "breakout_index": b, "pullback_index": pullback_idx,
+            "range_high": range_high, "range_low": range_low,
+            "breakout_atr": atr_b, "atr": atr_now,
+            "breakout_volume_mult": breakout_vol, "volume_mult": cur_vol_mult,
+            "ema9": emas[0], "ema21": emas[1], "ema50": emas[2],
+            "extension_atr": extension, "rows": rows[max(0, b-25):], "full_len": len(rows),
+            "checks": {"Range": True, "Breakout": True, "Volume": breakout_vol >= MOM_MIN_VOLUME_MULT,
+                       "Trend": True, "Pullback": age > 0, "Continuation": age > 0},
+            "retest_ok": age > 0, "rejection_ok": True, "early_entry": age <= 4,
+            "fvg": {"low": min(range_low, entry), "high": max(range_high, entry), "index": b},
+            "ob": {"low": swing_low, "high": swing_high, "index": pullback_idx if pullback_idx is not None else b},
+            "entry_zone": {"low": min(range_low, range_high), "high": max(range_low, range_high)},
+            "entry_zone_low": min(range_low, range_high), "entry_zone_high": max(range_low, range_high),
         }
     return None
 
 
+def _move_setup(rows, direction):
+    """Compatibility wrapper: all scanner/watch signals now use Momentum Engine."""
+    return _momentum_setup(rows, direction)
+
+
 def analyze(symbol, rows5, rows15=None):
-    """SAIWAN Move Hunter: 5m entry hunting with 15m context, price action only."""
-    if len(rows5) < 120:
+    """SAIWAN Momentum Engine: 15m primary signal timeframe, closed candles only."""
+    rows = rows15 if rows15 and len(rows15) >= 90 else rows5
+    if not rows or len(rows) < 90:
         return None
-    for r in rows5: r["symbol"] = symbol
+    for r in rows:
+        r["symbol"] = symbol
     candidates = []
     for direction in ("LONG", "SHORT"):
-        sig = _move_setup(rows5, direction)
+        sig = _momentum_setup(rows, direction)
         if sig:
             sig["symbol"] = symbol
-            sig["context15"] = _context_15m(rows15, direction)
-            sig["timeframe"] = "5m Entry · 15m Context"
+            sig["timeframe"] = SIGNAL_TIMEFRAME if rows is rows15 else TF_5M
             candidates.append(sig)
     return max(candidates, key=lambda x: x["time"]) if candidates else None
 
 def make_chart(sig):
-    """Render a clean dark TradingView-style ICT/SMC setup chart."""
-    rows = sig["rows"]
+    """Render a dark TradingView-style Momentum Engine setup chart."""
+    rows = sig["rows"][-CHART_CANDLES:]
     n = len(rows)
     direction = sig["direction"]
     entry, sl = sig["entry"], sig["sl"]
     tp1, tp2, tp3 = sig["tp1"], sig["tp2"], sig["tp3"]
-
-    # Dark TradingView-style palette.
-    BG = "#07101d"
-    PANEL = "#0b1626"
-    GRID = "#1a293b"
-    TEXT = "#e7eef7"
-    MUTED = "#7f93a8"
-    UP = "#12d6a0"
-    DOWN = "#ff3d57"
-    GOLD = "#ffd21f"
-    BLUE = "#4f7cff"
-    PURPLE = "#7c5cff"
-    PINK = "#ff4f87"
-    CYAN = "#31d7ff"
+    BG, PANEL, GRID = "#07101d", "#0b1626", "#1a293b"
+    TEXT, MUTED = "#e7eef7", "#7f93a8"
+    UP, DOWN = "#12d6a0", "#ff3d57"
+    GOLD, BLUE, CYAN = "#ffd21f", "#4f7cff", "#31d7ff"
 
     fig, ax = plt.subplots(figsize=(14.4, 7.8), dpi=170, facecolor=BG)
     ax.set_facecolor(BG)
-
-    width = 0.62
+    width = .62
     for i, r in enumerate(rows):
         c = UP if r["close"] >= r["open"] else DOWN
-        ax.vlines(i, r["low"], r["high"], color=c, linewidth=1.15, zorder=5)
+        ax.vlines(i, r["low"], r["high"], color=c, linewidth=1.1, zorder=4)
         lo = min(r["open"], r["close"])
-        bh = max(abs(r["close"] - r["open"]), abs(r["close"]) * 1e-5)
-        ax.add_patch(Rectangle(
-            (i - width / 2, lo), width, bh,
-            facecolor=c, edgecolor=c, linewidth=.65, zorder=6
-        ))
+        bh = max(abs(r["close"]-r["open"]), abs(r["close"])*1e-5)
+        ax.add_patch(Rectangle((i-width/2, lo), width, bh, facecolor=c, edgecolor=c, linewidth=.6, zorder=5))
 
-    right = n + 13
-    fvg = sig["fvg"]
-    ob = sig["ob"]
-    zone = sig["entry_zone"]
-    offset = sig.get("full_len", n) - n
+    closes = [r["close"] for r in rows]
+    e9, e21, e50 = ema(closes,9), ema(closes,21), ema(closes,50)
+    ax.plot(range(n), e9, color=CYAN, linewidth=1.15, alpha=.9, label="EMA9")
+    ax.plot(range(n), e21, color=BLUE, linewidth=1.25, alpha=.95, label="EMA21")
+    ax.plot(range(n), e50, color=GOLD, linewidth=1.2, alpha=.9, label="EMA50")
 
-    def local_idx(z):
-        if not isinstance(z, dict) or "index" not in z:
-            return max(0, n - 1)
-        return int(z.get("index", 0)) - offset
+    full_offset = sig.get("full_len", n) - len(sig.get("rows", rows))
+    def local_index(full_i):
+        idx = int(full_i) - full_offset
+        # sig rows may have been clipped again for charting.
+        return max(0, min(n-1, idx - (len(sig.get("rows", rows)) - n)))
 
-    def zone_box(z, color, alpha, label, text_color=None):
-        idx = local_idx(z)
-        x0 = max(0, min(n - 1, idx - max(4, n // 12)))
-        low, high = float(z["low"]), float(z["high"])
-        if high < low:
-            low, high = high, low
-        ax.add_patch(Rectangle(
-            (x0, low), right - x0, max(high - low, 1e-9),
-            facecolor=color, edgecolor=color, alpha=alpha,
-            linewidth=1.1, zorder=1
-        ))
-        tc = text_color or color
-        ax.text(
-            x0 + (right - x0) * .58, high - (high - low) * .22,
-            label, color=tc, fontsize=9.2, fontweight="bold",
-            ha="center", va="center", zorder=8,
-            bbox=dict(boxstyle="round,pad=.28", facecolor=BG,
-                      edgecolor=tc, linewidth=.8, alpha=.88)
-        )
-        return x0
+    bidx = local_index(sig.get("breakout_index", max(0, n-1)))
+    pidx = sig.get("pullback_index")
+    if pidx is not None:
+        pidx = local_index(pidx)
 
-    # Order Block and FVG zones.
-    zone_box(ob, PINK, .18, "SUPPLY / ORDER BLOCK", PINK)
-    zone_box(fvg, PURPLE, .17, "FVG", "#a995ff")
+    rh, rl = sig.get("range_high"), sig.get("range_low")
+    if rh is not None and rl is not None:
+        x0 = max(0, bidx - 20)
+        ax.add_patch(Rectangle((x0, rl), max(1, bidx-x0), rh-rl,
+                               facecolor=GOLD, edgecolor=GOLD, alpha=.10, linewidth=1.0, zorder=1))
+        ax.text(x0+1, rh, "BASE / RANGE", color=GOLD, fontsize=8.5, fontweight="bold", va="bottom")
+        ax.axhline(rh if direction == "LONG" else rl, color=CYAN, linestyle="--", linewidth=1.1, alpha=.85)
+        ax.text(bidx, rh if direction == "LONG" else rl,
+                "BREAKOUT" if direction == "LONG" else "BREAKDOWN",
+                color=CYAN, fontsize=8.5, fontweight="bold", va="bottom" if direction == "LONG" else "top")
 
-    # Entry zone is subtle so it does not overpower the actual FVG/OB.
-    ez_idx = local_idx(fvg)
-    ez_x = max(0, min(n - 1, ez_idx - 2))
-    ez_low, ez_high = float(zone["low"]), float(zone["high"])
-    ax.add_patch(Rectangle(
-        (ez_x, ez_low), right - ez_x, max(ez_high - ez_low, 1e-9),
-        facecolor=BLUE, edgecolor=BLUE, alpha=.055, linewidth=.8, zorder=0
-    ))
+    if pidx is not None and pidx >= 0 and pidx < n:
+        ax.scatter([pidx], [rows[pidx]["close"]], s=48, facecolors="none", edgecolors=GOLD, linewidth=1.3, zorder=9)
+        ax.text(pidx, rows[pidx]["close"], " PULLBACK", color=GOLD, fontsize=8.5, fontweight="bold", va="bottom")
 
-    # Convert setup indices into visible chart indices.
-    sweep_local = int(sig.get("sweep_index", n - 1)) - offset
-    mss_local = int(sig.get("mss_index", n - 1)) - offset
-    sweep_price = float(sig["liquidity"])
+    ax.axhline(entry, color=BLUE, linestyle="--", linewidth=1.2)
+    ax.axhline(sl, color=DOWN, linewidth=1.15)
+    for y, lab in ((tp1,"TP1"),(tp2,"TP2"),(tp3,"TP3")):
+        ax.axhline(y, color=UP, linestyle="--", linewidth=.95, alpha=.85)
+        ax.text(n+1, y, f"{lab} {fmt_price(y)}", color=UP, fontsize=8, fontweight="bold", va="center")
+    ax.text(n+1, entry, f"ENTRY {fmt_price(entry)}", color=BLUE, fontsize=8, fontweight="bold", va="center")
+    ax.text(n+1, sl, f"SL {fmt_price(sl)}", color=DOWN, fontsize=8, fontweight="bold", va="center")
 
-    # Liquidity sweep: strong yellow callout above the sweep.
-    if 0 <= sweep_local < n:
-        ax.scatter(
-            [sweep_local], [sweep_price], s=58,
-            marker="v" if direction == "SHORT" else "^",
-            color=GOLD, edgecolor=BG, linewidth=.7, zorder=10
-        )
-        tx = max(2, sweep_local - 12)
-        ty = sweep_price + (max(r["high"] for r in rows) - min(r["low"] for r in rows)) * .07
-        ax.annotate(
-            "Liquidity Sweep", xy=(sweep_local, sweep_price),
-            xytext=(tx, ty), color=GOLD, fontsize=10, fontweight="bold",
-            arrowprops=dict(arrowstyle="->", color=GOLD, lw=1.5), zorder=10
-        )
-
-    # MSS / CHOCH is a clean structural line rather than a large label over candles.
-    if 0 <= mss_local < n:
-        ax.axhline(sig["mss_level"], color=CYAN, linestyle="--",
-                   linewidth=1.0, alpha=.72, zorder=2)
-        ax.annotate(
-            "MSS / CHOCH", xy=(mss_local, sig["mss_level"]),
-            xytext=(max(1, mss_local - 10), sig["mss_level"]),
-            color=CYAN, fontsize=8.8, fontweight="bold",
-            arrowprops=dict(arrowstyle="->", color=CYAN, lw=1.25), zorder=9
-        )
-
-    # Risk/reward levels with right-side pill labels.
-    arrow_color = UP if direction == "LONG" else DOWN
-    ax.axhline(entry, color=BLUE, linewidth=1.15, linestyle="--", alpha=.95, zorder=3)
-    ax.axhline(sl, color=DOWN, linewidth=1.15, alpha=.95, zorder=3)
-    for y, lab in [(tp1, "TP1"), (tp2, "TP2"), (tp3, "TP3")]:
-        ax.axhline(y, color=UP, linewidth=.95, linestyle="--", alpha=.8, zorder=2)
-
-    def right_label(y, label, color):
-        ax.text(
-            right + .25, y, f"{label} {fmt_price(y)}",
-            color=TEXT, fontsize=8.7, fontweight="bold", va="center", ha="left",
-            bbox=dict(boxstyle="round,pad=.34", facecolor=color,
-                      edgecolor=color, linewidth=.8, alpha=.95), zorder=12
-        )
-
-    right_label(sl, "SL", DOWN)
-    right_label(entry, "Entry", BLUE)
-    right_label(tp1, "TP1", "#008f70")
-    right_label(tp2, "TP2", "#008f70")
-    right_label(tp3, "TP3", "#008f70")
-
-    # Entry marker.
-    ax.scatter([n - 1], [entry], s=56, color=arrow_color,
-               edgecolor=TEXT, linewidth=.9, zorder=11)
-
-    # Header.
-    context = sig.get("context15", "")
-    context_text = str(context).upper() if context else ""
-    tf_label = str(sig.get("timeframe", "5m"))
-    ax.text(.018, 1.065, f"{sig['symbol']} · {tf_label}", transform=ax.transAxes,
-            fontsize=16, color=TEXT, fontweight="bold", va="top")
-    ax.text(.018, 1.025, "SAIWAN CRYPTO SIGNAL  ·  BITGET FUTURES",
-            transform=ax.transAxes, fontsize=8.8, color=MUTED,
-            fontweight="bold", va="top")
-    ax.text(.985, 1.055, direction, transform=ax.transAxes,
-            fontsize=12, color=arrow_color, fontweight="bold", ha="right", va="top",
-            bbox=dict(boxstyle="round,pad=.38", facecolor=BG,
-                      edgecolor=arrow_color, linewidth=1.0))
-
-    # Compact trade summary panel, matching the requested sample style.
-    panel_text = (
-        f"{sig['symbol']}  ·  {direction}\n"
-        f"Timeframe: {tf_label}\n\n"
-        f"Entry   :  {fmt_price(entry)}\n"
-        f"SL      :  {fmt_price(sl)}\n"
-        f"TP1     :  {fmt_price(tp1)}\n"
-        f"TP2     :  {fmt_price(tp2)}\n"
-        f"TP3     :  {fmt_price(tp3)}\n"
-        f"{_setup_detail_lines(sig)[0]}\n"
-        f"{_setup_detail_lines(sig)[1]}\n"
-        f"\n✓ Liquidity Sweep\n✓ MSS   ✓ CHOCH\n✓ FVG   ✓ OB"
-    )
-    ax.text(
-        .022, .035, panel_text, transform=ax.transAxes,
-        fontsize=8.8, color=TEXT, va="bottom", ha="left", linespacing=1.45,
-        bbox=dict(boxstyle="round,pad=.72", facecolor=PANEL,
-                  edgecolor="#2a4664", linewidth=1.0, alpha=.97), zorder=20
-    )
-
-    if context_text:
-        ax.text(.50, .018, f"15m Context: {context_text}", transform=ax.transAxes,
-                fontsize=8.5, color=MUTED, ha="center", va="bottom")
-
-    # Axes/grid styling.
+    vol = sig.get("volume_mult", 0.0)
+    atr_v = sig.get("atr", 0.0)
+    extension = sig.get("extension_atr", 0.0)
+    quality = _setup_metrics(sig)
+    dtext = "LONG" if direction == "LONG" else "SHORT"
+    dcolor = UP if direction == "LONG" else DOWN
+    ax.text(.018,1.065,f"{sig.get('symbol','')} · {sig.get('timeframe','15m').upper()}",transform=ax.transAxes,
+            fontsize=16,color=TEXT,fontweight="bold",va="top")
+    ax.text(.018,1.025,"SAIWAN MOMENTUM ENGINE · CLOSED CANDLES",transform=ax.transAxes,
+            fontsize=8.8,color=MUTED,fontweight="bold",va="top")
+    ax.text(.985,1.055,dtext,transform=ax.transAxes,fontsize=12,color=dcolor,fontweight="bold",ha="right",va="top",
+            bbox=dict(boxstyle="round,pad=.38",facecolor=BG,edgecolor=dcolor,linewidth=1.0))
+    panel=(f"Pattern  {sig.get('pattern','MOMENTUM')}\n"
+           f"Entry    {fmt_price(entry)}\nSL       {fmt_price(sl)}\n"
+           f"TP1/2/3  {fmt_price(tp1)} / {fmt_price(tp2)} / {fmt_price(tp3)}\n\n"
+           f"Volume   {vol:.2f}× avg\nATR      {fmt_price(atr_v)}\nExtension {extension:.2f}× ATR\n"
+           f"R:R      {quality['rr1']:.2f} / {quality['rr2']:.2f} / {quality['rr3']:.2f}")
+    ax.text(.022,.035,panel,transform=ax.transAxes,fontsize=8.5,color=TEXT,va="bottom",ha="left",linespacing=1.4,
+            bbox=dict(boxstyle="round,pad=.72",facecolor=PANEL,edgecolor="#2a4664",linewidth=1.0,alpha=.97),zorder=20)
+    ax.legend(loc="upper left",bbox_to_anchor=(.34,1.055),frameon=False,labelcolor=TEXT,fontsize=8.5,ncol=3)
     ax.yaxis.tick_right()
-    ax.tick_params(axis="y", colors="#9bb0c5", labelsize=8.2, length=0, pad=7)
-    ax.tick_params(axis="x", colors="#71879d", labelsize=7.8, length=0, pad=8)
-    ax.grid(axis="y", color=GRID, linewidth=.65, alpha=.8)
-    ax.grid(axis="x", color=GRID, linewidth=.35, alpha=.35)
-    for side in ["top", "left", "bottom"]:
-        ax.spines[side].set_visible(False)
+    ax.tick_params(axis="y",colors="#9bb0c5",labelsize=8.2,length=0,pad=7)
+    ax.tick_params(axis="x",colors="#71879d",labelsize=7.8,length=0,pad=8)
+    ax.grid(axis="y",color=GRID,linewidth=.65,alpha=.8)
+    ax.grid(axis="x",color=GRID,linewidth=.35,alpha=.35)
+    for side in ["top","left","bottom"]: ax.spines[side].set_visible(False)
     ax.spines["right"].set_color("#22364b")
-    ax.spines["right"].set_linewidth(.8)
-
-    step = max(1, n // 7)
-    ticks = list(range(0, n, step))
-    if not ticks or ticks[-1] != n - 1:
-        ticks.append(n - 1)
+    step=max(1,n//7)
+    ticks=list(range(0,n,step))
+    if not ticks or ticks[-1]!=n-1: ticks.append(n-1)
     ax.set_xticks(ticks)
-    ax.set_xticklabels([
-        datetime.fromtimestamp(rows[i]["time"], tz=timezone.utc).strftime("%H:%M")
-        for i in ticks
-    ])
-
-    all_lows = [r["low"] for r in rows] + [sl, tp1, tp2, tp3, ob["low"], fvg["low"]]
-    all_highs = [r["high"] for r in rows] + [sl, tp1, tp2, tp3, ob["high"], fvg["high"]]
-    ymin, ymax = min(all_lows), max(all_highs)
-    span = max(ymax - ymin, abs(rows[-1]["close"]) * .012)
-    ax.set_ylim(ymin - span * .06, ymax + span * .16)
-    ax.set_xlim(-1, right + 5)
-
-    fig.subplots_adjust(left=.025, right=.865, top=.86, bottom=.085)
-    safe = "".join(ch if ch.isalnum() else "_" for ch in sig["symbol"])
-    path = f"/tmp/chart_{safe}_{sig['time']}.png"
-    fig.savefig(path, facecolor=BG, edgecolor="none", bbox_inches="tight", pad_inches=.08)
+    ax.set_xticklabels([datetime.fromtimestamp(rows[i]["time"],tz=timezone.utc).strftime("%d\n%H:%M") for i in ticks])
+    lows=[r["low"] for r in rows]+[sl,tp1,tp2,tp3]
+    highs=[r["high"] for r in rows]+[sl,tp1,tp2,tp3]
+    ymin,ymax=min(lows),max(highs)
+    span=max(ymax-ymin,abs(rows[-1]["close"])*.012)
+    ax.set_ylim(ymin-span*.06,ymax+span*.16)
+    ax.set_xlim(-1,n+12)
+    fig.subplots_adjust(left=.025,right=.865,top=.86,bottom=.085)
+    safe="".join(ch if ch.isalnum() else "_" for ch in sig.get("symbol","SIGNAL"))
+    path=f"/tmp/chart_{safe}_{sig['time']}.png"
+    fig.savefig(path,facecolor=BG,edgecolor="none",bbox_inches="tight",pad_inches=.08)
     plt.close(fig)
     return path
-
 
 
 def make_analysis_chart(symbol, timeframe, rows, block=None):
@@ -891,45 +927,33 @@ def make_analysis_chart(symbol, timeframe, rows, block=None):
     for idx, price in lows[-6:]:
         ax.scatter([idx], [price], s=20, facecolors="none", edgecolors=UP, linewidth=.9, zorder=8)
 
-    # If a complete ICT setup exists, overlay its zones and levels.
+    # If a complete Momentum Engine setup exists, overlay its range and levels.
     if block:
         setup = block.get("long_sig") or block.get("short_sig")
         if setup:
-            direction=setup["direction"]
-            fvg=setup.get("fvg") or {}
-            ob=setup.get("ob") or {}
-            offset=setup.get("full_len", len(rows)) - len(setup.get("rows", rows))
-            setup_rows=setup.get("rows", rows)
-            # Match setup timestamps to visible chart indices where possible.
-            time_to_local={r["time"]:i for i,r in enumerate(rows)}
-            def zone_idx(z):
-                if not z or "index" not in z:
-                    return max(0,n-1)
-                full_i=int(z["index"])
-                setup_i=full_i-offset
-                if setup_rows and 0 <= setup_i < len(setup_rows):
-                    ts=setup_rows[setup_i]["time"]
-                    return time_to_local.get(ts, max(0,n-1))
-                return max(0,min(n-1, full_i))
-            for z,color,label,alpha in ((ob,PINK,"ORDER BLOCK",.18),(fvg,PURPLE,"FVG",.18)):
-                if z and "low" in z and "high" in z:
-                    x0=max(0,min(n-1,zone_idx(z)-8))
-                    ax.add_patch(Rectangle((x0,z["low"]),n-x0,z["high"]-z["low"],
-                                           facecolor=color,edgecolor=color,alpha=alpha,linewidth=1.0,zorder=1))
-                    ax.text(x0+1,z["high"],label,color=color,fontsize=8.5,fontweight="bold",va="bottom",zorder=9)
+            direction = setup["direction"]
+            rh, rl = setup.get("range_high"), setup.get("range_low")
+            time_to_local = {r["time"]: i for i, r in enumerate(rows)}
+            setup_rows = setup.get("rows", rows)
+            if rh is not None and rl is not None:
+                x = max(0, len(rows)-min(20, len(rows)-1))
+                ax.add_patch(Rectangle((x, rl), len(rows)-1-x, rh-rl,
+                                       facecolor=GOLD, edgecolor=GOLD, alpha=.10, linewidth=1.0, zorder=1))
+                ax.axhline(rh if direction == "LONG" else rl, color=CYAN, linestyle="--", linewidth=1.0, alpha=.85)
+                ax.text(x+1, rh if direction == "LONG" else rl,
+                        "BREAKOUT" if direction == "LONG" else "BREAKDOWN",
+                        color=CYAN, fontsize=8, fontweight="bold", va="bottom" if direction == "LONG" else "top")
             if "entry" in setup:
-                entry,sl=setup["entry"],setup["sl"]
+                entry, sl = setup["entry"], setup["sl"]
                 ax.axhline(entry,color=BLUE,linestyle="--",linewidth=1.15,zorder=3)
                 ax.axhline(sl,color=DOWN,linewidth=1.1,zorder=3)
                 for y,lab in ((setup["tp1"],"TP1"),(setup["tp2"],"TP2"),(setup["tp3"],"TP3")):
                     ax.axhline(y,color=UP,linestyle="--",linewidth=.9,alpha=.8,zorder=2)
-                    ax.text(n+1,y,f"{lab} {fmt_price(y)}",color=UP,fontsize=8,fontweight="bold",va="center")
-                ax.text(n+1,entry,f"ENTRY {fmt_price(entry)}",color=BLUE,fontsize=8,fontweight="bold",va="center")
-                ax.text(n+1,sl,f"SL {fmt_price(sl)}",color=DOWN,fontsize=8,fontweight="bold",va="center")
-                if "liquidity" in setup:
-                    ax.axhline(setup["liquidity"],color=GOLD,linestyle=":",linewidth=1.0,alpha=.9,zorder=2)
-                if "mss_level" in setup:
-                    ax.axhline(setup["mss_level"],color=CYAN,linestyle="--",linewidth=1.0,alpha=.7,zorder=2)
+                    ax.text(len(rows)+1,y,f"{lab} {fmt_price(y)}",color=UP,fontsize=8,fontweight="bold",va="center")
+                ax.text(len(rows)+1,entry,f"ENTRY {fmt_price(entry)}",color=BLUE,fontsize=8,fontweight="bold",va="center")
+                ax.text(len(rows)+1,sl,f"SL {fmt_price(sl)}",color=DOWN,fontsize=8,fontweight="bold",va="center")
+                ax.text(.72,.95,setup.get("pattern","MOMENTUM"),transform=ax.transAxes,
+                        color=UP if direction=="LONG" else DOWN,fontsize=9,fontweight="bold",ha="left",va="top")
 
     cur=rows[-1]["close"]
     e20v=e20[-1]; e50v=e50[-1]
@@ -993,29 +1017,20 @@ def make_analysis_charts(raw_symbol, requested_timeframes=None):
     symbol=_normalize_analysis_symbol(raw_symbol)
     tfs=list(requested_timeframes or [])
     if not tfs:
-        tfs=["5m","15m"]
+        tfs=[SIGNAL_TIMEFRAME]
     paths=[]
     for tf in tfs:
         rows=_analysis_tf_data(symbol,tf)
         block=None
-        if tf in ("1h","4h"):
-            try:
-                block=_format_htf_block(symbol,tf)
-            except Exception:
-                block=None
-        elif tf=="5m":
-            try:
-                rows15=_analysis_tf_data(symbol,"15m")
-                cur=rows[-1]["close"]
-                e20=ema([r["close"] for r in rows],20)[-1]
-                e50=ema([r["close"] for r in rows],50)[-1]
-                long_sig=_move_setup(rows,"LONG")
-                short_sig=_move_setup(rows,"SHORT")
-                block={"long_sig":long_sig,"short_sig":short_sig}
-            except Exception:
-                block=None
+        try:
+            long_sig=_momentum_setup(rows,"LONG")
+            short_sig=_momentum_setup(rows,"SHORT")
+            block={"long_sig":long_sig,"short_sig":short_sig}
+        except Exception:
+            block=None
         paths.append(make_analysis_chart(symbol,tf,rows,block))
     return paths
+
 
 def telegram_url(method):
     if not TOKEN:
@@ -1096,9 +1111,9 @@ def _timeframe_bias(rows):
 
 
 def _timeframe_setup(rows, direction):
-    """Run the existing price-action setup model on any supported timeframe."""
+    """Run the Momentum Engine on any supported timeframe."""
     try:
-        return _move_setup(rows, direction)
+        return _momentum_setup(rows, direction)
     except Exception:
         return None
 
@@ -1116,7 +1131,7 @@ def _format_htf_block(symbol, timeframe):
     elif long_sig and short_sig:
         setup = "🟡 BOTH directions have setup conditions"
     else:
-        setup = "⚪ No complete ICT setup"
+        setup = "⚪ No complete Momentum setup"
 
     return {
         "timeframe": timeframe,
@@ -1155,7 +1170,7 @@ def analysis_report(raw_symbol, requested_timeframes=None):
       /analysis BTC 4h
 
     The requested timeframe is analyzed directly with closed candles, EMA bias,
-    price-action/ICT setup checks, and a matching chart. No trade is placed.
+    momentum breakout/pullback checks, and a matching chart. No trade is placed.
     """
     symbol = _normalize_analysis_symbol(raw_symbol)
     if not symbol or len(symbol) < 6:
@@ -1168,7 +1183,7 @@ def analysis_report(raw_symbol, requested_timeframes=None):
             requested.append(tf)
     requested = requested[:3]
 
-    # Default mode keeps the current behavior exactly: 5m entry + 15m context.
+    # No timeframe means legacy fallback mode; normal /analysis requires one timeframe.
     if not requested:
         rows5 = get_klines(symbol, TF_5M, CANDLE_LIMIT)
         rows15 = get_klines(symbol, TF_15M, 180)
@@ -1216,7 +1231,7 @@ def analysis_report(raw_symbol, requested_timeframes=None):
         lines = [
             f"🔎 SAIWAN ANALYSIS — {symbol}", "", verdict,
             f"💵 Price: {fmt_price(cur)}",
-            "⏱ Timeframe: 5m + 15m context", "",
+            "⏱ Timeframe: 15m Momentum Engine", "",
             f"5m EMA20: {fmt_price(e20_5)} | EMA50: {fmt_price(e50_5)}",
             f"15m EMA20: {fmt_price(e20_15)} | EMA50: {fmt_price(e50_15)}",
             f"15m Long context: {context_long}",
@@ -1230,12 +1245,12 @@ def analysis_report(raw_symbol, requested_timeframes=None):
                 f"🎯 TP1: {fmt_price(setup['tp1'])}",
                 f"🎯 TP2: {fmt_price(setup['tp2'])}",
                 f"🎯 TP3: {fmt_price(setup['tp3'])}", "",
-                "✅ Liquidity Sweep · MSS · CHOCH · FVG · OB",
+                f"✅ {setup.get('pattern','MOMENTUM')} · volume {setup.get('volume_mult',0):.2f}× · extension {setup.get('extension_atr',0):.2f}×ATR",
             ]
         else:
             lines += [
                 "",
-                "ℹ️ هیچ setupی تەواوی Liquidity Sweep + MSS + FVG + OB لە ئێستادا نییە.",
+                "ℹ️ هیچ Momentum setup ـێکی تەواو لە ئێستادا نییە.",
                 "باشترە بۆ triggerی تەواو چاوەڕێ بکرێت لە جیاتی دروستکردنی سیگناڵی ناڕاست.",
             ]
         return "\n".join(lines)
@@ -1280,26 +1295,21 @@ def analysis_report(raw_symbol, requested_timeframes=None):
 
 
 def _setup_metrics(sig):
-    """Return transparent, rule-based trade metrics for a detected setup."""
+    """Transparent Momentum Engine metrics; quality is a rule count, not probability."""
     entry = float(sig["entry"])
     sl = float(sig["sl"])
     risk = abs(entry - sl)
     if risk <= 0:
-        return {"risk": 0.0, "rr1": 0.0, "rr2": 0.0, "rr3": 0.0, "quality": 0}
-    rr1 = abs(float(sig["tp1"]) - entry) / risk
-    rr2 = abs(float(sig["tp2"]) - entry) / risk
-    rr3 = abs(float(sig["tp3"]) - entry) / risk
-    # Quality is a heuristic, not a probability: all five structural checks are
-    # required by the setup model, then RR and candle confirmation add points.
+        return {"risk":0.0,"rr1":0.0,"rr2":0.0,"rr3":0.0,"quality":0}
+    rr1 = abs(float(sig["tp1"])-entry)/risk
+    rr2 = abs(float(sig["tp2"])-entry)/risk
+    rr3 = abs(float(sig["tp3"])-entry)/risk
     checks = sig.get("checks") or {}
-    structural = sum(bool(checks.get(k)) for k in ("Liquidity Sweep", "MSS", "CHOCH", "FVG", "OB"))
-    quality = structural
-    quality += 1 if rr1 >= 1.5 else 0
-    quality += 1 if rr2 >= 2.5 else 0
-    quality += 1 if rr3 >= 4.0 else 0
-    quality += 1 if sig.get("rejection_ok") else 0
-    quality += 1 if sig.get("early_entry") else 0
-    return {"risk": risk, "rr1": rr1, "rr2": rr2, "rr3": rr3, "quality": min(10, quality)}
+    quality = sum(bool(checks.get(k)) for k in ("Range","Breakout","Volume","Trend"))
+    quality += 1 if sig.get("retest_ok") else 0
+    quality += 1 if sig.get("extension_atr",99) <= 1.20 else 0
+    quality += 1 if sig.get("volume_mult",0) >= 1.10 else 0
+    return {"risk":risk,"rr1":rr1,"rr2":rr2,"rr3":rr3,"quality":min(10,quality)}
 
 
 def _setup_detail_lines(sig):
@@ -1307,6 +1317,7 @@ def _setup_detail_lines(sig):
     return [
         f"⭐ Quality: {m['quality']}/10 (rule-based)",
         f"📐 R:R — TP1 {m['rr1']:.2f}R · TP2 {m['rr2']:.2f}R · TP3 {m['rr3']:.2f}R",
+        f"📊 Volume {sig.get('volume_mult',0):.2f}× · Extension {sig.get('extension_atr',0):.2f}×ATR",
     ]
 
 
@@ -1409,7 +1420,8 @@ def watch_loop():
                     f"🎯 TP2: {fmt_price(sig['tp2'])}\n"
                     f"🎯 TP3: {fmt_price(sig['tp3'])}\n"
                     f"{details[0]}\n{details[1]}\n\n"
-                    "✅ Liquidity Sweep · MSS · CHOCH · FVG · OB\n"
+                    f"Pattern: {sig.get('pattern','MOMENTUM')} · Volume {sig.get('volume_mult',0):.2f}× · Extension {sig.get('extension_atr',0):.2f}×ATR\n"
+                    "🛡️ Anti-chase filter: ON\n"
                     "⚠️ Signal only — no automatic trading."
                 )
                 path = None
@@ -1487,6 +1499,150 @@ def _risk_text(parts):
     return "\n".join(lines)
 
 
+def _get_historical_klines(symbol, timeframe, days=30):
+    """Fetch closed historical candles in backward pages for backtesting.
+
+    Bitget's historical-candle endpoint returns up to 200 rows per request, so
+    we walk backward from now. The exact available history depends on timeframe.
+    """
+    granularity = {"5m":"5m","15m":"15m","1h":"1H","4h":"4H"}.get(str(timeframe).lower())
+    if not granularity:
+        raise ValueError("unsupported timeframe")
+    candle_ms = {"5m":300000,"15m":900000,"1h":3600000,"4h":14400000}[str(timeframe).lower()]
+    now_ms = int(time.time()*1000)
+    start_ms = now_ms - int(days*86400000)
+    cursor_end = now_ms
+    out = {}
+    max_pages = max(2, int((days*86400000)/(candle_ms*180))+4)
+    for _ in range(max_pages):
+        payload = bitget_get("/api/v2/mix/market/history-candles", {
+            "symbol": symbol, "productType": BITGET_PRODUCT, "granularity": granularity,
+            "endTime": str(cursor_end), "limit": 200, "kLineType": "market"
+        })
+        data = payload.get("data") or []
+        if not data:
+            break
+        oldest = None
+        for v in data:
+            try:
+                if len(v) < 6: continue
+                ts = int(v[0])
+                if ts < start_ms: continue
+                out[ts] = {"time":ts//1000,"open":float(v[1]),"high":float(v[2]),"low":float(v[3]),"close":float(v[4]),"vol":float(v[5]),"turnover":float(v[6]) if len(v)>6 else 0.0}
+                oldest = ts if oldest is None else min(oldest, ts)
+            except (TypeError, ValueError, IndexError):
+                continue
+        if oldest is None or oldest <= start_ms or len(data) < 2:
+            break
+        cursor_end = oldest - candle_ms
+        time.sleep(BITGET_MIN_REQUEST_INTERVAL)
+    return sorted(out.values(), key=lambda r:r["time"])
+
+
+def _backtest_one(rows, direction, sl_buffer, tps, max_hold_bars=48):
+    trades=[]
+    i=100
+    cooldown_until=100
+    while i < len(rows)-2:
+        if i < cooldown_until:
+            i += 1; continue
+        hist=rows[:i+1]
+        sig=_momentum_setup(hist,direction,sl_atr_buffer=sl_buffer,tp_multipliers=tps)
+        if not sig or sig.get("time") != rows[i]["time"]:
+            i += 1; continue
+        entry=float(sig["entry"]); sl=float(sig["sl"]); risk=abs(entry-sl)
+        if risk <= 0:
+            i += 1; continue
+        weights=[0.50,0.25,0.25]
+        levels=[float(sig["tp1"]),float(sig["tp2"]),float(sig["tp3"])]
+        hit=[False,False,False]
+        realized=0.0; exit_bar=None; outcome="OPEN"
+        end=min(len(rows),i+1+max_hold_bars)
+        for j in range(i+1,end):
+            r=rows[j]
+            # Conservative same-candle handling: if SL and a target are both
+            # touched, count SL first because intrabar order is unknown.
+            sl_hit=(r["low"]<=sl) if direction=="LONG" else (r["high"]>=sl)
+            if sl_hit:
+                for k in range(3):
+                    if not hit[k]: realized += -weights[k]
+                outcome="SL"; exit_bar=j; break
+            for k,level in enumerate(levels):
+                if hit[k]: continue
+                tp_hit=(r["high"]>=level) if direction=="LONG" else (r["low"]<=level)
+                if tp_hit:
+                    realized += weights[k]*tps[k]
+                    hit[k]=True
+            if all(hit):
+                outcome="TP3"; exit_bar=j; break
+        if exit_bar is None:
+            # Time exit: mark open position to close price in R.
+            j=end-1; close=rows[j]["close"]
+            move=((close-entry)/risk) if direction=="LONG" else ((entry-close)/risk)
+            remaining=sum(weights[k] for k in range(3) if not hit[k])
+            realized += remaining*move
+            outcome="TIME"; exit_bar=j
+        trades.append({"entry_time":rows[i]["time"],"direction":direction,"realized_r":realized,"outcome":outcome,"bars":exit_bar-i})
+        cooldown_until=(exit_bar+1 if exit_bar is not None else i+1)
+        i=cooldown_until
+    return trades
+
+
+def _run_backtest(symbol, timeframe="15m", days=30):
+    rows=_get_historical_klines(symbol,timeframe,days)
+    if len(rows)<150:
+        raise RuntimeError(f"only {len(rows)} candles available")
+    profiles=[]
+    for slbuf in (0.15,0.25,0.40,0.60):
+        for tps in ((1.0,2.0,3.0),(1.5,2.5,4.0),(1.5,3.0,5.0),(2.0,3.0,5.0)):
+            all_trades=_backtest_one(rows,"LONG",slbuf,tps)+_backtest_one(rows,"SHORT",slbuf,tps)
+            if not all_trades: continue
+            gross=sum(t["realized_r"] for t in all_trades)
+            wins=sum(t["realized_r"]>0 for t in all_trades)
+            sls=sum(t["outcome"]=="SL" for t in all_trades)
+            tp3=sum(t["outcome"]=="TP3" for t in all_trades)
+            # Equity curve in R for drawdown.
+            eq=peak=dd=0.0
+            for t in sorted(all_trades,key=lambda x:x["entry_time"]):
+                eq += t["realized_r"]; peak=max(peak,eq); dd=min(dd,eq-peak)
+            profiles.append({"sl":slbuf,"tps":tps,"trades":len(all_trades),"gross_r":gross,"win_rate":wins/len(all_trades)*100,"sl_count":sls,"tp3_count":tp3,"max_dd_r":abs(dd)})
+    profiles.sort(key=lambda x:(x["gross_r"],-x["max_dd_r"],x["trades"]),reverse=True)
+    return rows,profiles
+
+
+def _backtest_text(parts):
+    if len(parts) not in (2,3,4):
+        return ("🧪 BACKTEST\n\n"
+                "نموونە: /backtest BTC 15m 30\n"
+                "Timeframe: 5m, 15m, 1h, 4h\n"
+                "Days: 7–52 (15m supports up to the available Bitget history).")
+    symbol=_normalize_analysis_symbol(parts[1])
+    tf=_normalize_analysis_timeframe(parts[2]) if len(parts)>=3 else SIGNAL_TIMEFRAME
+    try:
+        days=int(parts[3]) if len(parts)==4 else 30
+        days=max(7,min(52,days))
+    except ValueError:
+        return "❌ Days دەبێت ژمارە بێت."
+    if not symbol or not tf:
+        return "❌ Coin یان timeframe هەڵەیە."
+    rows,profiles=_run_backtest(symbol,tf,days)
+    if not profiles:
+        return f"🧪 BACKTEST — {symbol} · {tf.upper()}\n\n🟡 هیچ trade ـێک نەدۆزرایەوە لە {len(rows)} candle ـدا."
+    best=profiles[0]
+    lines=[f"🧪 SAIWAN MOMENTUM BACKTEST",f"⭐ {symbol} · {tf.upper()} · {days} days",f"Candles: {len(rows)}","",
+           "📌 TP/SL sweep (historical, closed candles only)",
+           f"Best gross R: {best['gross_r']:+.2f}R",
+           f"SL buffer: {best['sl']:.2f}× ATR",
+           f"TP: {best['tps'][0]:.1f}R / {best['tps'][1]:.1f}R / {best['tps'][2]:.1f}R",
+           f"Trades: {best['trades']} · Win-rate by realized R: {best['win_rate']:.1f}%",
+           f"SL exits: {best['sl_count']} · TP3 exits: {best['tp3_count']} · Max DD: {best['max_dd_r']:.2f}R", "",
+           "Top parameter sets:"]
+    for n,p in enumerate(profiles[:5],1):
+        lines.append(f"{n}. SL {p['sl']:.2f} ATR · TP {p['tps'][0]:.1f}/{p['tps'][1]:.1f}/{p['tps'][2]:.1f}R · {p['trades']} trades · {p['gross_r']:+.2f}R · DD {p['max_dd_r']:.2f}R")
+    lines += ["", "ℹ️ This is a parameter comparison, not a guarantee. Fees, funding and slippage are not included in gross R."]
+    return "\n".join(lines)
+
+
 def _history_text(symbol_filter=None):
     with state_lock:
         items = list(signal_history)
@@ -1553,22 +1709,22 @@ def _settings_text():
 def _quick_scan(raw_symbol):
     symbol = _normalize_analysis_symbol(raw_symbol)
     try:
-        rows5 = get_klines(symbol, TF_5M, 180)
-        rows15 = get_klines(symbol, TF_15M, 120)
-        if len(rows5) < 80 or len(rows15) < 30:
+        rows = get_klines(symbol, SIGNAL_TIMEFRAME, CANDLE_LIMIT)
+        if len(rows) < 90:
             return f"❌ داتای پێویست بۆ {symbol} بەردەست نییە."
-        *_, bias5 = _timeframe_bias(rows5)
-        *_, bias15 = _timeframe_bias(rows15)
-        long5 = _move_setup(rows5, "LONG")
-        short5 = _move_setup(rows5, "SHORT")
-        setup5 = long5 if long5 and not short5 else short5 if short5 and not long5 else None
-        lines = [f"📊 QUICK SCAN — {symbol}", "", f"💵 Price: {fmt_price(rows5[-1]['close'])}", f"5m: {bias5}", f"15m: {bias15}"]
-        if setup5:
-            direction = "LONG" if setup5 is long5 else "SHORT"
-            lines += [f"🎯 Setup: {direction}", f"Entry: {fmt_price(setup5['entry'])}", f"SL: {fmt_price(setup5['sl'])}", f"TP1: {fmt_price(setup5['tp1'])}", f"TP2: {fmt_price(setup5['tp2'])}", f"TP3: {fmt_price(setup5['tp3'])}"]
-            lines += _setup_detail_lines(setup5)
+        cur = rows[-1]["close"]
+        *_, bias = _timeframe_bias(rows)
+        long_sig = _move_setup(rows, "LONG")
+        short_sig = _move_setup(rows, "SHORT")
+        setup = long_sig if long_sig and not short_sig else short_sig if short_sig and not long_sig else None
+        lines = [f"📊 QUICK SCAN — {symbol}", "", f"💵 Price: {fmt_price(cur)}", f"⏱ {SIGNAL_TIMEFRAME.upper()}", f"Bias: {bias}"]
+        if setup:
+            lines += [f"🎯 Setup: {'🟢 LONG' if setup['direction']=='LONG' else '🔴 SHORT'}",
+                      f"Pattern: {setup.get('pattern')}", f"Entry: {fmt_price(setup['entry'])}", f"SL: {fmt_price(setup['sl'])}",
+                      f"TP1: {fmt_price(setup['tp1'])}", f"TP2: {fmt_price(setup['tp2'])}", f"TP3: {fmt_price(setup['tp3'])}"]
+            lines += _setup_detail_lines(setup)
         else:
-            lines.append("🟡 WAIT — complete setup نییە.")
+            lines.append("🟡 WAIT — breakout/pullback setupی تەواو نییە.")
         return "\n".join(lines)
     except Exception as e:
         return f"❌ Quick scan سەرکەوتوو نەبوو: {_error_bucket(e)}"
@@ -1593,9 +1749,8 @@ def _smart_scan_report(limit=8):
 
     def one(symbol):
         try:
-            rows5 = get_klines(symbol, TF_5M, CANDLE_LIMIT)
-            rows15 = get_klines(symbol, TF_15M, 180)
-            sig = analyze(symbol, rows5, rows15)
+            rows15 = get_klines(symbol, SIGNAL_TIMEFRAME, CANDLE_LIMIT)
+            sig = analyze(symbol, rows15, None)
             return sig
         except Exception:
             return None
@@ -1622,7 +1777,7 @@ def _smart_scan_report(limit=8):
             f"{i}. {d} · ⭐ {sig['symbol']}",
             f"   Entry {fmt_price(sig['entry'])} · SL {fmt_price(sig['sl'])}",
             f"   TP1 {fmt_price(sig['tp1'])} · TP2 {fmt_price(sig['tp2'])} · TP3 {fmt_price(sig['tp3'])}",
-            f"   Quality {m['quality']}/10 · TP3 {m['rr3']:.2f}R · 15m {sig.get('context15','UNKNOWN')}",
+            f"   Quality {m['quality']}/10 · TP3 {m['rr3']:.2f}R · {sig.get('pattern','MOMENTUM')}",
             "",
         ]
     lines.append("⚠️ Radar is informational; no automatic trading.")
@@ -1668,7 +1823,7 @@ def status_text():
         f"Scanner: {'RUNNING' if scanner else 'STOPPED'}\n"
         f"Smart Watch: {'ON' if watch_on else 'OFF'} ({watched}/{MAX_WATCH_ITEMS})\n"
         "Market: Bitget USDT Perpetual Futures\n"
-        "Strategy: SAIWAN Move Hunter — Liquidity Sweep + MSS + CHOCH + FVG + OB\n"
+        "Strategy: SAIWAN Momentum Engine — Breakout + Pullback + Volume + ATR\n"
         "Analysis: 5m / 15m / 1h / 4h\n"
         f"Pending signals: {pending}\n"
         f"Tracked signals: {tracked}\n"
@@ -1711,11 +1866,10 @@ def scan_once():
 
     def check_symbol(symbol):
         try:
-            rows5 = get_klines(symbol, TF_5M, CANDLE_LIMIT)
-            rows15 = get_klines(symbol, TF_15M, 180)
-            if len(rows5) < 120 or len(rows15) < 30:
+            rows15 = get_klines(symbol, SIGNAL_TIMEFRAME, CANDLE_LIMIT)
+            if len(rows15) < 90:
                 return symbol, None, None
-            return symbol, analyze(symbol, rows5, rows15), None
+            return symbol, analyze(symbol, rows15, None), None
         except Exception as e:
             return symbol, None, e
 
@@ -1752,7 +1906,7 @@ def scan_once():
 
     total_errors = sum(error_buckets.values())
     summary = ", ".join(f"{name}={count}" for name, count in sorted(error_buckets.items(), key=lambda kv: kv[1], reverse=True)[:4])
-    print(f"Bitget Move Hunter scan: universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
+    print(f"Bitget Momentum Engine scan: universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
     if not contracts:
         print("Bitget warning: no contracts returned from /api/v2/mix/market/contracts")
     elif not tickers:
@@ -1763,22 +1917,24 @@ def scan_once():
 
 def signal_caption(sig):
     d = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
+    m = _setup_metrics(sig)
     return (
-        f"🚀 SAIWAN CRYPTO SIGNAL\n\n{d}\n"
+        f"🚀 SAIWAN MOMENTUM SIGNAL\n\n{d}\n"
         f"⭐ {sig['symbol']} · Bitget Futures\n"
-        f"⏱ 5m Entry · 15m Context\n\n"
-        "Liquidity Sweep ✓  ·  MSS ✓  ·  CHOCH ✓  ·  FVG ✓  ·  OB ✓\n"
-        f"15m Context: {sig.get('context15','UNKNOWN')}\n"
+        f"⏱ {sig.get('timeframe', SIGNAL_TIMEFRAME).upper()} · CLOSED CANDLES\n\n"
+        f"Pattern: {sig.get('pattern','MOMENTUM')}\n"
+        f"Range → Breakout/Breakdown → Pullback/Continuation\n"
+        f"Volume: {sig.get('volume_mult',0):.2f}× avg · Extension: {sig.get('extension_atr',0):.2f}× ATR\n\n"
         f"Entry: {fmt_price(sig['entry'])}\n"
         f"SL: {fmt_price(sig['sl'])}\n"
         f"TP1: {fmt_price(sig['tp1'])}\n"
         f"TP2: {fmt_price(sig['tp2'])}\n"
         f"TP3: {fmt_price(sig['tp3'])}\n"
-        f"{_setup_detail_lines(sig)[0]}\n"
-        f"{_setup_detail_lines(sig)[1]}\n\n"
-        "⚡ Early move setup — closed candles only.\n"
+        f"⭐ Quality: {m['quality']}/10 · R:R {m['rr1']:.2f} / {m['rr2']:.2f} / {m['rr3']:.2f}\n\n"
+        "🛡️ Anti-chase filter: ON\n"
         "⚠️ Signal only — no automatic trading."
     )
+
 
 def scanner_loop():
     global scanner_running
@@ -1976,12 +2132,12 @@ def poll_updates():
                             "/settings - Bot settings\n"
                             "/status - Bot status\n\n"
                             "Market: Bitget USDT Perpetual Futures\n"
-                            "Model: Liquidity Sweep + MSS + CHOCH + FVG + OB\n"
+                            "Model: SAIWAN Momentum Engine — Breakout + Pullback + Volume + ATR\n"
                             "TP/SL monitoring: ENABLED")
                     elif cmd == "/scan":
                         if len(parts) == 1:
                             start_scanner(active_chat_id)
-                            send_message(active_chat_id, "🚀 SAIWAN CRYPTO SIGNAL SCANNER STARTED\n\n5m + 15m context. TP/SL monitoring is enabled.")
+                            send_message(active_chat_id, "🚀 SAIWAN MOMENTUM SCANNER STARTED\n\n15m closed candles · breakout + pullback + volume + ATR. Anti-chase filter is enabled. TP/SL monitoring is enabled.")
                         elif parts[1].lower() in ("top", "smart", "smartscan"):
                             send_message(active_chat_id, "📊 Smart Scan خەریکە بازارەکە پشکنین دەکات...")
                             send_message(active_chat_id, _smart_scan_report())
@@ -2051,6 +2207,16 @@ def poll_updates():
                             send_message(active_chat_id, "نموونە: /stats یان /stats BTC")
                         else:
                             send_message(active_chat_id, _stats_text(parts[1] if len(parts) == 2 else None))
+                    elif cmd == "/backtest":
+                        if len(parts) not in (2,3,4):
+                            send_message(active_chat_id, "نموونە: /backtest BTC 15m 30")
+                        else:
+                            send_message(active_chat_id, "🧪 Backtest خەریکە دەکرێت...\nTP/SL ـە جیاوازەکان بەراورد دەکرێن.")
+                            try:
+                                send_message(active_chat_id, _backtest_text(parts))
+                            except Exception as e:
+                                print(f"BACKTEST ERROR {type(e).__name__}: {e}")
+                                send_message(active_chat_id, f"❌ Backtest سەرکەوتوو نەبوو: {_error_bucket(e)}")
                     elif cmd == "/settings":
                         if len(parts) == 1:
                             send_message(active_chat_id, _settings_text())
