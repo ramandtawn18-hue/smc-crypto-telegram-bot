@@ -19,13 +19,8 @@ BITGET_PRODUCT = "USDT-FUTURES"
 TELEGRAM_API = "https://api.telegram.org/bot"
 
 TF_15M = "15m"
-TF_30M = "30m"
-TF_1H = "1h"
-TF_2H = "2h"
-TF_4H = "4h"
 TF_5M = "5m"
-TIMEFRAME = TF_15M
-SUPPORTED_SCAN_TIMEFRAMES = (TF_15M, TF_30M, TF_1H, TF_2H, TF_4H)
+TIMEFRAME = TF_5M
 CANDLE_LIMIT = 260
 # 0 = scan every eligible Bitget USDT perpetual contract (no top-N cap)
 MAX_PAIRS = 0
@@ -33,7 +28,7 @@ SCAN_WORKERS = 6
 SCAN_INTERVAL = 60
 SEND_INTERVAL = 600  # minimum 10 minutes between sent signals
 SIGNAL_TIMEFRAME = TF_15M
-CHART_CANDLES = 80
+CHART_CANDLES = 70
 HTTP_TIMEOUT = 15
 MIN_SCORE = 5
 
@@ -49,32 +44,14 @@ TP3_R = 4.0
 # SAIWAN Momentum Engine — tuned as a starting point for backtesting.
 MOM_RANGE_LOOKBACK = 20
 MOM_BREAKOUT_WINDOW = 12
-MOM_MAX_PULLBACK_BARS = 12
-MOM_MIN_VOLUME_MULT = 1.15
-MOM_TRIGGER_VOLUME_MULT = 0.90
-MOM_MIN_BODY_RATIO = 0.45
-MOM_MIN_BREAKOUT_ATR = 0.05
-MOM_MAX_EXTENSION_ATR = 1.80
-MOM_PULLBACK_ATR = 0.10
-MOM_SL_ATR_BUFFER = 0.50
-MOM_MIN_RISK_ATR = 0.80
-MOM_MAX_RISK_ATR = 3.50
-
-# SA-VWAP port from the supplied TradingView Pine source.
-# Primary trigger: anchored VWAP retest after price has spent enough bars away
-# from VWAP in the current structural leg. Risk preset mirrors the source's
-# Balanced preset: 1.5 ATR SL and 1R / 2R / 3R targets, with BE after TP1.
-SA_VWAP_ENABLED = True
-SA_VWAP_PIVOT_LEFT = 55
-SA_VWAP_PIVOT_RIGHT = 55
-SA_VWAP_MIN_SWING_ATR = 1.50
-SA_VWAP_RETEST_MIN_AWAY = 5
-SA_VWAP_RETEST_TOL_SIGMA = 0.25
-SA_VWAP_VOLUME_CLAMP_MEDIAN = 4.0
-SA_VWAP_SL_ATR = 1.50
-SA_VWAP_TP_R = (1.0, 2.0, 3.0)
-SA_VWAP_USE_BE = True
-
+MOM_MAX_PULLBACK_BARS = 8
+MOM_MIN_VOLUME_MULT = 1.30
+MOM_TRIGGER_VOLUME_MULT = 1.05
+MOM_MIN_BODY_RATIO = 0.55
+MOM_MIN_BREAKOUT_ATR = 0.10
+MOM_MAX_EXTENSION_ATR = 1.20
+MOM_PULLBACK_ATR = 0.20
+MOM_SL_ATR_BUFFER = 0.25
 MOM_EMA_FAST = 9
 MOM_EMA_MID = 21
 MOM_EMA_SLOW = 50
@@ -86,7 +63,6 @@ state_lock = threading.Lock()
 scanner_thread = None
 scanner_running = False
 active_chat_id = None
-active_scan_timeframe = TF_15M
 pending_signals = []
 seen_signals = set()
 seen_order = []
@@ -196,9 +172,7 @@ def get_klines(symbol, interval=TIMEFRAME, limit=CANDLE_LIMIT):
     api_granularity = {
         "5m": "5m",
         "15m": "15m",
-        "30m": "30m",
         "1h": "1H",
-        "2h": "2H",
         "4h": "4H",
     }.get(str(interval).lower(), interval)
 
@@ -212,9 +186,7 @@ def get_klines(symbol, interval=TIMEFRAME, limit=CANDLE_LIMIT):
     candle_ms = {
         "5m": 5 * 60 * 1000,
         "15m": 15 * 60 * 1000,
-        "30m": 30 * 60 * 1000,
         "1h": 60 * 60 * 1000,
-        "2h": 2 * 60 * 60 * 1000,
         "4h": 4 * 60 * 60 * 1000,
     }.get(str(interval).lower())
     if candle_ms is None:
@@ -704,25 +676,25 @@ def _momentum_setup(rows, direction, sl_atr_buffer=MOM_SL_ATR_BUFFER,
             if direction == "LONG":
                 pull_low = min(r["low"] for r in post)
                 pullback_depth = max(0.0, range_high - pull_low)
-                if pull_low < range_high - 0.75 * atr_b:
+                if pull_low < range_high - 0.35 * atr_b:
                     # Too deep: breakout has likely failed.
                     continue
                 if pullback_depth < MOM_PULLBACK_ATR * atr_b:
                     # No meaningful reset; avoid buying the top of a straight move.
                     continue
-                continuation_level = max(r["high"] for r in rows[b:cur_i]) if cur_i > b else range_high
-                trigger_ok = cur["close"] > max(range_high, continuation_level) and _candle_bull(cur)
+                continuation_level = max(r["high"] for r in rows[b:cur_i])
+                trigger_ok = cur["close"] > continuation_level and _candle_bull(cur)
                 swing_low = pull_low
                 swing_high = max(r["high"] for r in rows[b:cur_i+1])
             else:
                 pull_high = max(r["high"] for r in post)
                 pullback_depth = max(0.0, pull_high - range_low)
-                if pull_high > range_low + 0.75 * atr_b:
+                if pull_high > range_low + 0.35 * atr_b:
                     continue
                 if pullback_depth < MOM_PULLBACK_ATR * atr_b:
                     continue
-                continuation_level = min(r["low"] for r in rows[b:cur_i]) if cur_i > b else range_low
-                trigger_ok = cur["close"] < min(range_low, continuation_level) and _candle_bear(cur)
+                continuation_level = min(r["low"] for r in rows[b:cur_i])
+                trigger_ok = cur["close"] < continuation_level and _candle_bear(cur)
                 swing_high = pull_high
                 swing_low = min(r["low"] for r in rows[b:cur_i+1])
             cur_vol = cur.get("vol", 0.0)
@@ -736,33 +708,17 @@ def _momentum_setup(rows, direction, sl_atr_buffer=MOM_SL_ATR_BUFFER,
             pullback_idx = cur_i
             pattern = "MOMENTUM CONTINUATION"
 
-        # Risk is volatility/structure based, not a tiny fixed-distance stop.
-        # The invalidation level must clear both the pullback swing and the
-        # original breakout range, then gets an ATR safety buffer.  A minimum
-        # ATR risk floor prevents microscopic SL/TP clusters on quiet 15m moves.
         if direction == "LONG":
-            invalidation = min(swing_low, range_low)
-            sl = invalidation - sl_atr_buffer * atr_now
-            min_sl = entry - MOM_MIN_RISK_ATR * atr_now
-            sl = min(sl, min_sl)
+            sl = swing_low - sl_atr_buffer * atr_now
             if sl >= entry:
                 continue
             risk = entry - sl
-            risk_atr = risk / max(atr_now, 1e-12)
-            if risk_atr > MOM_MAX_RISK_ATR:
-                continue
             t1, t2, t3 = [entry + risk * float(x) for x in tp_multipliers]
         else:
-            invalidation = max(swing_high, range_high)
-            sl = invalidation + sl_atr_buffer * atr_now
-            min_sl = entry + MOM_MIN_RISK_ATR * atr_now
-            sl = max(sl, min_sl)
+            sl = swing_high + sl_atr_buffer * atr_now
             if sl <= entry:
                 continue
             risk = sl - entry
-            risk_atr = risk / max(atr_now, 1e-12)
-            if risk_atr > MOM_MAX_RISK_ATR:
-                continue
             t1, t2, t3 = [entry - risk * float(x) for x in tp_multipliers]
 
         if risk <= 0 or risk > entry * 0.12:
@@ -785,8 +741,6 @@ def _momentum_setup(rows, direction, sl_atr_buffer=MOM_SL_ATR_BUFFER,
             "breakout_index": b, "pullback_index": pullback_idx,
             "range_high": range_high, "range_low": range_low,
             "breakout_atr": atr_b, "atr": atr_now,
-            "risk_distance": risk, "risk_atr": risk / max(atr_now, 1e-12),
-            "risk_pct": (risk / max(entry, 1e-12)) * 100.0,
             "breakout_volume_mult": breakout_vol, "volume_mult": cur_vol_mult,
             "ema9": emas[0], "ema21": emas[1], "ema50": emas[2],
             "extension_atr": extension, "rows": rows[max(0, b-25):], "full_len": len(rows),
@@ -801,200 +755,13 @@ def _momentum_setup(rows, direction, sl_atr_buffer=MOM_SL_ATR_BUFFER,
     return None
 
 
-def _sa_vwap_setup(rows, direction):
-    """Python port of the supplied SA-VWAP Pine signal/risk core.
-
-    The source uses Swing anchoring by default, cumulative volume-weighted VWAP,
-    volume-weighted sigma bands, a 5-bar minimum-away retest and the Balanced
-    risk preset (1.5 ATR SL, 1R/2R/3R TP). Only closed candles are supplied by
-    the scanner, so no realtime candle is used here.
-    """
-    n = len(rows)
-    left, right = SA_VWAP_PIVOT_LEFT, SA_VWAP_PIVOT_RIGHT
-    if n < max(120, left + right + 20):
-        return None
-
-    # Reproduce the Pine Swing market-structure engine closely enough for the
-    # signal layer: confirmed pivots, minimum swing amplitude, newest pivot wins.
-    sw_type = 0
-    sw_hi = sw_lo = None
-    sw_hi_bar = sw_lo_bar = None
-    events = []
-    for i in range(left, n - right):
-        hi = rows[i]["high"]
-        lo = rows[i]["low"]
-        hi_window = [r["high"] for r in rows[i-left:i+right+1]]
-        lo_window = [r["low"] for r in rows[i-left:i+right+1]]
-        piv_hi = hi >= max(hi_window)
-        piv_lo = lo <= min(lo_window)
-        a = _atr_at(rows, i, 14) or 0.0
-        min_swing = SA_VWAP_MIN_SWING_ATR * a
-
-        if piv_hi:
-            if sw_type == 1:
-                if sw_hi is None or hi > sw_hi:
-                    sw_hi, sw_hi_bar = hi, i
-                    events.append((i, "HIGH", hi))
-            elif sw_type == 0 or (sw_lo is not None and hi - sw_lo >= min_swing):
-                sw_hi, sw_hi_bar, sw_type = hi, i, 1
-                events.append((i, "HIGH", hi))
-        if piv_lo:
-            if sw_type == -1:
-                if sw_lo is None or lo < sw_lo:
-                    sw_lo, sw_lo_bar = lo, i
-                    events.append((i, "LOW", lo))
-            elif sw_type == 0 or (sw_hi is not None and sw_hi - lo >= min_swing):
-                sw_lo, sw_lo_bar, sw_type = lo, i, -1
-                events.append((i, "LOW", lo))
-
-    if sw_type == 1 and sw_hi_bar is not None:
-        leg_dir = -1
-        anchor = sw_hi_bar
-    elif sw_type == -1 and sw_lo_bar is not None:
-        leg_dir = 1
-        anchor = sw_lo_bar
-    else:
-        return None
-
-    if (direction == "LONG" and leg_dir != 1) or (direction == "SHORT" and leg_dir != -1):
-        return None
-    if anchor >= n - 2:
-        return None
-
-    # Build the anchored cumulative VWAP and weighted sigma exactly on the
-    # current leg. Volume is capped at 4x the 50-bar median, as in the source.
-    sum_w = sum_pw = sum_p2w = 0.0
-    points = []
-    for j in range(anchor, n):
-        px = (rows[j]["high"] + rows[j]["low"]) / 2.0
-        recent_vols = [max(float(x.get("vol", 0.0)), 0.0) for x in rows[max(0, j-49):j+1]]
-        med = sorted(recent_vols)[len(recent_vols)//2] if recent_vols else 0.0
-        raw_w = max(float(rows[j].get("vol", 0.0)), 0.0)
-        if med > 0:
-            wt = min(raw_w, med * SA_VWAP_VOLUME_CLAMP_MEDIAN)
-        else:
-            wt = 1.0
-        if wt <= 0:
-            wt = 1.0
-        sum_w += wt
-        sum_pw += px * wt
-        sum_p2w += px * px * wt
-        vwap = sum_pw / sum_w
-        sigma = math.sqrt(max(sum_p2w / sum_w - vwap * vwap, 0.0))
-        points.append((j, vwap, sigma, wt))
-
-    if not points:
-        return None
-
-    # Retest state mirrors the source's awayC/hit logic. A bar must stay on the
-    # leg's side of VWAP, outside tolerance, for >=5 bars before a touch counts.
-    away = 0
-    retests = 0
-    last_hit = False
-    last_vwap = last_sigma = None
-    leg_weight_above = 0.0
-    leg_weight_below = 0.0
-    for j, vwap, sigma, wt in points:
-        r = rows[j]
-        tol = sigma * SA_VWAP_RETEST_TOL_SIGMA if sigma > 0 else (_atr_at(rows, j, 14) or 0.0) * 0.1
-        touch = r["low"] <= vwap + tol and r["high"] >= vwap - tol
-        outside = r["low"] > vwap + tol if leg_dir > 0 else r["high"] < vwap - tol
-        hit = touch and away >= SA_VWAP_RETEST_MIN_AWAY
-        if r["close"] >= vwap:
-            leg_weight_above += wt
-        else:
-            leg_weight_below += wt
-        if hit:
-            retests += 1
-        away = 0 if touch else (away + 1 if outside else 0)
-        last_hit = hit
-        last_vwap, last_sigma = vwap, sigma
-
-    if not last_hit or last_vwap is None:
-        return None
-
-    cur = rows[-1]
-    atr_now = _atr_at(rows, n - 1, 13) or _atr_at(rows, n - 1, 14) or 0.0
-    if atr_now <= 0:
-        return None
-
-    dist_sig = (cur["close"] - last_vwap) / last_sigma if last_sigma > 0 else 0.0
-    if abs(dist_sig) > 2.0:
-        return None
-
-    # Source strength: 40 balance + 25 price side + 20 not stretched + 15
-    # prior retest. It is a context score, not a probability.
-    total_weight = leg_weight_above + leg_weight_below
-    balance = (leg_weight_above / total_weight * 100.0) if total_weight > 0 else 50.0
-    bal_align = balance if leg_dir > 0 else 100.0 - balance
-    strength = bal_align * 0.4
-    strength += 25.0 if dist_sig * leg_dir > 0 else 0.0
-    strength += 20.0 if abs(dist_sig) <= 2.0 else 0.0
-    strength += 15.0 if retests > 1 else 0.0
-    strength = min(strength, 100.0)
-
-    entry = cur["close"]
-    risk = atr_now * SA_VWAP_SL_ATR
-    if risk <= 0 or risk > entry * 0.12:
-        return None
-    if direction == "LONG":
-        sl = entry - risk
-        tp1 = entry + risk * SA_VWAP_TP_R[0]
-        tp2 = entry + risk * SA_VWAP_TP_R[1]
-        tp3 = entry + risk * SA_VWAP_TP_R[2]
-    else:
-        sl = entry + risk
-        tp1 = entry - risk * SA_VWAP_TP_R[0]
-        tp2 = entry - risk * SA_VWAP_TP_R[1]
-        tp3 = entry - risk * SA_VWAP_TP_R[2]
-
-    # Current candle volume relative to its preceding 20 bars, for display and
-    # optional quality scoring; it is not required by the supplied source.
-    prior_vol = _rolling_mean([r.get("vol", 0.0) for r in rows[:-1]], 20)
-    vol_mult = cur.get("vol", 0.0) / max(prior_vol, 1e-12) if prior_vol > 0 else 0.0
-    extension = abs(entry - last_vwap) / max(atr_now, 1e-12)
-
-    # Approximate structural label from the confirmed pivot that anchors the leg.
-    pattern = "SA-VWAP RETEST"
-    return {
-        "symbol": "", "direction": direction,
-        "structure": pattern, "pattern": pattern,
-        "entry": entry, "trigger_level": last_vwap,
-        "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
-        "score": int(round(strength / 20.0)), "max_score": 5,
-        "strength": strength, "sa_vwap": last_vwap, "sa_sigma": last_sigma,
-        "leg_direction": leg_dir, "leg_anchor_index": anchor,
-        "leg_retests": retests, "leg_balance": balance,
-        "risk_distance": risk, "risk_atr": SA_VWAP_SL_ATR,
-        "risk_pct": risk / max(entry, 1e-12) * 100.0,
-        "atr": atr_now, "volume_mult": vol_mult,
-        "breakout_volume_mult": vol_mult, "extension_atr": extension,
-        "breakout_index": anchor, "pullback_index": n - 1,
-        "range_high": max(r["high"] for r in rows[anchor:n]),
-        "range_low": min(r["low"] for r in rows[anchor:n]),
-        "retest_ok": True, "rejection_ok": True, "early_entry": True,
-        "checks": {"Range": True, "Breakout": True, "Volume": vol_mult >= 1.0,
-                    "Trend": True, "Pullback": True, "Continuation": True,
-                    "VWAP": True, "Retest": True},
-        "fvg": None, "ob": None,
-        "entry_zone_low": last_vwap - (last_sigma * SA_VWAP_RETEST_TOL_SIGMA),
-        "entry_zone_high": last_vwap + (last_sigma * SA_VWAP_RETEST_TOL_SIGMA),
-        "rows": rows[max(0, anchor - 10):], "full_len": len(rows),
-        "vwap_series": [(j, v) for j, v, _, _ in points],
-    }
-
-
 def _move_setup(rows, direction):
-    """SA-VWAP is the primary signal engine; Momentum remains the fallback."""
-    if SA_VWAP_ENABLED:
-        sig = _sa_vwap_setup(rows, direction)
-        if sig:
-            return sig
+    """Compatibility wrapper: all scanner/watch signals now use Momentum Engine."""
     return _momentum_setup(rows, direction)
 
 
-def analyze(symbol, rows5=None, rows15=None, timeframe=SIGNAL_TIMEFRAME):
-    """Run the Momentum Engine on the explicitly selected closed-candle timeframe."""
+def analyze(symbol, rows5, rows15=None):
+    """SAIWAN Momentum Engine: 15m primary signal timeframe, closed candles only."""
     rows = rows15 if rows15 and len(rows15) >= 90 else rows5
     if not rows or len(rows) < 90:
         return None
@@ -1002,10 +769,10 @@ def analyze(symbol, rows5=None, rows15=None, timeframe=SIGNAL_TIMEFRAME):
         r["symbol"] = symbol
     candidates = []
     for direction in ("LONG", "SHORT"):
-        sig = _move_setup(rows, direction)
+        sig = _momentum_setup(rows, direction)
         if sig:
             sig["symbol"] = symbol
-            sig["timeframe"] = timeframe
+            sig["timeframe"] = SIGNAL_TIMEFRAME if rows is rows15 else TF_5M
             candidates.append(sig)
     return max(candidates, key=lambda x: x["time"]) if candidates else None
 
@@ -1036,18 +803,6 @@ def make_chart(sig):
     ax.plot(range(n), e9, color=CYAN, linewidth=1.15, alpha=.9, label="EMA9")
     ax.plot(range(n), e21, color=BLUE, linewidth=1.25, alpha=.95, label="EMA21")
     ax.plot(range(n), e50, color=GOLD, linewidth=1.2, alpha=.9, label="EMA50")
-
-    if sig.get("pattern") == "SA-VWAP RETEST" and sig.get("vwap_series"):
-        vmap = {int(i): float(v) for i, v in sig.get("vwap_series", [])}
-        vxs, vys = [], []
-        chart_start_full = sig.get("full_len", len(rows)) - n
-        for i in range(n):
-            full_i = chart_start_full + i
-            if full_i in vmap:
-                vxs.append(i); vys.append(vmap[full_i])
-        if vxs:
-            ax.plot(vxs, vys, color="#ff9f43", linewidth=1.7, alpha=.95, label="SA-VWAP", zorder=7)
-            ax.scatter([n-1], [vys[-1]], s=28, color="#ff9f43", zorder=8)
 
     full_offset = sig.get("full_len", n) - len(sig.get("rows", rows))
     def local_index(full_i):
@@ -1091,8 +846,7 @@ def make_chart(sig):
     dcolor = UP if direction == "LONG" else DOWN
     ax.text(.018,1.065,f"{sig.get('symbol','')} · {sig.get('timeframe','15m').upper()}",transform=ax.transAxes,
             fontsize=16,color=TEXT,fontweight="bold",va="top")
-    strategy_title = "SAIWAN SA-VWAP · RETEST + ATR + BE" if sig.get("pattern") == "SA-VWAP RETEST" else "SAIWAN MOMENTUM ENGINE · CLOSED CANDLES"
-    ax.text(.018,1.025,strategy_title,transform=ax.transAxes,
+    ax.text(.018,1.025,"SAIWAN MOMENTUM ENGINE · CLOSED CANDLES",transform=ax.transAxes,
             fontsize=8.8,color=MUTED,fontweight="bold",va="top")
     ax.text(.985,1.055,dtext,transform=ax.transAxes,fontsize=12,color=dcolor,fontweight="bold",ha="right",va="top",
             bbox=dict(boxstyle="round,pad=.38",facecolor=BG,edgecolor=dcolor,linewidth=1.0))
@@ -1284,214 +1038,6 @@ def telegram_url(method):
     return TELEGRAM_API + TOKEN + "/" + method
 
 
-def _inline_button(text, callback_data):
-    return {"text": text, "callback_data": callback_data}
-
-
-def main_menu_markup():
-    return {
-        "inline_keyboard": [
-            [_inline_button("🔥 SCAN MARKET", "menu_scan"), _inline_button("🎯 TOP MOMENTUM", "scan_top")],
-            [_inline_button("📈 MOVERS", "movers"), _inline_button("🔎 ANALYSIS", "menu_analysis")],
-            [_inline_button("👁 WATCHLIST", "watchlist"), _inline_button("🔔 ALERTS", "alerts")],
-            [_inline_button("📜 HISTORY", "history"), _inline_button("📊 STATS", "stats")],
-            [_inline_button("💰 RISK", "risk"), _inline_button("⚙️ SETTINGS", "menu_settings")],
-            [_inline_button("🟢 BOT STATUS", "status"), _inline_button("🛑 STOP SCANNER", "stop")],
-        ]
-    }
-
-
-def scan_menu_markup():
-    return {
-        "inline_keyboard": [
-            [_inline_button("⚡ 15 MIN", "scan_tf:15m"), _inline_button("🕐 30 MIN", "scan_tf:30m")],
-            [_inline_button("🕐 1 HOUR", "scan_tf:1h"), _inline_button("🕑 2 HOURS", "scan_tf:2h")],
-            [_inline_button("🕓 4 HOURS", "scan_tf:4h")],
-            [_inline_button("◀️ BACK", "menu_main")],
-        ]
-    }
-
-
-def analysis_menu_markup():
-    coins = [("BTC", "BTC"), ("ETH", "ETH"), ("SOL", "SOL"), ("BNB", "BNB"), ("XRP", "XRP"), ("AVAX", "AVAX")]
-    rows = []
-    for i in range(0, len(coins), 2):
-        rows.append([_inline_button(f"🔎 {coins[i][0]} 15M", f"analysis:{coins[i][1]}"), _inline_button(f"🔎 {coins[i+1][0]} 15M", f"analysis:{coins[i+1][1]}")])
-    rows.append([_inline_button("◀️ BACK", "menu_main")])
-    return {"inline_keyboard": rows}
-
-
-def settings_menu_markup():
-    return {
-        "inline_keyboard": [
-            [_inline_button("🔔 ALERTS ON", "settings_alerts_on"), _inline_button("🔕 ALERTS OFF", "settings_alerts_off")],
-            [_inline_button("🟢 STATUS", "status")],
-            [_inline_button("◀️ BACK", "menu_main")],
-        ]
-    }
-
-
-def welcome_text():
-    label = _scan_timeframe_label(active_scan_timeframe)
-    return (
-        "🚀 SAIWAN CRYPTO SIGNALS\n\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "📡 SA-VWAP RETEST ENGINE\n"
-        f"📊 {label} • BITGET FUTURES\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "📐 Anchored VWAP • Retest • Strength\n"
-        "🎯 ATR SL • TP1 / TP2 / TP3 • BE\n"
-        "🔔 Signal + TP/SL monitoring: ACTIVE\n\n"
-        "Choose an action from the buttons below."
-    )
-
-
-def edit_message(chat_id, message_id, text, reply_markup=None):
-    data = {"chat_id": chat_id, "message_id": message_id, "text": text}
-    if reply_markup is not None:
-        data["reply_markup"] = json.dumps(reply_markup)
-    r = requests.post(telegram_url("editMessageText"), data=data, timeout=HTTP_TIMEOUT)
-    if not r.ok:
-        raise RuntimeError(f"Telegram editMessageText {r.status_code}: {r.text[:500]}")
-    return r.json()
-
-
-def answer_callback(callback_id, text=None):
-    data = {"callback_query_id": callback_id}
-    if text:
-        data["text"] = text
-    r = requests.post(telegram_url("answerCallbackQuery"), data=data, timeout=HTTP_TIMEOUT)
-    if not r.ok:
-        raise RuntimeError(f"Telegram answerCallbackQuery {r.status_code}: {r.text[:500]}")
-
-
-def _scan_timeframe_label(timeframe):
-    return {
-        "15m": "15 MIN",
-        "30m": "30 MIN",
-        "1h": "1 HOUR",
-        "2h": "2 HOURS",
-        "4h": "4 HOURS",
-    }.get(timeframe, str(timeframe).upper())
-
-
-def _normalize_scan_timeframe(raw):
-    tf = (raw or "").strip().lower()
-    aliases = {
-        "15": "15m", "15m": "15m",
-        "30": "30m", "30m": "30m",
-        "1h": "1h", "1hour": "1h", "1hr": "1h",
-        "2h": "2h", "2hour": "2h", "2hr": "2h",
-        "4h": "4h", "4hour": "4h", "4hr": "4h",
-    }
-    tf = aliases.get(tf)
-    return tf if tf in SUPPORTED_SCAN_TIMEFRAMES else None
-
-
-def _handle_callback_query(query):
-    global active_chat_id
-    callback_id = query.get("id")
-    data = str(query.get("data") or "")
-    msg = query.get("message") or {}
-    chat = msg.get("chat") or {}
-    chat_id = chat.get("id")
-    message_id = msg.get("message_id")
-    if not chat_id or not message_id:
-        if callback_id:
-            answer_callback(callback_id)
-        return
-    active_chat_id = chat_id
-    try:
-        if data == "menu_main":
-            edit_message(chat_id, message_id, welcome_text(), main_menu_markup())
-            answer_callback(callback_id)
-        elif data == "menu_scan":
-            edit_message(chat_id, message_id, "🔥 SCAN MARKET\n\nChoose timeframe:", scan_menu_markup())
-            answer_callback(callback_id)
-        elif data == "menu_analysis":
-            edit_message(chat_id, message_id, "🔎 15M ANALYSIS\n\nChoose a coin:", analysis_menu_markup())
-            answer_callback(callback_id)
-        elif data == "menu_settings":
-            edit_message(chat_id, message_id, "⚙️ SETTINGS\n\nChoose an option:", settings_menu_markup())
-            answer_callback(callback_id)
-        elif data.startswith("scan_tf:"):
-            tf = _normalize_scan_timeframe(data.split(":", 1)[1])
-            if not tf:
-                answer_callback(callback_id, "Unsupported timeframe")
-                return
-            label = _scan_timeframe_label(tf)
-            start_scanner(chat_id, tf)
-            edit_message(
-                chat_id, message_id,
-                f"🚀 SA-VWAP {label} SCANNER STARTED\n\n"
-                f"The SA-VWAP Retest Engine is now scanning {label} closed candles.\n\n"
-                "📐 Anchored VWAP + Retest + Strength\n"
-                "🛑 ATR Stop Loss: 1.5 ATR\n"
-                "🎯 TP1 1R • TP2 2R • TP3 3R\n"
-                "🛡️ TP1 → Break Even: ON\n"
-                "🎯 TP/SL monitoring: ON",
-                main_menu_markup(),
-            )
-            answer_callback(callback_id, f"{label} scanner started")
-        elif data == "scan_top":
-            answer_callback(callback_id, "Scanning top momentum setups…")
-            report = _smart_scan_report()
-            edit_message(chat_id, message_id, report, main_menu_markup())
-        elif data == "movers":
-            answer_callback(callback_id, "Loading 24H movers…")
-            edit_message(chat_id, message_id, _movers_report(), main_menu_markup())
-        elif data == "watchlist":
-            answer_callback(callback_id)
-            edit_message(chat_id, message_id, "👁 WATCHLIST\n\n" + _watch_text(), main_menu_markup())
-        elif data == "alerts":
-            answer_callback(callback_id)
-            edit_message(chat_id, message_id, "🔔 RECENT ALERTS\n\n" + _alerts_text(), main_menu_markup())
-        elif data == "history":
-            answer_callback(callback_id)
-            edit_message(chat_id, message_id, "📜 SIGNAL HISTORY\n\n" + _history_text(None), main_menu_markup())
-        elif data == "stats":
-            answer_callback(callback_id)
-            edit_message(chat_id, message_id, "📊 SIGNAL STATISTICS\n\n" + _stats_text(None), main_menu_markup())
-        elif data == "risk":
-            answer_callback(callback_id)
-            edit_message(chat_id, message_id, "💰 RISK / POSITION SIZE\n\nFor custom position sizing use:\n/risk BTC 1000 1\n\nFor entry/SL based sizing:\n/risk BTC 1000 1 105000 103800", main_menu_markup())
-        elif data == "status":
-            answer_callback(callback_id)
-            edit_message(chat_id, message_id, "🟢 BOT STATUS\n\n" + status_text(), main_menu_markup())
-        elif data == "stop":
-            stop_scanner()
-            answer_callback(callback_id, "Scanner stopped")
-            edit_message(chat_id, message_id, "🛑 SCANNER STOPPED\n\nSmart Watch remains available if enabled.", main_menu_markup())
-        elif data.startswith("analysis:"):
-            symbol = _normalize_analysis_symbol(data.split(":", 1)[1])
-            answer_callback(callback_id, f"Analyzing {symbol}…")
-            report = analysis_report(symbol, [TF_15M])
-            edit_message(chat_id, message_id, "🔎 15M ANALYSIS\n\n" + report, analysis_menu_markup())
-            try:
-                for chart_path in make_analysis_charts(symbol, [TF_15M]):
-                    send_photo(chat_id, chart_path, f"📊 SAIWAN CHART — {symbol} · 15M")
-            except Exception as e:
-                print(f"BUTTON ANALYSIS CHART ERROR {type(e).__name__}: {e}")
-        elif data == "settings_alerts_on":
-            with watch_lock:
-                bot_settings["alerts"] = True
-            answer_callback(callback_id, "Alerts enabled")
-            edit_message(chat_id, message_id, "⚙️ SETTINGS\n\n🔔 Smart Watch alerts: ON", settings_menu_markup())
-        elif data == "settings_alerts_off":
-            with watch_lock:
-                bot_settings["alerts"] = False
-            answer_callback(callback_id, "Alerts disabled")
-            edit_message(chat_id, message_id, "⚙️ SETTINGS\n\n🔕 Smart Watch alerts: OFF", settings_menu_markup())
-        else:
-            answer_callback(callback_id, "Unknown button")
-    except Exception as e:
-        print(f"CALLBACK ERROR {data}: {type(e).__name__}: {e}")
-        try:
-            answer_callback(callback_id, "Action failed")
-        except Exception:
-            pass
-
-
 def send_message(chat_id, text, reply_markup=None, reply_to_message_id=None):
     data = {"chat_id": chat_id, "text": text}
     if reply_markup is not None:
@@ -1528,19 +1074,23 @@ def _normalize_analysis_symbol(raw):
 
 
 def _normalize_analysis_timeframe(raw):
-    """Normalize analysis to the bot's single 15-minute timeframe."""
+    """Normalize an analysis timeframe. Supports 5m/15m/1h/4h."""
     tf = (raw or "").strip().lower()
-    aliases = {"15": "15m", "15m": "15m"}
+    aliases = {
+        "5": "5m", "5m": "5m",
+        "15": "15m", "15m": "15m",
+        "1h": "1h", "1hr": "1h", "60m": "1h", "60": "1h",
+        "4h": "4h", "4hr": "4h", "240m": "4h", "240": "4h",
+    }
     return aliases.get(tf)
 
 
 def _analysis_tf_data(symbol, timeframe):
     """Fetch closed candles for an on-demand analysis timeframe."""
-    if timeframe != TF_15M:
-        raise RuntimeError("SAIWAN is configured for 15m only")
-    rows = get_klines(symbol, TF_15M, max(CANDLE_LIMIT, 180))
-    if len(rows) < 90:
-        raise RuntimeError("not enough 15m candles")
+    limits = {"5m": CANDLE_LIMIT, "15m": 180, "1h": 180, "4h": 180}
+    rows = get_klines(symbol, timeframe, limits.get(timeframe, 180))
+    if len(rows) < 60:
+        raise RuntimeError(f"not enough {timeframe} candles")
     return rows
 
 
@@ -1611,56 +1161,138 @@ def _analysis_verdict(blocks):
 
 
 def analysis_report(raw_symbol, requested_timeframes=None):
-    """On-demand analysis for the bot's single 15-minute timeframe."""
+    """On-demand single-timeframe analysis for /analysis SYMBOL TIMEFRAME.
+
+    Examples:
+      /analysis BTC 5m
+      /analysis BTC 15m
+      /analysis BTC 1h
+      /analysis BTC 4h
+
+    The requested timeframe is analyzed directly with closed candles, EMA bias,
+    momentum breakout/pullback checks, and a matching chart. No trade is placed.
+    """
     symbol = _normalize_analysis_symbol(raw_symbol)
     if not symbol or len(symbol) < 6:
-        return "❌ تکایە ناوی کۆین بنووسە.\n\nنموونە: /analysis BTC 15m"
+        return "❌ تکایە ناوی کۆین بنووسە.\n\nنموونە:\n/analysis BTC\n/analysis BTC 1h\n/analysis BTC 4h\n/analysis BTC 1h 4h"
 
     requested = []
-    for raw_tf in (requested_timeframes or [SIGNAL_TIMEFRAME]):
+    for raw_tf in (requested_timeframes or []):
         tf = _normalize_analysis_timeframe(raw_tf)
-        if tf == TF_15M and tf not in requested:
+        if tf and tf not in requested:
             requested.append(tf)
-    if requested != [TF_15M]:
-        return "❌ SAIWAN تەنها لەسەر 15m کار دەکات.\nنموونە: /analysis BTC 15m"
+    requested = requested[:3]
+
+    # No timeframe means legacy fallback mode; normal /analysis requires one timeframe.
+    if not requested:
+        rows5 = get_klines(symbol, TF_5M, CANDLE_LIMIT)
+        rows15 = get_klines(symbol, TF_15M, 180)
+        if len(rows5) < 120 or len(rows15) < 30:
+            return f"❌ داتای بەشی پێویست بۆ {symbol} بەردەست نییە. دڵنیابە کۆینەکە لە Bitget USDT Futures هەیە."
+
+        cur = rows5[-1]["close"]
+        e20_5 = ema([r["close"] for r in rows5], 20)[-1]
+        e50_5 = ema([r["close"] for r in rows5], 50)[-1]
+        e20_15 = ema([r["close"] for r in rows15], 20)[-1]
+        e50_15 = ema([r["close"] for r in rows15], 50)[-1]
+
+        long_sig = _move_setup(rows5, "LONG")
+        short_sig = _move_setup(rows5, "SHORT")
+        long_score = int(cur > e20_5) + int(e20_5 > e50_5) + int(e20_15 > e50_15)
+        short_score = int(cur < e20_5) + int(e20_5 < e50_5) + int(e20_15 < e50_15)
+
+        if long_sig and not short_sig:
+            verdict = "🟢 LONG setup موجودە"
+            setup = long_sig
+        elif short_sig and not long_sig:
+            verdict = "🔴 SHORT setup موجودە"
+            setup = short_sig
+        elif long_sig and short_sig:
+            if long_score > short_score:
+                verdict = "🟢 LONG bias — بەڵام هەردوو لایەن setup هەیە"
+                setup = long_sig
+            elif short_score > long_score:
+                verdict = "🔴 SHORT bias — بەڵام هەردوو لایەن setup هەیە"
+                setup = short_sig
+            else:
+                verdict = "🟡 WAIT — هەردوو لایەن نزیکن"
+                setup = None
+        else:
+            if long_score >= 2 and short_score == 0:
+                verdict = "🟢 LONG bias — setupی تەواو نییە"
+            elif short_score >= 2 and long_score == 0:
+                verdict = "🔴 SHORT bias — setupی تەواو نییە"
+            else:
+                verdict = "🟡 WAIT — setupی تەواو نییە"
+            setup = None
+
+        context_long = _context_15m(rows15, "LONG")
+        context_short = _context_15m(rows15, "SHORT")
+        lines = [
+            f"🔎 SAIWAN ANALYSIS — {symbol}", "", verdict,
+            f"💵 Price: {fmt_price(cur)}",
+            "⏱ Timeframe: 15m Momentum Engine", "",
+            f"5m EMA20: {fmt_price(e20_5)} | EMA50: {fmt_price(e50_5)}",
+            f"15m EMA20: {fmt_price(e20_15)} | EMA50: {fmt_price(e50_15)}",
+            f"15m Long context: {context_long}",
+            f"15m Short context: {context_short}", "",
+            f"📊 Bias checks — LONG {long_score}/3 · SHORT {short_score}/3",
+        ]
+        if setup:
+            lines += [
+                "", f"🎯 Entry: {fmt_price(setup['entry'])}",
+                f"🛑 SL: {fmt_price(setup['sl'])}",
+                f"🎯 TP1: {fmt_price(setup['tp1'])}",
+                f"🎯 TP2: {fmt_price(setup['tp2'])}",
+                f"🎯 TP3: {fmt_price(setup['tp3'])}", "",
+                f"✅ {setup.get('pattern','MOMENTUM')} · volume {setup.get('volume_mult',0):.2f}× · extension {setup.get('extension_atr',0):.2f}×ATR",
+            ]
+        else:
+            lines += [
+                "",
+                "ℹ️ هیچ Momentum setup ـێکی تەواو لە ئێستادا نییە.",
+                "باشترە بۆ triggerی تەواو چاوەڕێ بکرێت لە جیاتی دروستکردنی سیگناڵی ناڕاست.",
+            ]
+        return "\n".join(lines)
 
     try:
-        block = _format_htf_block(symbol, TF_15M)
-    except Exception:
-        return f"❌ نەتوانرا شیکاری {symbol} لە 15m بکرێت. دڵنیابە کۆینەکە لە Bitget USDT Futures هەیە."
-
-    setup = block["long_sig"] or block["short_sig"]
-    if block["bias"] == "LONG":
-        verdict = "🟢 LONG bias"
-    elif block["bias"] == "SHORT":
-        verdict = "🔴 SHORT bias"
-    else:
-        verdict = "🟡 MIXED bias"
+        blocks = [_format_htf_block(symbol, tf) for tf in requested]
+    except Exception as e:
+        return f"❌ نەتوانرا شیکاری {symbol} بکرێت بۆ {', '.join(requested)}. دڵنیابە کۆینەکە لە Bitget USDT Futures هەیە."
 
     lines = [
-        f"🔎 SAIWAN ANALYSIS — {symbol}",
-        "",
-        verdict,
-        "⏱ Timeframe: 15M ONLY · CLOSED CANDLES",
-        f"💵 Price: {fmt_price(block['price'])}",
-        f"EMA20: {fmt_price(block['ema20'])} | EMA50: {fmt_price(block['ema50'])}",
-        f"📊 Checks — LONG {block['long_score']}/2 · SHORT {block['short_score']}/2",
-        f"Setup: {block['setup']}",
+        f"🔎 SAIWAN HTF ANALYSIS — {symbol}", "",
+        _analysis_verdict(blocks),
+        "📌 This is market analysis only — no automatic trading.", "",
     ]
-    if setup:
+    for b in blocks:
         lines += [
-            "",
-            f"🎯 Entry: {fmt_price(setup['entry'])}",
-            f"🛑 SL: {fmt_price(setup['sl'])}",
-            f"🎯 TP1: {fmt_price(setup['tp1'])}",
-            f"🎯 TP2: {fmt_price(setup['tp2'])}",
-            f"🎯 TP3: {fmt_price(setup['tp3'])}",
-            "",
-            f"⚡ {setup.get('pattern','MOMENTUM')} · volume {setup.get('volume_mult',0):.2f}× · extension {setup.get('extension_atr',0):.2f}× ATR",
+            f"━━ {b['timeframe'].upper()} ━━",
+            f"💵 Price: {fmt_price(b['price'])}",
+            f"EMA20: {fmt_price(b['ema20'])} | EMA50: {fmt_price(b['ema50'])}",
+            f"Bias: {'🟢 LONG' if b['bias']=='LONG' else '🔴 SHORT' if b['bias']=='SHORT' else '🟡 MIXED'}",
+            f"📊 Checks — LONG {b['long_score']}/2 · SHORT {b['short_score']}/2",
+            f"Setup: {b['setup']}",
         ]
-    else:
-        lines += ["", "ℹ️ هیچ Momentum setup ـێکی تەواو لە ئێستادا نییە."]
+        setup = b["long_sig"] or b["short_sig"]
+        if setup:
+            lines += [
+                f"Entry: {fmt_price(setup['entry'])}",
+                f"SL: {fmt_price(setup['sl'])}",
+                f"TP1: {fmt_price(setup['tp1'])}",
+                f"TP2: {fmt_price(setup['tp2'])}",
+                f"TP3: {fmt_price(setup['tp3'])}",
+            ]
+        lines.append("")
+
+    if len(blocks) >= 2:
+        b1, b2 = blocks[0], blocks[1]
+        if b1["bias"] == b2["bias"] and b1["bias"] in ("LONG", "SHORT"):
+            lines += [f"🎯 HTF ALIGNMENT: {b1['bias']} — {b1['timeframe']} + {b2['timeframe']} agree."]
+        else:
+            lines += ["⚠️ HTF ALIGNMENT: Mixed — wait for the timeframes to agree before treating it as a directional setup."]
     return "\n".join(lines)
+
 
 def _setup_metrics(sig):
     """Transparent Momentum Engine metrics; quality is a rule count, not probability."""
@@ -1672,11 +1304,6 @@ def _setup_metrics(sig):
     rr1 = abs(float(sig["tp1"])-entry)/risk
     rr2 = abs(float(sig["tp2"])-entry)/risk
     rr3 = abs(float(sig["tp3"])-entry)/risk
-    if sig.get("pattern") == "SA-VWAP RETEST" and sig.get("strength") is not None:
-        # The supplied Pine script calls this a context strength score, not a
-        # backtested probability. Convert it only for the bot's compact /10 UI.
-        quality = round(float(sig.get("strength", 0.0)) / 10.0)
-        return {"risk":risk,"rr1":rr1,"rr2":rr2,"rr3":rr3,"quality":min(10, max(0, quality))}
     checks = sig.get("checks") or {}
     quality = sum(bool(checks.get(k)) for k in ("Range","Breakout","Volume","Trend"))
     quality += 1 if sig.get("retest_ok") else 0
@@ -1688,7 +1315,7 @@ def _setup_metrics(sig):
 def _setup_detail_lines(sig):
     m = _setup_metrics(sig)
     return [
-        (f"⭐ SA-VWAP Strength: {sig.get('strength',0):.0f}/100" if sig.get('pattern') == 'SA-VWAP RETEST' else f"⭐ Quality: {m['quality']}/10 (rule-based)"),
+        f"⭐ Quality: {m['quality']}/10 (rule-based)",
         f"📐 R:R — TP1 {m['rr1']:.2f}R · TP2 {m['rr2']:.2f}R · TP3 {m['rr3']:.2f}R",
         f"📊 Volume {sig.get('volume_mult',0):.2f}× · Extension {sig.get('extension_atr',0):.2f}×ATR",
     ]
@@ -1714,7 +1341,7 @@ def _record_history(state, outcome, level=None):
         "outcome": outcome,
         "level": level,
         "source": state.get("source", "scanner"),
-        "timeframe": state.get("timeframe", "15m"),
+        "timeframe": state.get("timeframe", "5m"),
     }
     with state_lock:
         signal_history.append(item)
@@ -1878,10 +1505,10 @@ def _get_historical_klines(symbol, timeframe, days=30):
     Bitget's historical-candle endpoint returns up to 200 rows per request, so
     we walk backward from now. The exact available history depends on timeframe.
     """
-    granularity = {"15m":"15m"}.get(str(timeframe).lower())
+    granularity = {"5m":"5m","15m":"15m","1h":"1H","4h":"4H"}.get(str(timeframe).lower())
     if not granularity:
         raise ValueError("unsupported timeframe")
-    candle_ms = {"15m":900000}[str(timeframe).lower()]
+    candle_ms = {"5m":300000,"15m":900000,"1h":3600000,"4h":14400000}[str(timeframe).lower()]
     now_ms = int(time.time()*1000)
     start_ms = now_ms - int(days*86400000)
     cursor_end = now_ms
@@ -1987,8 +1614,8 @@ def _backtest_text(parts):
     if len(parts) not in (2,3,4):
         return ("🧪 BACKTEST\n\n"
                 "نموونە: /backtest BTC 15m 30\n"
-                "Timeframe: 15m only\n"
-                "Days: 7–52 · Strategy timeframe: 15m only.")
+                "Timeframe: 5m, 15m, 1h, 4h\n"
+                "Days: 7–52 (15m supports up to the available Bitget history).")
     symbol=_normalize_analysis_symbol(parts[1])
     tf=_normalize_analysis_timeframe(parts[2]) if len(parts)>=3 else SIGNAL_TIMEFRAME
     try:
@@ -2196,11 +1823,8 @@ def status_text():
         f"Scanner: {'RUNNING' if scanner else 'STOPPED'}\n"
         f"Smart Watch: {'ON' if watch_on else 'OFF'} ({watched}/{MAX_WATCH_ITEMS})\n"
         "Market: Bitget USDT Perpetual Futures\n"
-        "Strategy: SAIWAN SA-VWAP RETEST\n"
-        "Engine: Anchored VWAP + Retest + Strength\n"
-        f"Scan timeframe: {_scan_timeframe_label(active_scan_timeframe)}\n"
-        f"Analysis timeframe: {_scan_timeframe_label(active_scan_timeframe)}\n"
-        "Risk: ATR 1.5R · TP 1R / 2R / 3R · TP1 → BE\n"
+        "Strategy: SAIWAN Momentum Engine — Breakout + Pullback + Volume + ATR\n"
+        "Analysis: 5m / 15m / 1h / 4h\n"
         f"Pending signals: {pending}\n"
         f"Tracked signals: {tracked}\n"
         f"History: {hist}\n"
@@ -2222,9 +1846,8 @@ def _error_bucket(exc):
     return type(exc).__name__
 
 
-def scan_once(timeframe=None):
+def scan_once():
     global pending_signals
-    timeframe = _normalize_scan_timeframe(timeframe) or active_scan_timeframe
     contracts = get_contracts()
     tickers = get_tickers()
     tv = {x.get("symbol"): x for x in tickers}
@@ -2243,10 +1866,10 @@ def scan_once(timeframe=None):
 
     def check_symbol(symbol):
         try:
-            rows_tf = get_klines(symbol, timeframe, CANDLE_LIMIT)
-            if len(rows_tf) < 90:
+            rows15 = get_klines(symbol, SIGNAL_TIMEFRAME, CANDLE_LIMIT)
+            if len(rows15) < 90:
                 return symbol, None, None
-            return symbol, analyze(symbol, rows_tf, None, timeframe), None
+            return symbol, analyze(symbol, rows15, None), None
         except Exception as e:
             return symbol, None, e
 
@@ -2261,7 +1884,7 @@ def scan_once(timeframe=None):
                 error_buckets[key] = error_buckets.get(key, 0) + 1
                 continue
             if sig:
-                key = f"{timeframe}:{symbol}:{sig['direction']}:{sig['time']}"
+                key = f"{symbol}:{sig['direction']}:{sig['time']}"
                 if key not in seen_signals:
                     sig["key"] = key
                     found.append(sig)
@@ -2283,7 +1906,7 @@ def scan_once(timeframe=None):
 
     total_errors = sum(error_buckets.values())
     summary = ", ".join(f"{name}={count}" for name, count in sorted(error_buckets.items(), key=lambda kv: kv[1], reverse=True)[:4])
-    print(f"Bitget Momentum Engine scan: timeframe={timeframe}, universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
+    print(f"Bitget Momentum Engine scan: universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
     if not contracts:
         print("Bitget warning: no contracts returned from /api/v2/mix/market/contracts")
     elif not tickers:
@@ -2296,22 +1919,20 @@ def signal_caption(sig):
     d = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
     m = _setup_metrics(sig)
     return (
-        f"🚀 SAIWAN SA-VWAP SIGNAL\n\n{d}\n"
+        f"🚀 SAIWAN MOMENTUM SIGNAL\n\n{d}\n"
         f"⭐ {sig['symbol']} · Bitget Futures\n"
         f"⏱ {sig.get('timeframe', SIGNAL_TIMEFRAME).upper()} · CLOSED CANDLES\n\n"
         f"Pattern: {sig.get('pattern','MOMENTUM')}\n"
-        + (f"VWAP: {fmt_price(sig.get('sa_vwap', 0))} · Strength: {sig.get('strength', 0):.0f}/100\n"
-           if sig.get('pattern') == 'SA-VWAP RETEST' else
-           "Range → Breakout/Breakdown → Pullback/Continuation\n")
-        + f"Volume: {sig.get('volume_mult',0):.2f}× avg · Extension: {sig.get('extension_atr',0):.2f}× ATR\n\n"
+        f"Range → Breakout/Breakdown → Pullback/Continuation\n"
+        f"Volume: {sig.get('volume_mult',0):.2f}× avg · Extension: {sig.get('extension_atr',0):.2f}× ATR\n\n"
         f"Entry: {fmt_price(sig['entry'])}\n"
         f"SL: {fmt_price(sig['sl'])}\n"
         f"TP1: {fmt_price(sig['tp1'])}\n"
         f"TP2: {fmt_price(sig['tp2'])}\n"
         f"TP3: {fmt_price(sig['tp3'])}\n"
         f"⭐ Quality: {m['quality']}/10 · R:R {m['rr1']:.2f} / {m['rr2']:.2f} / {m['rr3']:.2f}\n\n"
-        + ("🛡️ TP1 → SL moved to BE\n" if sig.get('pattern') == 'SA-VWAP RETEST' and SA_VWAP_USE_BE else "🛡️ Anti-chase filter: ON\n")
-        + "⚠️ Signal only — no automatic trading."
+        "🛡️ Anti-chase filter: ON\n"
+        "⚠️ Signal only — no automatic trading."
     )
 
 
@@ -2319,7 +1940,7 @@ def scanner_loop():
     global scanner_running
     scanner_running=True
     while not stop_event.is_set():
-        try: scan_once(active_scan_timeframe)
+        try: scan_once()
         except Exception as e: print(f"SCAN LOOP ERROR {type(e).__name__}: {e}")
         force_scan_event.clear()
         for _ in range(SCAN_INTERVAL):
@@ -2340,13 +1961,10 @@ def track_sent_signal(sig, chat_id, message_id, source="scanner"):
             "direction": sig["direction"],
             "entry": sig["entry"],
             "sl": sig["sl"],
-            "active_sl": sig["sl"],
-            "be_active": False,
-            "tp1_be_enabled": bool(SA_VWAP_USE_BE and sig.get("pattern") == "SA-VWAP RETEST"),
             "tp1": sig["tp1"],
             "tp2": sig["tp2"],
             "tp3": sig["tp3"],
-            "timeframe": sig.get("timeframe", "15m"),
+            "timeframe": sig.get("timeframe", "5m"),
             "source": source,
             "tp1_hit": False,
             "tp2_hit": False,
@@ -2385,15 +2003,14 @@ def monitor_active_signals():
             try:
                 # Stop monitoring after SL. This prevents a later TP notification
                 # after the original setup has already been invalidated.
-                if _hit_level(state["direction"], state.get("active_sl", state["sl"]), price):
-                    sl_label = "BE" if state.get("be_active") else "SL"
+                if _hit_level(state["direction"], state["sl"], price):
                     send_message(
                         state["chat_id"],
-                        f"🛑 {sl_label} Hit\n⭐ {state['symbol']}\n💵 Price: {fmt_price(price)}",
+                        f"🛑 SL Hit\n⭐ {state['symbol']}\n💵 Price: {fmt_price(price)}",
                         reply_to_message_id=state["message_id"],
                     )
                     _record_history(state, "SL", "SL")
-                    _record_alert("SL", symbol=state["symbol"], timeframe=state.get("timeframe", "15m"), direction=state["direction"])
+                    _record_alert("SL", symbol=state["symbol"], timeframe=state.get("timeframe", "5m"), direction=state["direction"])
                     with state_lock:
                         active_signals.pop(state["key"], None)
                     continue
@@ -2411,18 +2028,11 @@ def monitor_active_signals():
                         )
                         if name == "tp3":
                             _record_history(state, "TP3", "TP3")
-                            _record_alert("TP3", symbol=state["symbol"], timeframe=state.get("timeframe", "15m"), direction=state["direction"])
+                            _record_alert("TP3", symbol=state["symbol"], timeframe=state.get("timeframe", "5m"), direction=state["direction"])
                         else:
-                            # TP1/TP2 are milestones. SA-VWAP moves SL to entry after TP1.
-                            _record_alert(name.upper(), symbol=state["symbol"], timeframe=state.get("timeframe", "15m"), direction=state["direction"])
-                            if name == "tp1" and state.get("tp1_be_enabled") and not state.get("be_active"):
-                                state["active_sl"] = state["entry"]
-                                state["be_active"] = True
-                                send_message(
-                                    state["chat_id"],
-                                    f"🛡️ BREAK-EVEN\n⭐ {state['symbol']}\n💵 SL moved to Entry: {fmt_price(state['entry'])}",
-                                    reply_to_message_id=state["message_id"],
-                                )
+                            # TP1/TP2 are milestones, not closed trades. Keep them in alerts,
+                            # while /history remains a terminal-outcome history.
+                            _record_alert(name.upper(), symbol=state["symbol"], timeframe=state.get("timeframe", "5m"), direction=state["direction"])
                         with state_lock:
                             if state["key"] in active_signals:
                                 active_signals[state["key"]][hit_key] = True
@@ -2461,11 +2071,9 @@ def sender_loop():
             print(f"SEND ERROR {type(e).__name__}: {e}")
 
 
-def start_scanner(chat_id, timeframe=TF_15M):
-    global scanner_thread, active_chat_id, active_scan_timeframe
+def start_scanner(chat_id):
+    global scanner_thread, active_chat_id
     active_chat_id = chat_id
-    tf = _normalize_scan_timeframe(timeframe) or TF_15M
-    active_scan_timeframe = tf
     with state_lock:
         running = scanner_running
     if not running:
@@ -2484,7 +2092,7 @@ def poll_updates():
     conflict_wait = 3
     while True:
         try:
-            r = requests.get(telegram_url("getUpdates"), params={"timeout": 25, "offset": offset, "allowed_updates": json.dumps(["message", "callback_query"])}, timeout=35)
+            r = requests.get(telegram_url("getUpdates"), params={"timeout": 25, "offset": offset, "allowed_updates": json.dumps(["message"])}, timeout=35)
             if r.status_code == 409:
                 print("TELEGRAM 409 CONFLICT: another poller is active; retrying shortly")
                 time.sleep(conflict_wait)
@@ -2495,9 +2103,6 @@ def poll_updates():
             data = r.json()
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
-                if upd.get("callback_query"):
-                    _handle_callback_query(upd["callback_query"])
-                    continue
                 msg = upd.get("message") or {}
                 chat = msg.get("chat") or {}
                 text = (msg.get("text") or "").strip()
@@ -2508,10 +2113,30 @@ def poll_updates():
                 cmd = parts[0].split("@")[0].lower() if parts else ""
                 try:
                     if cmd == "/start":
-                        send_message(active_chat_id, welcome_text(), main_menu_markup())
+                        send_message(active_chat_id,
+                            "🚀 SAIWAN CRYPTO SIGNAL\n\n"
+                            "/scan - Start full scanner\n"
+                            "/scan BTC - Quick market scan\n"
+                            "/scan top - Smart Scan\n"
+                            "/movers - Top 24h movers\n"
+                            "/stop - Stop scanner\n"
+                            "/watch BTC 5m - Smart Watch\n"
+                            "/unwatch BTC - Remove watch\n"
+                            "/watchlist - Watched coins\n"
+                            "/alerts - Recent alerts\n"
+                            "/analysis BTC 5m - One timeframe only\n"
+                            "/risk BTC 1000 1 - Risk amount\n"
+                            "/risk BTC 1000 1 105000 103800 - Position size\n"
+                            "/history - Closed signal history\n"
+                            "/stats [BTC] - Signal statistics\n"
+                            "/settings - Bot settings\n"
+                            "/status - Bot status\n\n"
+                            "Market: Bitget USDT Perpetual Futures\n"
+                            "Model: SAIWAN Momentum Engine — Breakout + Pullback + Volume + ATR\n"
+                            "TP/SL monitoring: ENABLED")
                     elif cmd == "/scan":
                         if len(parts) == 1:
-                            start_scanner(active_chat_id, TF_15M)
+                            start_scanner(active_chat_id)
                             send_message(active_chat_id, "🚀 SAIWAN MOMENTUM SCANNER STARTED\n\n15m closed candles · breakout + pullback + volume + ATR. Anti-chase filter is enabled. TP/SL monitoring is enabled.")
                         elif parts[1].lower() in ("top", "smart", "smartscan"):
                             send_message(active_chat_id, "📊 Smart Scan خەریکە بازارەکە پشکنین دەکات...")
@@ -2528,7 +2153,7 @@ def poll_updates():
                         else:
                             symbol = _normalize_analysis_symbol(parts[1]); tf = _normalize_analysis_timeframe(parts[2])
                             if not symbol or not tf:
-                                send_message(active_chat_id, "❌ Coin یان timeframe هەڵەیە. Timeframe: 15m only")
+                                send_message(active_chat_id, "❌ Coin یان timeframe هەڵەیە. Timeframe: 5m, 15m, 1h, 4h")
                             else:
                                 with watch_lock:
                                     if symbol not in watchlist and len(watchlist) >= MAX_WATCH_ITEMS:
@@ -2560,11 +2185,11 @@ def poll_updates():
                         send_message(active_chat_id, _alerts_text())
                     elif cmd == "/analysis":
                         if len(parts) != 3:
-                            send_message(active_chat_id, "🔎 نموونە:\n/analysis BTC 15m\n/analysis AVAX 15m")
+                            send_message(active_chat_id, "🔎 نموونە:\n/analysis BTC 5m\n/analysis AVAX 15m\n/analysis ETH 1h\n/analysis BTC 4h")
                         else:
                             symbol = _normalize_analysis_symbol(parts[1]); tf = _normalize_analysis_timeframe(parts[2])
                             if not tf:
-                                send_message(active_chat_id, "❌ Timeframe ـی بۆتەکە تەنها 15m ـە. نموونە: /analysis BTC 15m")
+                                send_message(active_chat_id, "❌ Timeframe ـی دروست: 5m, 15m, 1h, 4h")
                             else:
                                 send_message(active_chat_id, f"🔎 خەریکم {symbol} شیکاری دەکەم...\n⏱ {tf.upper()}")
                                 send_message(active_chat_id, analysis_report(symbol, [tf]))
