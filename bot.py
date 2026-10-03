@@ -1038,6 +1038,174 @@ def telegram_url(method):
     return TELEGRAM_API + TOKEN + "/" + method
 
 
+def _inline_button(text, callback_data):
+    return {"text": text, "callback_data": callback_data}
+
+
+def main_menu_markup():
+    return {
+        "inline_keyboard": [
+            [_inline_button("🔥 SCAN MARKET", "menu_scan"), _inline_button("🎯 TOP MOMENTUM", "scan_top")],
+            [_inline_button("📈 MOVERS", "movers"), _inline_button("🔎 ANALYSIS", "menu_analysis")],
+            [_inline_button("👁 WATCHLIST", "watchlist"), _inline_button("🔔 ALERTS", "alerts")],
+            [_inline_button("📜 HISTORY", "history"), _inline_button("📊 STATS", "stats")],
+            [_inline_button("💰 RISK", "risk"), _inline_button("⚙️ SETTINGS", "menu_settings")],
+            [_inline_button("🟢 BOT STATUS", "status"), _inline_button("🛑 STOP SCANNER", "stop")],
+        ]
+    }
+
+
+def scan_menu_markup():
+    return {
+        "inline_keyboard": [
+            [_inline_button("⚡ FULL 15M SCAN", "scan_full")],
+            [_inline_button("🎯 TOP MOMENTUM", "scan_top")],
+            [_inline_button("📈 TOP MOVERS", "movers")],
+            [_inline_button("◀️ BACK", "menu_main")],
+        ]
+    }
+
+
+def analysis_menu_markup():
+    coins = [("BTC", "BTC"), ("ETH", "ETH"), ("SOL", "SOL"), ("BNB", "BNB"), ("XRP", "XRP"), ("AVAX", "AVAX")]
+    rows = []
+    for i in range(0, len(coins), 2):
+        rows.append([_inline_button(f"🔎 {coins[i][0]} 15M", f"analysis:{coins[i][1]}"), _inline_button(f"🔎 {coins[i+1][0]} 15M", f"analysis:{coins[i+1][1]}")])
+    rows.append([_inline_button("◀️ BACK", "menu_main")])
+    return {"inline_keyboard": rows}
+
+
+def settings_menu_markup():
+    return {
+        "inline_keyboard": [
+            [_inline_button("🔔 ALERTS ON", "settings_alerts_on"), _inline_button("🔕 ALERTS OFF", "settings_alerts_off")],
+            [_inline_button("🟢 STATUS", "status")],
+            [_inline_button("◀️ BACK", "menu_main")],
+        ]
+    }
+
+
+def welcome_text():
+    return (
+        "🚀 SAIWAN CRYPTO SIGNALS\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "⚡ MOMENTUM ENGINE\n"
+        "📊 15M • BITGET FUTURES\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "🎯 Breakout • Pullback • Volume • ATR\n"
+        "🔔 Signal + TP/SL monitoring: ACTIVE\n\n"
+        "Choose an action from the buttons below."
+    )
+
+
+def edit_message(chat_id, message_id, text, reply_markup=None):
+    data = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if reply_markup is not None:
+        data["reply_markup"] = json.dumps(reply_markup)
+    r = requests.post(telegram_url("editMessageText"), data=data, timeout=HTTP_TIMEOUT)
+    if not r.ok:
+        raise RuntimeError(f"Telegram editMessageText {r.status_code}: {r.text[:500]}")
+    return r.json()
+
+
+def answer_callback(callback_id, text=None):
+    data = {"callback_query_id": callback_id}
+    if text:
+        data["text"] = text
+    r = requests.post(telegram_url("answerCallbackQuery"), data=data, timeout=HTTP_TIMEOUT)
+    if not r.ok:
+        raise RuntimeError(f"Telegram answerCallbackQuery {r.status_code}: {r.text[:500]}")
+
+
+def _handle_callback_query(query):
+    global active_chat_id
+    callback_id = query.get("id")
+    data = str(query.get("data") or "")
+    msg = query.get("message") or {}
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    message_id = msg.get("message_id")
+    if not chat_id or not message_id:
+        if callback_id:
+            answer_callback(callback_id)
+        return
+    active_chat_id = chat_id
+    try:
+        if data == "menu_main":
+            edit_message(chat_id, message_id, welcome_text(), main_menu_markup())
+            answer_callback(callback_id)
+        elif data == "menu_scan":
+            edit_message(chat_id, message_id, "🔥 SCAN MARKET\n\nChoose a scan:", scan_menu_markup())
+            answer_callback(callback_id)
+        elif data == "menu_analysis":
+            edit_message(chat_id, message_id, "🔎 15M ANALYSIS\n\nChoose a coin:", analysis_menu_markup())
+            answer_callback(callback_id)
+        elif data == "menu_settings":
+            edit_message(chat_id, message_id, "⚙️ SETTINGS\n\nChoose an option:", settings_menu_markup())
+            answer_callback(callback_id)
+        elif data == "scan_full":
+            start_scanner(chat_id)
+            edit_message(chat_id, message_id, "🚀 15M SCANNER STARTED\n\nThe Momentum Engine is scanning closed candles.\n\n⚡ Breakout + Pullback + Volume + ATR\n🔒 Anti-chase filter: ON\n🎯 TP/SL monitoring: ON", main_menu_markup())
+            answer_callback(callback_id, "Scanner started")
+        elif data == "scan_top":
+            answer_callback(callback_id, "Scanning top momentum setups…")
+            report = _smart_scan_report()
+            edit_message(chat_id, message_id, report, main_menu_markup())
+        elif data == "movers":
+            answer_callback(callback_id, "Loading 24H movers…")
+            edit_message(chat_id, message_id, _movers_report(), main_menu_markup())
+        elif data == "watchlist":
+            answer_callback(callback_id)
+            edit_message(chat_id, message_id, "👁 WATCHLIST\n\n" + _watch_text(), main_menu_markup())
+        elif data == "alerts":
+            answer_callback(callback_id)
+            edit_message(chat_id, message_id, "🔔 RECENT ALERTS\n\n" + _alerts_text(), main_menu_markup())
+        elif data == "history":
+            answer_callback(callback_id)
+            edit_message(chat_id, message_id, "📜 SIGNAL HISTORY\n\n" + _history_text(None), main_menu_markup())
+        elif data == "stats":
+            answer_callback(callback_id)
+            edit_message(chat_id, message_id, "📊 SIGNAL STATISTICS\n\n" + _stats_text(None), main_menu_markup())
+        elif data == "risk":
+            answer_callback(callback_id)
+            edit_message(chat_id, message_id, "💰 RISK / POSITION SIZE\n\nFor custom position sizing use:\n/risk BTC 1000 1\n\nFor entry/SL based sizing:\n/risk BTC 1000 1 105000 103800", main_menu_markup())
+        elif data == "status":
+            answer_callback(callback_id)
+            edit_message(chat_id, message_id, "🟢 BOT STATUS\n\n" + status_text(), main_menu_markup())
+        elif data == "stop":
+            stop_scanner()
+            answer_callback(callback_id, "Scanner stopped")
+            edit_message(chat_id, message_id, "🛑 SCANNER STOPPED\n\nSmart Watch remains available if enabled.", main_menu_markup())
+        elif data.startswith("analysis:"):
+            symbol = _normalize_analysis_symbol(data.split(":", 1)[1])
+            answer_callback(callback_id, f"Analyzing {symbol}…")
+            report = analysis_report(symbol, [TF_15M])
+            edit_message(chat_id, message_id, "🔎 15M ANALYSIS\n\n" + report, analysis_menu_markup())
+            try:
+                for chart_path in make_analysis_charts(symbol, [TF_15M]):
+                    send_photo(chat_id, chart_path, f"📊 SAIWAN CHART — {symbol} · 15M")
+            except Exception as e:
+                print(f"BUTTON ANALYSIS CHART ERROR {type(e).__name__}: {e}")
+        elif data == "settings_alerts_on":
+            with watch_lock:
+                bot_settings["alerts"] = True
+            answer_callback(callback_id, "Alerts enabled")
+            edit_message(chat_id, message_id, "⚙️ SETTINGS\n\n🔔 Smart Watch alerts: ON", settings_menu_markup())
+        elif data == "settings_alerts_off":
+            with watch_lock:
+                bot_settings["alerts"] = False
+            answer_callback(callback_id, "Alerts disabled")
+            edit_message(chat_id, message_id, "⚙️ SETTINGS\n\n🔕 Smart Watch alerts: OFF", settings_menu_markup())
+        else:
+            answer_callback(callback_id, "Unknown button")
+    except Exception as e:
+        print(f"CALLBACK ERROR {data}: {type(e).__name__}: {e}")
+        try:
+            answer_callback(callback_id, "Action failed")
+        except Exception:
+            pass
+
+
 def send_message(chat_id, text, reply_markup=None, reply_to_message_id=None):
     data = {"chat_id": chat_id, "text": text}
     if reply_markup is not None:
@@ -2006,7 +2174,7 @@ def poll_updates():
     conflict_wait = 3
     while True:
         try:
-            r = requests.get(telegram_url("getUpdates"), params={"timeout": 25, "offset": offset, "allowed_updates": json.dumps(["message"])}, timeout=35)
+            r = requests.get(telegram_url("getUpdates"), params={"timeout": 25, "offset": offset, "allowed_updates": json.dumps(["message", "callback_query"])}, timeout=35)
             if r.status_code == 409:
                 print("TELEGRAM 409 CONFLICT: another poller is active; retrying shortly")
                 time.sleep(conflict_wait)
@@ -2017,6 +2185,9 @@ def poll_updates():
             data = r.json()
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
+                if upd.get("callback_query"):
+                    _handle_callback_query(upd["callback_query"])
+                    continue
                 msg = upd.get("message") or {}
                 chat = msg.get("chat") or {}
                 text = (msg.get("text") or "").strip()
@@ -2027,27 +2198,7 @@ def poll_updates():
                 cmd = parts[0].split("@")[0].lower() if parts else ""
                 try:
                     if cmd == "/start":
-                        send_message(active_chat_id,
-                            "🚀 SAIWAN CRYPTO SIGNAL\n\n"
-                            "/scan - Start full scanner\n"
-                            "/scan BTC - Quick market scan\n"
-                            "/scan top - Smart Scan\n"
-                            "/movers - Top 24h movers\n"
-                            "/stop - Stop scanner\n"
-                            "/watch BTC 5m - Smart Watch\n"
-                            "/unwatch BTC - Remove watch\n"
-                            "/watchlist - Watched coins\n"
-                            "/alerts - Recent alerts\n"
-                            "/analysis BTC 15m - 15m analysis only\n"
-                            "/risk BTC 1000 1 - Risk amount\n"
-                            "/risk BTC 1000 1 105000 103800 - Position size\n"
-                            "/history - Closed signal history\n"
-                            "/stats [BTC] - Signal statistics\n"
-                            "/settings - Bot settings\n"
-                            "/status - Bot status\n\n"
-                            "Market: Bitget USDT Perpetual Futures\n"
-                            "Model: SAIWAN Momentum Engine — Breakout + Pullback + Volume + ATR\n"
-                            "TP/SL monitoring: ENABLED")
+                        send_message(active_chat_id, welcome_text(), main_menu_markup())
                     elif cmd == "/scan":
                         if len(parts) == 1:
                             start_scanner(active_chat_id)
