@@ -29,9 +29,9 @@ SUPPORTED_SCAN_TIMEFRAMES = (TF_15M, TF_30M, TF_1H, TF_2H, TF_4H)
 CANDLE_LIMIT = 260
 # 0 = scan every eligible Bitget USDT perpetual contract (no top-N cap)
 MAX_PAIRS = 0
-SCAN_WORKERS = 6
+SCAN_WORKERS = 10
 SCAN_INTERVAL = 60
-SEND_INTERVAL = 600  # minimum 10 minutes between sent signals
+SEND_INTERVAL = 60  # SA-VWAP: deliver as soon as the confirmed 15m trigger is found
 SIGNAL_TIMEFRAME = TF_15M
 CHART_CANDLES = 80
 HTTP_TIMEOUT = 15
@@ -46,7 +46,7 @@ TP1_R = 1.5
 TP2_R = 2.5
 TP3_R = 4.0
 
-# SAIWAN Momentum Engine — tuned as a starting point for backtesting.
+# SAIWAN SA-VWAP Engine — tuned as a starting point for backtesting.
 MOM_RANGE_LOOKBACK = 20
 MOM_BREAKOUT_WINDOW = 12
 MOM_MAX_PULLBACK_BARS = 12
@@ -622,7 +622,7 @@ def _ema_alignment(rows, direction):
 
 def _momentum_setup(rows, direction, sl_atr_buffer=MOM_SL_ATR_BUFFER,
                     tp_multipliers=(TP1_R, TP2_R, TP3_R)):
-    """SAIWAN Momentum Engine: breakout/breakdown -> controlled pullback -> continuation.
+    """SAIWAN SA-VWAP Engine: breakout/breakdown -> controlled pullback -> continuation.
 
     Only closed candles in ``rows`` are used. The current last candle is the
     confirmed trigger. Signals are rejected when price is already too extended,
@@ -801,188 +801,340 @@ def _momentum_setup(rows, direction, sl_atr_buffer=MOM_SL_ATR_BUFFER,
     return None
 
 
-def _sa_vwap_setup(rows, direction):
-    """Python port of the supplied SA-VWAP Pine signal/risk core.
+def _pine_rma(values, period):
+    """TradingView ta.rma() equivalent for a fully known historical series."""
+    out = [None] * len(values)
+    if len(values) < period:
+        return out
+    seed = sum(values[:period]) / float(period)
+    out[period - 1] = seed
+    alpha = 1.0 / float(period)
+    prev = seed
+    for i in range(period, len(values)):
+        v = values[i]
+        prev = alpha * v + (1.0 - alpha) * prev
+        out[i] = prev
+    return out
 
-    The source uses Swing anchoring by default, cumulative volume-weighted VWAP,
-    volume-weighted sigma bands, a 5-bar minimum-away retest and the Balanced
-    risk preset (1.5 ATR SL, 1R/2R/3R TP). Only closed candles are supplied by
-    the scanner, so no realtime candle is used here.
+
+def _pine_atr_series(rows, period=13):
+    if not rows:
+        return []
+    trs = []
+    for i, r in enumerate(rows):
+        if i == 0:
+            tr = r["high"] - r["low"]
+        else:
+            pc = rows[i - 1]["close"]
+            tr = max(r["high"] - r["low"], abs(r["high"] - pc), abs(r["low"] - pc))
+        trs.append(max(float(tr), 0.0))
+    return _pine_rma(trs, period)
+
+
+def _pine_median(values):
+    vals = sorted(float(v) for v in values if v is not None and math.isfinite(float(v)))
+    if not vals:
+        return 0.0
+    m = len(vals)
+    mid = m // 2
+    if m % 2:
+        return vals[mid]
+    return (vals[mid - 1] + vals[mid]) / 2.0
+
+
+def _sa_weight_series(rows):
+    """Exact default SA-VWAP weighting: cumulative volume, capped at 4x median(50)."""
+    weights = []
+    for i, r in enumerate(rows):
+        raw = max(float(r.get("vol", 0.0)), 0.0)
+        med = _pine_median([rows[k].get("vol", 0.0) for k in range(max(0, i - 49), i + 1)])
+        wt = min(raw, med * SA_VWAP_VOLUME_CLAMP_MEDIAN) if med > 0 else raw
+        weights.append(wt)
+    return weights
+
+
+def _pivot_at(rows, p, left=55, right=55):
+    if p < left or p + right >= len(rows):
+        return False, False
+    h = rows[p]["high"]
+    l = rows[p]["low"]
+    hs = [rows[k]["high"] for k in range(p - left, p + right + 1)]
+    ls = [rows[k]["low"] for k in range(p - left, p + right + 1)]
+    # Pine ta.pivothigh/low accepts equality at the pivot extreme.
+    return h >= max(hs), l <= min(ls)
+
+
+def _sa_build_leg(rows, start, end, direction, weights, atrs, source_points=None):
+    """Rebuild one Pine Leg from its anchor through a confirmed bar."""
+    sum_w = sum_pw = sum_p2 = 0.0
+    away = 0
+    retests = 0
+    points = []
+    for j in range(start, end + 1):
+        px = (rows[j]["high"] + rows[j]["low"]) / 2.0
+        wt = weights[j]
+        sum_w += wt
+        sum_pw += px * wt
+        sum_p2 += px * px * wt
+        if sum_w > 0:
+            vwap = sum_pw / sum_w
+            sigma = math.sqrt(max(sum_p2 / sum_w - vwap * vwap, 0.0))
+        else:
+            vwap = None
+            sigma = 0.0
+        if vwap is None:
+            continue
+        tol = sigma * SA_VWAP_RETEST_TOL_SIGMA if sigma > 0 else (atrs[j] or 0.0) * 0.1
+        r = rows[j]
+        touch = r["low"] <= vwap + tol and r["high"] >= vwap - tol
+        outside = (r["low"] > vwap + tol) if direction > 0 else (r["high"] < vwap - tol)
+        hit = touch and away >= SA_VWAP_RETEST_MIN_AWAY
+        if hit:
+            retests += 1
+        points.append({
+            "index": j, "vwap": vwap, "sigma": sigma, "hit": hit,
+            "away_before": away, "touch": touch, "outside": outside,
+            "retests": retests, "weight": wt,
+        })
+        # Pine's putPoint commits the current bar on a confirmed historical bar.
+        away = 0 if touch else (away + 1 if outside else 0)
+    return points
+
+
+def _sa_vwap_setup(rows, direction):
+    """Bit-for-bit-oriented port of the supplied TradingView SA-VWAP default mode.
+
+    Ground truth is the user's Pine source: Swing anchoring 55/55, ATR(13) RMA,
+    cumulative volume VWAP on hl2, 4x median(50) volume clamp, 5-bar away retest,
+    0.25-sigma touch tolerance, Balanced 1.5 ATR risk and 1R/2R/3R targets.
+    The scanner intentionally emits ONLY a retest on the newest closed candle so
+    it cannot manufacture a late entry after the TradingView event already passed.
     """
     n = len(rows)
-    left, right = SA_VWAP_PIVOT_LEFT, SA_VWAP_PIVOT_RIGHT
-    if n < max(120, left + right + 20):
+    left = SA_VWAP_PIVOT_LEFT
+    right = SA_VWAP_PIVOT_RIGHT
+    if n < max(left + right + 10, 120):
         return None
 
-    # Reproduce the Pine Swing market-structure engine closely enough for the
-    # signal layer: confirmed pivots, minimum swing amplitude, newest pivot wins.
+    atrs = _pine_atr_series(rows, 13)
+    weights = _sa_weight_series(rows)
+    warmup = max(left + right, 50)
+
+    # Pine structure state.
     sw_type = 0
     sw_hi = sw_lo = None
     sw_hi_bar = sw_lo_bar = None
-    events = []
-    for i in range(left, n - right):
-        hi = rows[i]["high"]
-        lo = rows[i]["low"]
-        hi_window = [r["high"] for r in rows[i-left:i+right+1]]
-        lo_window = [r["low"] for r in rows[i-left:i+right+1]]
-        piv_hi = hi >= max(hi_window)
-        piv_lo = lo <= min(lo_window)
-        a = _atr_at(rows, i, 14) or 0.0
-        min_swing = SA_VWAP_MIN_SWING_ATR * a
+    ref_hi = ref_lo = None
+    last_struct = "—"
+    leg = None
+    archived = []
+    active_trade = None
+    latest_signal = None
+    structure_points = []
 
-        if piv_hi:
-            if sw_type == 1:
-                if sw_hi is None or hi > sw_hi:
-                    sw_hi, sw_hi_bar = hi, i
-                    events.append((i, "HIGH", hi))
-            elif sw_type == 0 or (sw_lo is not None and hi - sw_lo >= min_swing):
-                sw_hi, sw_hi_bar, sw_type = hi, i, 1
-                events.append((i, "HIGH", hi))
-        if piv_lo:
-            if sw_type == -1:
-                if sw_lo is None or lo < sw_lo:
-                    sw_lo, sw_lo_bar = lo, i
-                    events.append((i, "LOW", lo))
-            elif sw_type == 0 or (sw_hi is not None and sw_hi - lo >= min_swing):
-                sw_lo, sw_lo_bar, sw_type = lo, i, -1
-                events.append((i, "LOW", lo))
+    def classify(cur, ref, is_high, tol_abs):
+        if ref is None:
+            return "H" if is_high else "L"
+        if abs(cur - ref) <= tol_abs:
+            return "EQH" if is_high else "EQL"
+        return ("HH" if is_high else "HL") if cur > ref else ("LH" if is_high else "LL")
 
-    if sw_type == 1 and sw_hi_bar is not None:
-        leg_dir = -1
-        anchor = sw_hi_bar
-    elif sw_type == -1 and sw_lo_bar is not None:
-        leg_dir = 1
-        anchor = sw_lo_bar
-    else:
-        return None
-
-    if (direction == "LONG" and leg_dir != 1) or (direction == "SHORT" and leg_dir != -1):
-        return None
-    if anchor >= n - 2:
-        return None
-
-    # Build the anchored cumulative VWAP and weighted sigma exactly on the
-    # current leg. Volume is capped at 4x the 50-bar median, as in the source.
-    sum_w = sum_pw = sum_p2w = 0.0
-    points = []
-    for j in range(anchor, n):
-        px = (rows[j]["high"] + rows[j]["low"]) / 2.0
-        recent_vols = [max(float(x.get("vol", 0.0)), 0.0) for x in rows[max(0, j-49):j+1]]
-        med = sorted(recent_vols)[len(recent_vols)//2] if recent_vols else 0.0
-        raw_w = max(float(rows[j].get("vol", 0.0)), 0.0)
-        if med > 0:
-            wt = min(raw_w, med * SA_VWAP_VOLUME_CLAMP_MEDIAN)
+    def make_trade(j, leg_dir, vwap, sigma, strength, retests):
+        risk_atr = atrs[j] or 0.0
+        entry = rows[j]["close"]
+        sl_dist = risk_atr * SA_VWAP_SL_ATR
+        if sl_dist <= 0:
+            return None
+        if leg_dir > 0:
+            sl = entry - sl_dist
+            tp1 = entry + sl_dist * 1.0
+            tp2 = entry + sl_dist * 2.0
+            tp3 = entry + sl_dist * 3.0
         else:
-            wt = 1.0
-        if wt <= 0:
-            wt = 1.0
-        sum_w += wt
-        sum_pw += px * wt
-        sum_p2w += px * px * wt
-        vwap = sum_pw / sum_w
-        sigma = math.sqrt(max(sum_p2w / sum_w - vwap * vwap, 0.0))
-        points.append((j, vwap, sigma, wt))
+            sl = entry + sl_dist
+            tp1 = entry - sl_dist * 1.0
+            tp2 = entry - sl_dist * 2.0
+            tp3 = entry - sl_dist * 3.0
+        if sl <= 0 and leg_dir > 0:
+            return None
+        if risk_atr > 0 and sl_dist > entry * 0.12:
+            return None
+        return {
+            "direction": "LONG" if leg_dir > 0 else "SHORT",
+            "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+            "active_sl": sl, "tp1_hit": False, "tp2_hit": False,
+            "tp3_hit": False, "be_active": False, "entry_bar": j,
+            "vwap": vwap, "sigma": sigma, "strength": strength,
+            "retests": retests,
+        }
 
-    if not points:
+    # Scan exactly as Pine evaluates confirmed bars. A pivot at p becomes known
+    # on confirmation bar p+right, and minSwing/equality tolerance use ATR of the
+    # confirmation bar, not ATR at the pivot itself.
+    for t in range(n):
+        hi_event = lo_event = False
+        hi_ext = lo_ext = False
+        if t >= right:
+            p = t - right
+            piv_hi, piv_lo = _pivot_at(rows, p, left, right)
+            atr_now = atrs[t] or 0.0
+            min_swing = SA_VWAP_MIN_SWING_ATR * atr_now
+            eq_tol = 0.1 * atr_now
+
+            if piv_hi:
+                val = rows[p]["high"]
+                if sw_type == 1:
+                    if sw_hi is None or val > sw_hi:
+                        sw_hi, sw_hi_bar = val, p
+                        hi_event = True
+                        hi_ext = True
+                elif sw_type == 0 or (sw_lo is not None and val - sw_lo >= min_swing):
+                    ref_hi = sw_hi
+                    sw_hi, sw_hi_bar, sw_type = val, p, 1
+                    hi_event = True
+
+            if piv_lo:
+                val = rows[p]["low"]
+                if sw_type == -1:
+                    if sw_lo is None or val < sw_lo:
+                        sw_lo, sw_lo_bar = val, p
+                        lo_event = True
+                        lo_ext = True
+                elif sw_type == 0 or (sw_hi is not None and sw_hi - val >= min_swing):
+                    ref_lo = sw_lo
+                    sw_lo, sw_lo_bar, sw_type = val, p, -1
+                    lo_event = True
+
+            if hi_event:
+                last_struct = classify(sw_hi, ref_hi, True, eq_tol)
+                structure_points.append((sw_hi_bar, sw_hi, last_struct, "HIGH"))
+            if lo_event:
+                last_struct = classify(sw_lo, ref_lo, False, eq_tol)
+                structure_points.append((sw_lo_bar, sw_lo, last_struct, "LOW"))
+
+        # Default mode is Swing. A new leg starts at the pivot bar on the
+        # confirmation bar, exactly like the Pine source.
+        next_dir = 0
+        next_anchor = None
+        if hi_event or lo_event:
+            next_dir = -1 if sw_type == 1 else 1
+            next_anchor = sw_hi_bar if sw_type == 1 else sw_lo_bar
+
+        if next_anchor is not None and next_anchor <= t:
+            if leg is not None:
+                leg["points"] = [x for x in leg["points"] if x["index"] <= next_anchor]
+                archived.append(leg)
+            pts = _sa_build_leg(rows, next_anchor, t, next_dir, weights, atrs)
+            leg = {"dir": next_dir, "anchor": next_anchor,
+                   "anchor_px": rows[next_anchor]["low"] if next_dir > 0 else rows[next_anchor]["high"],
+                   "points": pts}
+        elif leg is not None:
+            # Advance one confirmed bar. Recompute the live leg statistics to keep
+            # the state exact and avoid accumulating numerical drift.
+            leg["points"] = _sa_build_leg(rows, leg["anchor"], t, leg["dir"], weights, atrs)
+
+        if leg is None or t < warmup or not leg["points"]:
+            continue
+
+        point = leg["points"][-1]
+        vwap = point["vwap"]
+        sigma = point["sigma"]
+        retests = point["retests"]
+        # Weighted balance uses the same per-bar VWAP comparison as Pine.
+        up = dn = 0.0
+        for q in leg["points"]:
+            if rows[q["index"]]["close"] >= q["vwap"]:
+                up += q["weight"]
+            else:
+                dn += q["weight"]
+        balance = up / (up + dn) * 100.0 if up + dn > 0 else 50.0
+        dist_sig = ((rows[t]["close"] - vwap) / sigma) if sigma > 0 else None
+        bal_align = balance if leg["dir"] > 0 else 100.0 - balance
+        strength = bal_align * 0.4
+        strength += 25.0 if dist_sig is not None and dist_sig * leg["dir"] > 0 else 0.0
+        strength += 20.0 if dist_sig is not None and abs(dist_sig) <= 2.0 else 0.0
+        strength += 15.0 if retests > 0 else 0.0
+        strength = min(strength, 100.0)
+
+        # Simulate the Pine single-position trade state. A signal is allowed only
+        # while flat at the start of this bar; exits are evaluated after entry.
+        hit = bool(point["hit"])
+        can_open = active_trade is None
+        opened = None
+        if can_open and hit and (leg["dir"] != 0):
+            opened = make_trade(t, leg["dir"], vwap, sigma, strength, retests)
+            if opened:
+                active_trade = opened
+                if t == n - 1:
+                    latest_signal = opened.copy()
+
+        # Do not evaluate hits on the same candle that opened the trade.
+        if active_trade is not None and active_trade["entry_bar"] < t:
+            tr = active_trade
+            r = rows[t]
+            sl_hit = (r["low"] <= tr["active_sl"]) if tr["direction"] == "LONG" else (r["high"] >= tr["active_sl"])
+            tp1_hit = (r["high"] >= tr["tp1"]) if tr["direction"] == "LONG" else (r["low"] <= tr["tp1"])
+            tp2_hit = (r["high"] >= tr["tp2"]) if tr["direction"] == "LONG" else (r["low"] <= tr["tp2"])
+            tp3_hit = (r["high"] >= tr["tp3"]) if tr["direction"] == "LONG" else (r["low"] <= tr["tp3"])
+            if tp1_hit and not tr["tp1_hit"] and not sl_hit:
+                tr["tp1_hit"] = True
+                if SA_VWAP_USE_BE:
+                    tr["active_sl"] = tr["entry"]
+                    tr["be_active"] = True
+            if tp2_hit and not tr["tp2_hit"] and not sl_hit:
+                tr["tp2_hit"] = True
+            if tp3_hit and not tr["tp3_hit"] and not sl_hit:
+                tr["tp3_hit"] = True
+            if sl_hit or tp3_hit:
+                active_trade = None
+
+    if latest_signal is None:
         return None
 
-    # Retest state mirrors the source's awayC/hit logic. A bar must stay on the
-    # leg's side of VWAP, outside tolerance, for >=5 bars before a touch counts.
-    away = 0
-    retests = 0
-    last_hit = False
-    last_vwap = last_sigma = None
-    leg_weight_above = 0.0
-    leg_weight_below = 0.0
-    for j, vwap, sigma, wt in points:
-        r = rows[j]
-        tol = sigma * SA_VWAP_RETEST_TOL_SIGMA if sigma > 0 else (_atr_at(rows, j, 14) or 0.0) * 0.1
-        touch = r["low"] <= vwap + tol and r["high"] >= vwap - tol
-        outside = r["low"] > vwap + tol if leg_dir > 0 else r["high"] < vwap - tol
-        hit = touch and away >= SA_VWAP_RETEST_MIN_AWAY
-        if r["close"] >= vwap:
-            leg_weight_above += wt
-        else:
-            leg_weight_below += wt
-        if hit:
-            retests += 1
-        away = 0 if touch else (away + 1 if outside else 0)
-        last_hit = hit
-        last_vwap, last_sigma = vwap, sigma
-
-    if not last_hit or last_vwap is None:
-        return None
-
-    cur = rows[-1]
-    atr_now = _atr_at(rows, n - 1, 13) or _atr_at(rows, n - 1, 14) or 0.0
-    if atr_now <= 0:
-        return None
-
-    dist_sig = (cur["close"] - last_vwap) / last_sigma if last_sigma > 0 else 0.0
-    if abs(dist_sig) > 2.0:
-        return None
-
-    # Source strength: 40 balance + 25 price side + 20 not stretched + 15
-    # prior retest. It is a context score, not a probability.
-    total_weight = leg_weight_above + leg_weight_below
-    balance = (leg_weight_above / total_weight * 100.0) if total_weight > 0 else 50.0
-    bal_align = balance if leg_dir > 0 else 100.0 - balance
-    strength = bal_align * 0.4
-    strength += 25.0 if dist_sig * leg_dir > 0 else 0.0
-    strength += 20.0 if abs(dist_sig) <= 2.0 else 0.0
-    strength += 15.0 if retests > 1 else 0.0
-    strength = min(strength, 100.0)
-
-    entry = cur["close"]
-    risk = atr_now * SA_VWAP_SL_ATR
-    if risk <= 0 or risk > entry * 0.12:
-        return None
-    if direction == "LONG":
-        sl = entry - risk
-        tp1 = entry + risk * SA_VWAP_TP_R[0]
-        tp2 = entry + risk * SA_VWAP_TP_R[1]
-        tp3 = entry + risk * SA_VWAP_TP_R[2]
-    else:
-        sl = entry + risk
-        tp1 = entry - risk * SA_VWAP_TP_R[0]
-        tp2 = entry - risk * SA_VWAP_TP_R[1]
-        tp3 = entry - risk * SA_VWAP_TP_R[2]
-
-    # Current candle volume relative to its preceding 20 bars, for display and
-    # optional quality scoring; it is not required by the supplied source.
+    # Only the newest confirmed candle can generate a fresh alert. This is the
+    # key fix for the user's late-entry problem: never resend a retest that has
+    # already happened and never replace its historical close with current price.
+    j = n - 1
+    sig = latest_signal
+    leg = leg
+    points = leg["points"] if leg else []
+    vmap = [(q["index"], q["vwap"], q["sigma"]) for q in points]
     prior_vol = _rolling_mean([r.get("vol", 0.0) for r in rows[:-1]], 20)
-    vol_mult = cur.get("vol", 0.0) / max(prior_vol, 1e-12) if prior_vol > 0 else 0.0
-    extension = abs(entry - last_vwap) / max(atr_now, 1e-12)
-
-    # Approximate structural label from the confirmed pivot that anchors the leg.
-    pattern = "SA-VWAP RETEST"
+    vol_mult = rows[-1].get("vol", 0.0) / max(prior_vol, 1e-12) if prior_vol > 0 else 0.0
+    extension = abs(sig["entry"] - sig["vwap"]) / max(atrs[j] or 0.0, 1e-12)
     return {
-        "symbol": "", "direction": direction,
-        "structure": pattern, "pattern": pattern,
-        "entry": entry, "trigger_level": last_vwap,
-        "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
-        "score": int(round(strength / 20.0)), "max_score": 5,
-        "strength": strength, "sa_vwap": last_vwap, "sa_sigma": last_sigma,
-        "leg_direction": leg_dir, "leg_anchor_index": anchor,
-        "leg_retests": retests, "leg_balance": balance,
-        "risk_distance": risk, "risk_atr": SA_VWAP_SL_ATR,
-        "risk_pct": risk / max(entry, 1e-12) * 100.0,
-        "atr": atr_now, "volume_mult": vol_mult,
+        "symbol": "", "direction": sig["direction"],
+        "structure": "SA-VWAP RETEST", "pattern": "SA-VWAP RETEST",
+        "entry": sig["entry"], "trigger_level": sig["vwap"],
+        "sl": sig["sl"], "tp1": sig["tp1"], "tp2": sig["tp2"], "tp3": sig["tp3"],
+        "score": int(round(sig["strength"] / 20.0)), "max_score": 5,
+        "strength": sig["strength"], "sa_vwap": sig["vwap"], "sa_sigma": sig["sigma"],
+        "leg_direction": leg["dir"] if leg else (1 if sig["direction"] == "LONG" else -1),
+        "leg_anchor_index": leg["anchor"] if leg else 0,
+        "leg_anchor_px": leg["anchor_px"] if leg else None,
+        "anchor_tag": next((sp[2] for sp in reversed(structure_points) if sp[0] == (leg["anchor"] if leg else 0)), "—"),
+        "leg_retests": sig["retests"], "leg_balance": None,
+        "risk_distance": abs(sig["entry"] - sig["sl"]),
+        "risk_atr": SA_VWAP_SL_ATR,
+        "risk_pct": abs(sig["entry"] - sig["sl"]) / max(sig["entry"], 1e-12) * 100.0,
+        "atr": atrs[j] or 0.0, "volume_mult": vol_mult,
         "breakout_volume_mult": vol_mult, "extension_atr": extension,
-        "breakout_index": anchor, "pullback_index": n - 1,
-        "range_high": max(r["high"] for r in rows[anchor:n]),
-        "range_low": min(r["low"] for r in rows[anchor:n]),
+        "breakout_index": leg["anchor"] if leg else 0,
+        "pullback_index": j,
+        "range_high": max(r["high"] for r in rows[leg["anchor"]:j + 1]) if leg else rows[j]["high"],
+        "range_low": min(r["low"] for r in rows[leg["anchor"]:j + 1]) if leg else rows[j]["low"],
         "retest_ok": True, "rejection_ok": True, "early_entry": True,
-        "checks": {"Range": True, "Breakout": True, "Volume": vol_mult >= 1.0,
-                    "Trend": True, "Pullback": True, "Continuation": True,
-                    "VWAP": True, "Retest": True},
+        "checks": {"Structure": True, "VWAP": True, "Retest": True, "Closed candle": True},
         "fvg": None, "ob": None,
-        "entry_zone_low": last_vwap - (last_sigma * SA_VWAP_RETEST_TOL_SIGMA),
-        "entry_zone_high": last_vwap + (last_sigma * SA_VWAP_RETEST_TOL_SIGMA),
-        "rows": rows[max(0, anchor - 10):], "full_len": len(rows),
-        "vwap_series": [(j, v) for j, v, _, _ in points],
+        "entry_zone_low": sig["vwap"] - sig["sigma"] * SA_VWAP_RETEST_TOL_SIGMA,
+        "entry_zone_high": sig["vwap"] + sig["sigma"] * SA_VWAP_RETEST_TOL_SIGMA,
+        "rows": rows, "full_len": len(rows),
+        "vwap_series": vmap,
+        "structure_points": structure_points,
+        "leg_dir_series": [(q["index"], leg["dir"]) for q in points],
+        "signal_bar": j,
+        "signal_time": rows[j]["time"],
     }
-
 
 def _move_setup(rows, direction):
     """Use the supplied TradingView SA-VWAP logic as the bot's signal engine."""
@@ -992,145 +1144,174 @@ def _move_setup(rows, direction):
 
 
 def analyze(symbol, rows5=None, rows15=None, timeframe=SIGNAL_TIMEFRAME):
-    """Run the Momentum Engine on the explicitly selected closed-candle timeframe."""
-    rows = rows15 if rows15 and len(rows15) >= 90 else rows5
-    if not rows or len(rows) < 90:
+    """SA-VWAP only. Signals are generated from the newest confirmed candle."""
+    rows = rows15 if rows15 and len(rows15) >= 120 else rows5
+    if not rows or len(rows) < 120:
         return None
     for r in rows:
         r["symbol"] = symbol
-    candidates = []
     for direction in ("LONG", "SHORT"):
         sig = _move_setup(rows, direction)
         if sig:
             sig["symbol"] = symbol
             sig["timeframe"] = timeframe
-            # SA-VWAP setup objects are built from closed candles and must carry
-            # the closed candle timestamp for de-duplication / ordering.
-            sig["time"] = rows[-1]["time"]
-            sig["candle_time"] = rows[-1]["time"]
-            candidates.append(sig)
-    return max(candidates, key=lambda x: x["time"]) if candidates else None
+            sig["time"] = sig.get("signal_time", rows[-1]["time"])
+            sig["candle_time"] = sig["time"]
+            return sig
+    return None
 
 def make_chart(sig):
-    """Render a dark TradingView-style Momentum Engine setup chart."""
-    rows = sig["rows"][-CHART_CANDLES:]
+    """TradingView-like SA-VWAP chart based on the supplied Pine source."""
+    rows = sig.get("rows", [])[-100:]
     n = len(rows)
-    direction = sig["direction"]
-    entry, sl = sig["entry"], sig["sl"]
-    tp1, tp2, tp3 = sig["tp1"], sig["tp2"], sig["tp3"]
-    BG, PANEL, GRID = "#07101d", "#0b1626", "#1a293b"
-    TEXT, MUTED = "#e7eef7", "#7f93a8"
-    UP, DOWN = "#12d6a0", "#ff3d57"
-    GOLD, BLUE, CYAN = "#ffd21f", "#4f7cff", "#31d7ff"
+    if n < 2:
+        raise RuntimeError("not enough candles for SA-VWAP chart")
 
-    fig, ax = plt.subplots(figsize=(14.4, 7.8), dpi=170, facecolor=BG)
+    BG = "#131722"
+    GRID = "#2A2E39"
+    TEXT = "#E0E0E0"
+    MUTED = "#9E9E9E"
+    BULL = "#00E676"
+    BEAR = "#FF5252"
+    ENTRY = "#5C8AAE"
+    SL = "#E57373"
+    TP = "#66BB6A"
+    TP_HIT = "#4DB6AC"
+    BE = "#FFA726"
+    PANEL = "#131722"
+
+    fig, ax = plt.subplots(figsize=(14.8, 8.2), dpi=180, facecolor=BG)
     ax.set_facecolor(BG)
-    width = .62
+    width = 0.62
     for i, r in enumerate(rows):
-        c = UP if r["close"] >= r["open"] else DOWN
-        ax.vlines(i, r["low"], r["high"], color=c, linewidth=1.1, zorder=4)
+        c = BULL if r["close"] >= r["open"] else BEAR
+        ax.vlines(i, r["low"], r["high"], color=c, linewidth=1.0, zorder=4)
         lo = min(r["open"], r["close"])
-        bh = max(abs(r["close"]-r["open"]), abs(r["close"])*1e-5)
-        ax.add_patch(Rectangle((i-width/2, lo), width, bh, facecolor=c, edgecolor=c, linewidth=.6, zorder=5))
+        bh = max(abs(r["close"] - r["open"]), abs(r["close"]) * 1e-6)
+        ax.add_patch(Rectangle((i - width / 2, lo), width, bh, facecolor=c,
+                               edgecolor=c, linewidth=.45, zorder=5))
 
-    closes = [r["close"] for r in rows]
-    e9, e21, e50 = ema(closes,9), ema(closes,21), ema(closes,50)
-    ax.plot(range(n), e9, color=CYAN, linewidth=1.15, alpha=.9, label="EMA9")
-    ax.plot(range(n), e21, color=BLUE, linewidth=1.25, alpha=.95, label="EMA21")
-    ax.plot(range(n), e50, color=GOLD, linewidth=1.2, alpha=.9, label="EMA50")
+    full_start = sig.get("full_len", len(rows)) - len(rows)
+    # Current-leg SA-VWAP + ±0.5σ band, matching the Pine default visual.
+    vmap = {int(i): (float(v), float(s)) for i, v, s in sig.get("vwap_series", [])}
+    xs, vs, ups, dns = [], [], [], []
+    for i in range(n):
+        q = vmap.get(full_start + i)
+        if q:
+            v, sd = q
+            xs.append(i); vs.append(v); ups.append(v + sd * 0.5); dns.append(v - sd * 0.5)
+    if xs:
+        ax.plot(xs, vs, color=BULL if sig["direction"] == "LONG" else BEAR,
+                linewidth=2.0, zorder=7, label="SA-VWAP")
+        ax.plot(xs, ups, color=BULL if sig["direction"] == "LONG" else BEAR,
+                linewidth=.65, alpha=.45, zorder=6)
+        ax.plot(xs, dns, color=BULL if sig["direction"] == "LONG" else BEAR,
+                linewidth=.65, alpha=.45, zorder=6)
+        ax.fill_between(xs, dns, ups, color=BULL if sig["direction"] == "LONG" else BEAR,
+                        alpha=.045, zorder=2)
 
-    if sig.get("pattern") == "SA-VWAP RETEST" and sig.get("vwap_series"):
-        vmap = {int(i): float(v) for i, v in sig.get("vwap_series", [])}
-        vxs, vys = [], []
-        chart_start_full = sig.get("full_len", len(rows)) - n
-        for i in range(n):
-            full_i = chart_start_full + i
-            if full_i in vmap:
-                vxs.append(i); vys.append(vmap[full_i])
-        if vxs:
-            ax.plot(vxs, vys, color="#ff9f43", linewidth=1.7, alpha=.95, label="SA-VWAP", zorder=7)
-            ax.scatter([n-1], [vys[-1]], s=28, color="#ff9f43", zorder=8)
+    # Structure labels, clipped to the visible window.
+    for idx, price, tag, kind in sig.get("structure_points", []):
+        li = idx - full_start
+        if 0 <= li < n:
+            col = BULL if kind == "LOW" else BEAR
+            va = "top" if kind == "HIGH" else "bottom"
+            y = price * (1.0015 if kind == "HIGH" else .9985)
+            ax.text(li, y, tag, color=col, fontsize=7.2, ha="center", va=va, zorder=10)
 
-    full_offset = sig.get("full_len", n) - len(sig.get("rows", rows))
-    def local_index(full_i):
-        idx = int(full_i) - full_offset
-        # sig rows may have been clipped again for charting.
-        return max(0, min(n-1, idx - (len(sig.get("rows", rows)) - n)))
+    sig_i = sig.get("signal_bar", len(sig.get("rows", [])) - 1) - full_start
+    sig_i = max(0, min(n - 1, sig_i))
+    if sig["direction"] == "LONG":
+        ax.scatter([sig_i], [rows[sig_i]["low"]], marker="^", s=85, color=BULL,
+                   edgecolors="#004D25", linewidth=.8, zorder=12)
+        ax.text(sig_i, rows[sig_i]["low"], " Long ▲", color="#004D25", fontsize=8.5,
+                fontweight="bold", va="top", ha="left", zorder=13)
+    else:
+        ax.scatter([sig_i], [rows[sig_i]["high"]], marker="v", s=85, color=BEAR,
+                   edgecolors="#FFFFFF", linewidth=.8, zorder=12)
+        ax.text(sig_i, rows[sig_i]["high"], " Short ▼", color="#FFFFFF", fontsize=8.5,
+                fontweight="bold", va="bottom", ha="left", zorder=13)
 
-    bidx = local_index(sig.get("breakout_index", max(0, n-1)))
-    pidx = sig.get("pullback_index")
-    if pidx is not None:
-        pidx = local_index(pidx)
+    entry, sl, tp1, tp2, tp3 = sig["entry"], sig["sl"], sig["tp1"], sig["tp2"], sig["tp3"]
+    ax.axhline(entry, color=ENTRY, linestyle=(0, (2, 2)), linewidth=1.0, zorder=3)
+    ax.axhline(sl, color=SL, linewidth=1.7, zorder=3)
+    for y, label, alpha in ((tp1, "TP1", .65), (tp2, "TP2", .75), (tp3, "TP3", .95)):
+        ax.axhline(y, color=TP, linestyle=(0, (4, 3)), linewidth=1.0, alpha=alpha, zorder=3)
 
-    rh, rl = sig.get("range_high"), sig.get("range_low")
-    if rh is not None and rl is not None:
-        x0 = max(0, bidx - 20)
-        ax.add_patch(Rectangle((x0, rl), max(1, bidx-x0), rh-rl,
-                               facecolor=GOLD, edgecolor=GOLD, alpha=.10, linewidth=1.0, zorder=1))
-        ax.text(x0+1, rh, "BASE / RANGE", color=GOLD, fontsize=8.5, fontweight="bold", va="bottom")
-        ax.axhline(rh if direction == "LONG" else rl, color=CYAN, linestyle="--", linewidth=1.1, alpha=.85)
-        ax.text(bidx, rh if direction == "LONG" else rl,
-                "BREAKOUT" if direction == "LONG" else "BREAKDOWN",
-                color=CYAN, fontsize=8.5, fontweight="bold", va="bottom" if direction == "LONG" else "top")
+    # Right-side price labels like TradingView.
+    xlab = n + 1.2
+    def pct(level):
+        return (level - entry) / entry * 100.0 if entry else 0.0
+    ax.text(xlab, entry, f"ENTRY {fmt_price(entry)}", color=ENTRY, fontsize=8.2, fontweight="bold", va="center")
+    ax.text(xlab, sl, f"SL {fmt_price(sl)} ({pct(sl):+.2f}%)", color=SL, fontsize=8.0, fontweight="bold", va="center")
+    ax.text(xlab, tp1, f"TP1 {fmt_price(tp1)} ({pct(tp1):+.2f}%)", color=TP, fontsize=8.0, fontweight="bold", va="center")
+    ax.text(xlab, tp2, f"TP2 {fmt_price(tp2)} ({pct(tp2):+.2f}%)", color=TP, fontsize=8.0, fontweight="bold", va="center")
+    ax.text(xlab, tp3, f"TP3 {fmt_price(tp3)} ({pct(tp3):+.2f}%)", color=TP, fontsize=8.0, fontweight="bold", va="center")
 
-    if pidx is not None and pidx >= 0 and pidx < n:
-        ax.scatter([pidx], [rows[pidx]["close"]], s=48, facecolors="none", edgecolors=GOLD, linewidth=1.3, zorder=9)
-        ax.text(pidx, rows[pidx]["close"], " PULLBACK", color=GOLD, fontsize=8.5, fontweight="bold", va="bottom")
+    # Dashboard modeled after the Pine dashboard.
+    strength = sig.get("strength", 0.0)
+    trend = "Bullish" if sig["direction"] == "LONG" else "Bearish"
+    anchor_i = sig.get("leg_anchor_index", 0)
+    anchor_px = sig.get("leg_anchor_px")
+    leg_age = max(0, sig_i + full_start - anchor_i)
+    move_pct = ((rows[-1]["close"] - anchor_px) / anchor_px * 100.0) if anchor_px else 0.0
+    dashboard = (
+        f"◆ SA-VWAP · {trend}\n"
+        f"Trend          {trend}\n"
+        f"Signal         {sig['direction']}\n"
+        f"Strength       {strength:.0f}  {'▰' * max(0, min(8, round(strength / 12.5)))}{'▱' * max(0, 8 - min(8, round(strength / 12.5)))}\n"
+        f"Last event     Retest {'▲' if sig['direction']=='LONG' else '▼'}\n"
+        f"Timeframe      {sig.get('timeframe','15m')}\n"
+        f"Mode           Swing / cumulative\n"
+        f"Anchor         {sig.get('anchor_tag', 'SA-VWAP')} @ {fmt_price(anchor_px)}\n"
+        f"Leg age        {leg_age} bars · {move_pct:+.2f}%\n"
+        f"VWAP           {fmt_price(sig['sa_vwap'])}\n"
+        f"Price vs VWAP  {(rows[-1]['close']-sig['sa_vwap'])/sig['sa_vwap']*100:+.2f}%\n"
+        f"\nSL             {fmt_price(sl)} ({pct(sl):+.2f}%)\n"
+        f"TP1            {fmt_price(tp1)} ({pct(tp1):+.2f}%)\n"
+        f"TP2            {fmt_price(tp2)} ({pct(tp2):+.2f}%)\n"
+        f"TP3            {fmt_price(tp3)} ({pct(tp3):+.2f}%)\n"
+        f"R:R            1.0 / 2.0 / 3.0"
+    )
+    ax.text(.985, .965, dashboard, transform=ax.transAxes, fontsize=7.4, color=TEXT,
+            va="top", ha="right", linespacing=1.35,
+            bbox=dict(boxstyle="round,pad=.65", facecolor=PANEL, edgecolor="#2A2E39",
+                      linewidth=1.0, alpha=.97), zorder=20)
 
-    ax.axhline(entry, color=BLUE, linestyle="--", linewidth=1.2)
-    ax.axhline(sl, color=DOWN, linewidth=1.15)
-    for y, lab in ((tp1,"TP1"),(tp2,"TP2"),(tp3,"TP3")):
-        ax.axhline(y, color=UP, linestyle="--", linewidth=.95, alpha=.85)
-        ax.text(n+1, y, f"{lab} {fmt_price(y)}", color=UP, fontsize=8, fontweight="bold", va="center")
-    ax.text(n+1, entry, f"ENTRY {fmt_price(entry)}", color=BLUE, fontsize=8, fontweight="bold", va="center")
-    ax.text(n+1, sl, f"SL {fmt_price(sl)}", color=DOWN, fontsize=8, fontweight="bold", va="center")
+    ax.text(.018, 1.055, f"{sig.get('symbol','')} · {sig.get('timeframe','15m').upper()}",
+            transform=ax.transAxes, fontsize=15.5, color=TEXT, fontweight="bold", va="top")
+    ax.text(.018, 1.018, "SA-VWAP [WAT] · STRUCTURE-ANCHORED VWAP",
+            transform=ax.transAxes, fontsize=8.4, color=MUTED, fontweight="bold", va="top")
+    dcol = BULL if sig["direction"] == "LONG" else BEAR
+    ax.text(.64, 1.055, sig["direction"], transform=ax.transAxes, fontsize=11.5, color=dcol,
+            fontweight="bold", va="top", ha="center")
 
-    vol = sig.get("volume_mult", 0.0)
-    atr_v = sig.get("atr", 0.0)
-    extension = sig.get("extension_atr", 0.0)
-    quality = _setup_metrics(sig)
-    dtext = "LONG" if direction == "LONG" else "SHORT"
-    dcolor = UP if direction == "LONG" else DOWN
-    ax.text(.018,1.065,f"{sig.get('symbol','')} · {sig.get('timeframe','15m').upper()}",transform=ax.transAxes,
-            fontsize=16,color=TEXT,fontweight="bold",va="top")
-    strategy_title = "SAIWAN SA-VWAP · RETEST + ATR + BE" if sig.get("pattern") == "SA-VWAP RETEST" else "SAIWAN MOMENTUM ENGINE · CLOSED CANDLES"
-    ax.text(.018,1.025,strategy_title,transform=ax.transAxes,
-            fontsize=8.8,color=MUTED,fontweight="bold",va="top")
-    ax.text(.985,1.055,dtext,transform=ax.transAxes,fontsize=12,color=dcolor,fontweight="bold",ha="right",va="top",
-            bbox=dict(boxstyle="round,pad=.38",facecolor=BG,edgecolor=dcolor,linewidth=1.0))
-    panel=(f"Pattern  {sig.get('pattern','MOMENTUM')}\n"
-           f"Entry    {fmt_price(entry)}\nSL       {fmt_price(sl)}\n"
-           f"TP1/2/3  {fmt_price(tp1)} / {fmt_price(tp2)} / {fmt_price(tp3)}\n\n"
-           f"Volume   {vol:.2f}× avg\nATR      {fmt_price(atr_v)}\nExtension {extension:.2f}× ATR\n"
-           f"R:R      {quality['rr1']:.2f} / {quality['rr2']:.2f} / {quality['rr3']:.2f}")
-    ax.text(.022,.035,panel,transform=ax.transAxes,fontsize=8.5,color=TEXT,va="bottom",ha="left",linespacing=1.4,
-            bbox=dict(boxstyle="round,pad=.72",facecolor=PANEL,edgecolor="#2a4664",linewidth=1.0,alpha=.97),zorder=20)
-    ax.legend(loc="upper left",bbox_to_anchor=(.34,1.055),frameon=False,labelcolor=TEXT,fontsize=8.5,ncol=3)
     ax.yaxis.tick_right()
-    ax.tick_params(axis="y",colors="#9bb0c5",labelsize=8.2,length=0,pad=7)
-    ax.tick_params(axis="x",colors="#71879d",labelsize=7.8,length=0,pad=8)
-    ax.grid(axis="y",color=GRID,linewidth=.65,alpha=.8)
-    ax.grid(axis="x",color=GRID,linewidth=.35,alpha=.35)
-    for side in ["top","left","bottom"]: ax.spines[side].set_visible(False)
-    ax.spines["right"].set_color("#22364b")
-    step=max(1,n//7)
-    ticks=list(range(0,n,step))
-    if not ticks or ticks[-1]!=n-1: ticks.append(n-1)
+    ax.tick_params(axis="y", colors="#9E9E9E", labelsize=8, length=0, pad=7)
+    ax.tick_params(axis="x", colors="#757575", labelsize=7.5, length=0, pad=8)
+    ax.grid(axis="y", color=GRID, linewidth=.55, alpha=.75)
+    ax.grid(axis="x", color=GRID, linewidth=.25, alpha=.3)
+    for side in ("top", "left", "bottom"):
+        ax.spines[side].set_visible(False)
+    ax.spines["right"].set_color(GRID)
+    step = max(1, n // 7)
+    ticks = list(range(0, n, step))
+    if not ticks or ticks[-1] != n - 1:
+        ticks.append(n - 1)
     ax.set_xticks(ticks)
-    ax.set_xticklabels([datetime.fromtimestamp(rows[i]["time"],tz=timezone.utc).strftime("%d\n%H:%M") for i in ticks])
-    lows=[r["low"] for r in rows]+[sl,tp1,tp2,tp3]
-    highs=[r["high"] for r in rows]+[sl,tp1,tp2,tp3]
-    ymin,ymax=min(lows),max(highs)
-    span=max(ymax-ymin,abs(rows[-1]["close"])*.012)
-    ax.set_ylim(ymin-span*.06,ymax+span*.16)
-    ax.set_xlim(-1,n+12)
-    fig.subplots_adjust(left=.025,right=.865,top=.86,bottom=.085)
-    safe="".join(ch if ch.isalnum() else "_" for ch in sig.get("symbol","SIGNAL"))
-    path=f"/tmp/chart_{safe}_{sig['time']}.png"
-    fig.savefig(path,facecolor=BG,edgecolor="none",bbox_inches="tight",pad_inches=.08)
+    ax.set_xticklabels([datetime.fromtimestamp(rows[i]["time"], tz=timezone.utc).strftime("%d\n%H:%M") for i in ticks])
+
+    levels = [r["low"] for r in rows] + [r["high"] for r in rows] + [sl, tp1, tp2, tp3, entry]
+    ymin, ymax = min(levels), max(levels)
+    span = max(ymax - ymin, abs(rows[-1]["close"]) * .01)
+    ax.set_ylim(ymin - span * .06, ymax + span * .12)
+    ax.set_xlim(-1, n + 11)
+    fig.subplots_adjust(left=.025, right=.83, top=.86, bottom=.085)
+    safe = "".join(ch if ch.isalnum() else "_" for ch in sig.get("symbol", "SIGNAL"))
+    path = f"/tmp/chart_{safe}_{sig['time']}.png"
+    fig.savefig(path, facecolor=BG, edgecolor="none", bbox_inches="tight", pad_inches=.08)
     plt.close(fig)
     return path
-
 
 def make_analysis_chart(symbol, timeframe, rows, block=None):
     """Render an on-demand analysis chart, even when no complete trade setup exists."""
@@ -1175,7 +1356,7 @@ def make_analysis_chart(symbol, timeframe, rows, block=None):
     for idx, price in lows[-6:]:
         ax.scatter([idx], [price], s=20, facecolors="none", edgecolors=UP, linewidth=.9, zorder=8)
 
-    # If a complete Momentum Engine setup exists, overlay its range and levels.
+    # If a complete SA-VWAP Engine setup exists, overlay its range and levels.
     if block:
         setup = block.get("long_sig") or block.get("short_sig")
         if setup:
@@ -1559,7 +1740,7 @@ def _timeframe_bias(rows):
 
 
 def _timeframe_setup(rows, direction):
-    """Run the Momentum Engine on any supported timeframe."""
+    """Run the SA-VWAP Engine on any supported timeframe."""
     try:
         return _momentum_setup(rows, direction)
     except Exception:
@@ -1654,14 +1835,14 @@ def analysis_report(raw_symbol, requested_timeframes=None):
             f"🎯 TP2: {fmt_price(setup['tp2'])}",
             f"🎯 TP3: {fmt_price(setup['tp3'])}",
             "",
-            f"⚡ {setup.get('pattern','MOMENTUM')} · volume {setup.get('volume_mult',0):.2f}× · extension {setup.get('extension_atr',0):.2f}× ATR",
+            f"⚡ {setup.get('pattern','SA-VWAP RETEST')} · VWAP retest",
         ]
     else:
         lines += ["", "ℹ️ هیچ Momentum setup ـێکی تەواو لە ئێستادا نییە."]
     return "\n".join(lines)
 
 def _setup_metrics(sig):
-    """Transparent Momentum Engine metrics; quality is a rule count, not probability."""
+    """Transparent SA-VWAP Engine metrics; quality is a rule count, not probability."""
     entry = float(sig["entry"])
     sl = float(sig["sl"])
     risk = abs(entry - sl)
@@ -1791,7 +1972,7 @@ def watch_loop():
                     f"🎯 TP2: {fmt_price(sig['tp2'])}\n"
                     f"🎯 TP3: {fmt_price(sig['tp3'])}\n"
                     f"{details[0]}\n{details[1]}\n\n"
-                    f"Pattern: {sig.get('pattern','MOMENTUM')} · Volume {sig.get('volume_mult',0):.2f}× · Extension {sig.get('extension_atr',0):.2f}×ATR\n"
+                    f"Pattern: {sig.get('pattern','SA-VWAP RETEST')} · VWAP retest\n"
                     "🛡️ Anti-chase filter: ON\n"
                     "⚠️ Signal only — no automatic trading."
                 )
@@ -2000,7 +2181,7 @@ def _backtest_text(parts):
     if not profiles:
         return f"🧪 BACKTEST — {symbol} · {tf.upper()}\n\n🟡 هیچ trade ـێک نەدۆزرایەوە لە {len(rows)} candle ـدا."
     best=profiles[0]
-    lines=[f"🧪 SAIWAN MOMENTUM BACKTEST",f"⭐ {symbol} · {tf.upper()} · {days} days",f"Candles: {len(rows)}","",
+    lines=[f"🧪 SAIWAN SA-VWAP BACKTEST",f"⭐ {symbol} · {tf.upper()} · {days} days",f"Candles: {len(rows)}","",
            "📌 TP/SL sweep (historical, closed candles only)",
            f"Best gross R: {best['gross_r']:+.2f}R",
            f"SL buffer: {best['sl']:.2f}× ATR",
@@ -2440,7 +2621,7 @@ def sender_loop():
         sig = None
         with state_lock:
             if pending_signals:
-                # One new signal per 10-minute window; send the strongest candidate.
+                # Send the newest confirmed SA-VWAP trigger as soon as possible.
                 pending_signals.sort(key=lambda x: (x.get("radar_score", 0), x.get("score", 0), x.get("confidence", 0), x.get("time", 0)), reverse=True)
                 sig = pending_signals.pop(0)
                 pending_signals.clear()
