@@ -8,7 +8,7 @@ import requests
 from flask import Flask, jsonify
 
 # ============================================================
-# SAIWAN — 1H Chart Pattern Breakout Bot
+# SAIWAN — 1H Chart Pattern Breakout Bot v4.1
 # Bitget USDT-M Perpetual + Telegram
 # Rule-based: closed 1H candle -> pattern -> breakout -> retest
 # -> confirmation -> structural SL -> RR-based TP.
@@ -46,7 +46,9 @@ http.headers.update({"User-Agent": "SAIWAN-1H-Pattern-Bot/3.0"})
 
 state = {"running": False, "last_scan": None, "last_error": None,
          "signals_sent": 0, "symbols": 0, "last_signal": None,
-         "signals_checked": 0, "last_scan_candidates": 0}
+         "signals_checked": 0, "last_scan_candidates": 0,
+         "patterns_found": 0, "breakouts_found": 0,
+         "retests_found": 0, "confirmations_found": 0}
 state_lock = threading.Lock()
 scan_lock = threading.Lock()
 processed = set()
@@ -325,42 +327,89 @@ def bear_candle(k,a):
     return k["close"]<k["open"] and abs(k["close"]-k["open"])>=a*.30 and (k["high"]-k["close"])/rng>=.55
 
 
-def make_signal(symbol,c,p,atr,hs,ls):
+def make_signal(symbol,c,p,atr,hs,ls,diag=None):
+    """Build one signal from a trendline/pattern.
+
+    The important change here is that the CURRENT closed candle may itself be
+    the retest + confirmation candle. The previous version could only count a
+    retest on an earlier candle and then required the following candle to be
+    confirmation, which missed many valid one-candle retests.
+    """
     cur=len(c)-1
     end=min(p.get("end",cur-3),cur-2)
     start=max(p.get("start",0),cur-MAX_PATTERN_BARS)
-    if end<=start: return None
-    direction=bi_level=None; bi=None
-    for i in range(end+1,cur):
-        a=atr[i] or med(atr[-20:]) or c[i]["close"]*.005
-        u,l=levels(p,i)
-        prev=c[i-1]; k=c[i]
-        if p["bias"] in ("BULLISH","NEUTRAL") and u is not None:
-            if prev["close"]<=u+a*.10 and k["close"]>u+a*BREAKOUT_ATR and bull_candle(k,a):
-                direction,bi,bi_level="LONG",i,u; break
-        if p["bias"] in ("BEARISH","NEUTRAL") and l is not None:
-            if prev["close"]>=l-a*.10 and k["close"]<l-a*BREAKOUT_ATR and bear_candle(k,a):
-                direction,bi,bi_level="SHORT",i,l; break
-    if bi is None: return None
+    if end<=start:
+        return None
 
-    retest=None; confirm=None
-    for r in range(bi+1,min(cur-1,bi+MAX_RETEST_BARS)+1):
+    direction=bi_level=None
+    bi=None
+
+    # Search recent candles for the breakout. A signal can only use a breakout
+    # that happened before the current closed candle.
+    first_break=max(end+1, cur-MAX_PATTERN_BARS)
+    last_break=cur-1
+    for i in range(first_break, last_break+1):
+        a=atr[i] or med(atr[max(0,i-20):i+1]) or c[i]["close"]*.005
+        u,l=levels(p,i)
+        prev=c[i-1]
+        k=c[i]
+
+        if p["bias"] in ("BULLISH","NEUTRAL") and u is not None:
+            if prev["close"]<=u+a*.15 and k["close"]>u+a*BREAKOUT_ATR and bull_candle(k,a):
+                direction,bi,bi_level="LONG",i,u
+                break
+
+        if p["bias"] in ("BEARISH","NEUTRAL") and l is not None:
+            if prev["close"]>=l-a*.15 and k["close"]<l-a*BREAKOUT_ATR and bear_candle(k,a):
+                direction,bi,bi_level="SHORT",i,l
+                break
+
+    if bi is None:
+        return None
+    if diag is not None:
+        diag["breakouts_found"] += 1
+
+    # Retest can happen on the next 1..MAX_RETEST_BARS closed candles.
+    # The CURRENT candle is allowed to be both retest and confirmation.
+    retest=None
+    confirm=None
+    max_r=min(cur,bi+MAX_RETEST_BARS)
+
+    for r in range(bi+1,max_r+1):
         a=atr[r] or atr[bi] or c[r]["close"]*.005
         k=c[r]
-        touched=k["low"]<=bi_level+a*RETEST_ATR and k["high"]>=bi_level-a*RETEST_ATR
+        touched=(k["low"]<=bi_level+a*RETEST_ATR and k["high"]>=bi_level-a*RETEST_ATR)
         if not touched:
             continue
+
         if direction=="LONG" and k["close"]>=bi_level:
+            if diag is not None:
+                diag["retests_found"] += 1
+            retest=r
+            # If this is the current closed candle, its close is the
+            # confirmation as well.
+            if r==cur and bull_candle(k,a):
+                confirm=cur
+                break
             if r+1==cur and bull_candle(c[cur],atr[cur] or a):
-                retest=r
                 confirm=cur
                 break
+
         if direction=="SHORT" and k["close"]<=bi_level:
-            if r+1==cur and bear_candle(c[cur],atr[cur] or a):
-                retest=r
+            if diag is not None:
+                diag["retests_found"] += 1
+            retest=r
+            if r==cur and bear_candle(k,a):
                 confirm=cur
                 break
-    if confirm!=cur: return None
+            if r+1==cur and bear_candle(c[cur],atr[cur] or a):
+                confirm=cur
+                break
+
+    if confirm!=cur:
+        return None
+    if diag is not None:
+        diag["confirmations_found"] += 1
 
     entry=c[cur]["close"]
     if direction=="LONG":
@@ -369,16 +418,23 @@ def make_signal(symbol,c,p,atr,hs,ls):
         sl=base-(atr[retest] or atr[cur]) * SL_ATR_BUFFER
         risk=entry-sl
         if risk<=0:return None
-        tp1=entry+risk*MIN_RR; tp2=entry+risk*TP2_R; tp3=entry+risk*TP3_R
+        tp1=entry+risk*MIN_RR
+        tp2=entry+risk*TP2_R
+        tp3=entry+risk*TP3_R
     else:
         highs=[i for i in hs if max(p.get("start",0),retest-12)<=i<=retest]
         base=c[highs[-1]]["high"] if highs else max(x["high"] for x in c[max(0,retest-8):retest+1])
         sl=base+(atr[retest] or atr[cur]) * SL_ATR_BUFFER
         risk=sl-entry
         if risk<=0:return None
-        tp1=entry-risk*MIN_RR; tp2=entry-risk*TP2_R; tp3=entry-risk*TP3_R
+        tp1=entry-risk*MIN_RR
+        tp2=entry-risk*TP2_R
+        tp3=entry-risk*TP3_R
+
     risk_pct=abs(entry-sl)/entry*100
-    if risk_pct<.15 or risk_pct>12: return None
+    if risk_pct<.15 or risk_pct>12:
+        return None
+
     return {"symbol":symbol,"side":direction,"pattern":p["type"],"score":p["score"],
             "touches":p["touches"],"entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"tp3":tp3,
             "rr":abs(tp2-entry)/abs(entry-sl),"risk_pct":risk_pct,"candle_ts":c[cur]["ts"],
@@ -386,16 +442,21 @@ def make_signal(symbol,c,p,atr,hs,ls):
             "pattern_data":p,"key":(symbol,c[cur]["ts"],direction,p["type"],bi)}
 
 
-def find_signal(symbol,c):
-    if len(c)<120:return None
+def find_signal(symbol,c,diag=None):
+    if len(c)<120:
+        return None
     atr=atrs(c)
-    if not atr[-1]:return None
+    if not atr[-1]:
+        return None
     hs,ls=pivots(c)
     patterns=detect_patterns(c,hs,ls,atr)
+    if diag is not None:
+        diag["patterns_found"] += len(patterns)
     found=[]
     for p in patterns:
-        s=make_signal(symbol,c,p,atr,hs,ls)
-        if s:found.append(s)
+        s=make_signal(symbol,c,p,atr,hs,ls,diag=diag)
+        if s:
+            found.append(s)
     return max(found,key=lambda x:(x["score"],x["rr"],x["touches"])) if found else None
 
 
@@ -589,32 +650,59 @@ def live_tracker_loop():
 
 
 def scan_once():
-    if not scan_lock.acquire(False):return
+    if not scan_lock.acquire(False):
+        return
+    diag={"patterns_found":0,"breakouts_found":0,"retests_found":0,"confirmations_found":0}
     try:
         symbols=get_symbols()
-        with state_lock: state["symbols"]=len(symbols)
+        with state_lock:
+            state["symbols"]=len(symbols)
+            state["signals_checked"]=0
+            state["last_scan_candidates"]=0
+            state["patterns_found"]=0
+            state["breakouts_found"]=0
+            state["retests_found"]=0
+            state["confirmations_found"]=0
+
         for symbol in symbols:
             try:
                 c=get_candles(symbol)
-                if len(c)<120:continue
-                candle_key=(symbol,c[-1]["ts"])
-                s=find_signal(symbol,c)
+                if len(c)<120:
+                    continue
+
                 with state_lock:
                     state["signals_checked"] += 1
+
+                s=find_signal(symbol,c,diag=diag)
+
                 if not s:
-                    # Re-check the latest closed candle on the next scan.
-                    # This helps when exchange data arrives slightly late.
                     continue
+
                 with state_lock:
                     state["last_scan_candidates"] += 1
-                if s["key"] in processed:continue
-                if COOLDOWN_HOURS and time.time()-last_signal_at.get(symbol,0)<COOLDOWN_HOURS*3600:continue
-                send_signal(s,c); register_active_signal(s); processed.add(s["key"]); last_signal_at[symbol]=time.time()
+
+                if s["key"] in processed:
+                    continue
+                if COOLDOWN_HOURS and time.time()-last_signal_at.get(symbol,0)<COOLDOWN_HOURS*3600:
+                    continue
+
+                send_signal(s,c)
+                register_active_signal(s)
+                processed.add(s["key"])
+                last_signal_at[symbol]=time.time()
                 with state_lock:
-                    state["signals_sent"]+=1; state["last_signal"]=f"{symbol} {s['side']} {s['pattern']} @ {fmt(s['entry'])}"
+                    state["signals_sent"]+=1
+                    state["last_signal"]=f"{symbol} {s['side']} {s['pattern']} @ {fmt(s['entry'])}"
             except Exception as e:
-                with state_lock: state["last_error"]=f"{symbol}: {e}"
-    finally:scan_lock.release()
+                with state_lock:
+                    state["last_error"]=f"{symbol}: {e}"
+    finally:
+        with state_lock:
+            state["patterns_found"]=diag["patterns_found"]
+            state["breakouts_found"]=diag["breakouts_found"]
+            state["retests_found"]=diag["retests_found"]
+            state["confirmations_found"]=diag["confirmations_found"]
+        scan_lock.release()
 
 
 def scanner_loop():
@@ -647,7 +735,7 @@ def telegram_loop():
                 elif text=="/status":
                     with state_lock:s=dict(state)
                     with active_lock: active_count=len(active_signals)
-                    tg_send("🤖 SAIWAN STATUS\n\nBot: ONLINE\nScanner: %s\nMarket: Bitget USDT Perpetual\nTimeframe: 1H\nSymbols: %s\nSignals sent: %s\nActive tracked signals: %s\nLast scan: %s\nLast signal: %s\nLast error: %s" % ("RUNNING" if s["running"] else "STARTING",s["symbols"],s["signals_sent"],active_count,s["last_scan"] or "not yet",s["last_signal"] or "none",s["last_error"] or "none"))
+                    tg_send("🤖 SAIWAN STATUS\n\nBot: ONLINE\nScanner: %s\nMarket: Bitget USDT Perpetual\nTimeframe: 1H\nSymbols: %s\nSignals sent: %s\nActive tracked signals: %s\nPatterns found: %s\nBreakouts found: %s\nRetests found: %s\nConfirmations: %s\nLast scan: %s\nLast signal: %s\nLast error: %s" % ("RUNNING" if s["running"] else "STARTING",s["symbols"],s["signals_sent"],active_count,s.get("patterns_found",0),s.get("breakouts_found",0),s.get("retests_found",0),s.get("confirmations_found",0),s["last_scan"] or "not yet",s["last_signal"] or "none",s["last_error"] or "none"))
         except Exception as e:
             with state_lock:state["last_error"]=f"Telegram: {e}"
             time.sleep(5)
