@@ -813,6 +813,176 @@ def make_chart(sig):
     return path
 
 
+
+def make_analysis_chart(symbol, timeframe, rows, block=None):
+    """Render an on-demand analysis chart, even when no complete trade setup exists."""
+    if not rows:
+        raise RuntimeError("no candles for analysis chart")
+    rows = rows[-90:]
+    n = len(rows)
+    BG = "#07101d"
+    PANEL = "#0b1626"
+    GRID = "#1a293b"
+    TEXT = "#e7eef7"
+    MUTED = "#7f93a8"
+    UP = "#12d6a0"
+    DOWN = "#ff3d57"
+    GOLD = "#ffd21f"
+    BLUE = "#4f7cff"
+    PURPLE = "#7c5cff"
+    PINK = "#ff4f87"
+    CYAN = "#31d7ff"
+
+    fig, ax = plt.subplots(figsize=(14.4, 7.8), dpi=170, facecolor=BG)
+    ax.set_facecolor(BG)
+    width = .62
+    for i, r in enumerate(rows):
+        c = UP if r["close"] >= r["open"] else DOWN
+        ax.vlines(i, r["low"], r["high"], color=c, linewidth=1.1, zorder=4)
+        lo = min(r["open"], r["close"])
+        bh = max(abs(r["close"]-r["open"]), abs(r["close"])*1e-5)
+        ax.add_patch(Rectangle((i-width/2, lo), width, bh, facecolor=c,
+                               edgecolor=c, linewidth=.6, zorder=5))
+
+    closes=[r["close"] for r in rows]
+    e20=ema(closes,20)
+    e50=ema(closes,50)
+    ax.plot(range(n), e20, color=BLUE, linewidth=1.35, alpha=.95, label="EMA20", zorder=6)
+    ax.plot(range(n), e50, color=GOLD, linewidth=1.25, alpha=.9, label="EMA50", zorder=6)
+
+    # Recent swing structure for a chart-first analysis.
+    highs, lows = swing_points(rows, left=2, right=2)
+    for idx, price in highs[-6:]:
+        ax.scatter([idx], [price], s=20, facecolors="none", edgecolors=DOWN, linewidth=.9, zorder=8)
+    for idx, price in lows[-6:]:
+        ax.scatter([idx], [price], s=20, facecolors="none", edgecolors=UP, linewidth=.9, zorder=8)
+
+    # If a complete ICT setup exists, overlay its zones and levels.
+    if block:
+        setup = block.get("long_sig") or block.get("short_sig")
+        if setup:
+            direction=setup["direction"]
+            fvg=setup.get("fvg") or {}
+            ob=setup.get("ob") or {}
+            offset=setup.get("full_len", len(rows)) - len(setup.get("rows", rows))
+            setup_rows=setup.get("rows", rows)
+            # Match setup timestamps to visible chart indices where possible.
+            time_to_local={r["time"]:i for i,r in enumerate(rows)}
+            def zone_idx(z):
+                if not z or "index" not in z:
+                    return max(0,n-1)
+                full_i=int(z["index"])
+                setup_i=full_i-offset
+                if setup_rows and 0 <= setup_i < len(setup_rows):
+                    ts=setup_rows[setup_i]["time"]
+                    return time_to_local.get(ts, max(0,n-1))
+                return max(0,min(n-1, full_i))
+            for z,color,label,alpha in ((ob,PINK,"ORDER BLOCK",.18),(fvg,PURPLE,"FVG",.18)):
+                if z and "low" in z and "high" in z:
+                    x0=max(0,min(n-1,zone_idx(z)-8))
+                    ax.add_patch(Rectangle((x0,z["low"]),n-x0,z["high"]-z["low"],
+                                           facecolor=color,edgecolor=color,alpha=alpha,linewidth=1.0,zorder=1))
+                    ax.text(x0+1,z["high"],label,color=color,fontsize=8.5,fontweight="bold",va="bottom",zorder=9)
+            if "entry" in setup:
+                entry,sl=setup["entry"],setup["sl"]
+                ax.axhline(entry,color=BLUE,linestyle="--",linewidth=1.15,zorder=3)
+                ax.axhline(sl,color=DOWN,linewidth=1.1,zorder=3)
+                for y,lab in ((setup["tp1"],"TP1"),(setup["tp2"],"TP2"),(setup["tp3"],"TP3")):
+                    ax.axhline(y,color=UP,linestyle="--",linewidth=.9,alpha=.8,zorder=2)
+                    ax.text(n+1,y,f"{lab} {fmt_price(y)}",color=UP,fontsize=8,fontweight="bold",va="center")
+                ax.text(n+1,entry,f"ENTRY {fmt_price(entry)}",color=BLUE,fontsize=8,fontweight="bold",va="center")
+                ax.text(n+1,sl,f"SL {fmt_price(sl)}",color=DOWN,fontsize=8,fontweight="bold",va="center")
+                if "liquidity" in setup:
+                    ax.axhline(setup["liquidity"],color=GOLD,linestyle=":",linewidth=1.0,alpha=.9,zorder=2)
+                if "mss_level" in setup:
+                    ax.axhline(setup["mss_level"],color=CYAN,linestyle="--",linewidth=1.0,alpha=.7,zorder=2)
+
+    cur=rows[-1]["close"]
+    e20v=e20[-1]; e50v=e50[-1]
+    if cur > e20v and e20v > e50v:
+        bias="LONG"
+        bias_color=UP
+    elif cur < e20v and e20v < e50v:
+        bias="SHORT"
+        bias_color=DOWN
+    else:
+        bias="MIXED"
+        bias_color=GOLD
+
+    ax.text(.018,1.065,f"{symbol} · {timeframe.upper()}",transform=ax.transAxes,
+            fontsize=16,color=TEXT,fontweight="bold",va="top")
+    ax.text(.018,1.025,"SAIWAN ANALYSIS · BITGET FUTURES",transform=ax.transAxes,
+            fontsize=8.8,color=MUTED,fontweight="bold",va="top")
+    ax.text(.985,1.055,bias,transform=ax.transAxes,fontsize=12,color=bias_color,
+            fontweight="bold",ha="right",va="top",
+            bbox=dict(boxstyle="round,pad=.38",facecolor=BG,edgecolor=bias_color,linewidth=1.0))
+
+    panel=(f"{symbol} · {timeframe.upper()}\\n"
+           f"Price  {fmt_price(cur)}\\n"
+           f"EMA20  {fmt_price(e20v)}\\n"
+           f"EMA50  {fmt_price(e50v)}\\n\\n"
+           f"Bias: {bias}\\n"
+           f"Candles: CLOSED")
+    ax.text(.022,.035,panel,transform=ax.transAxes,fontsize=8.8,color=TEXT,va="bottom",
+            ha="left",linespacing=1.45,bbox=dict(boxstyle="round,pad=.72",facecolor=PANEL,
+            edgecolor="#2a4664",linewidth=1.0,alpha=.97),zorder=20)
+    ax.legend(loc="upper left",bbox_to_anchor=(.36,1.055),frameon=False,labelcolor=TEXT,
+              fontsize=8.5,ncol=2)
+
+    ax.yaxis.tick_right()
+    ax.tick_params(axis="y",colors="#9bb0c5",labelsize=8.2,length=0,pad=7)
+    ax.tick_params(axis="x",colors="#71879d",labelsize=7.8,length=0,pad=8)
+    ax.grid(axis="y",color=GRID,linewidth=.65,alpha=.8)
+    ax.grid(axis="x",color=GRID,linewidth=.35,alpha=.35)
+    for side in ["top","left","bottom"]: ax.spines[side].set_visible(False)
+    ax.spines["right"].set_color("#22364b")
+    step=max(1,n//7)
+    ticks=list(range(0,n,step))
+    if not ticks or ticks[-1]!=n-1: ticks.append(n-1)
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([datetime.fromtimestamp(rows[i]["time"],tz=timezone.utc).strftime("%d\\n%H:%M") for i in ticks])
+    all_lows=[r["low"] for r in rows]
+    all_highs=[r["high"] for r in rows]
+    ymin,ymax=min(all_lows),max(all_highs)
+    span=max(ymax-ymin,abs(cur)*.012)
+    ax.set_ylim(ymin-span*.06,ymax+span*.16)
+    ax.set_xlim(-1,n+10)
+    fig.subplots_adjust(left=.025,right=.87,top=.86,bottom=.085)
+    safe="".join(ch if ch.isalnum() else "_" for ch in symbol)
+    path=f"/tmp/analysis_{safe}_{timeframe}_{int(time.time())}.png"
+    fig.savefig(path,facecolor=BG,edgecolor="none",bbox_inches="tight",pad_inches=.08)
+    plt.close(fig)
+    return path
+
+
+def make_analysis_charts(raw_symbol, requested_timeframes=None):
+    symbol=_normalize_analysis_symbol(raw_symbol)
+    tfs=list(requested_timeframes or [])
+    if not tfs:
+        tfs=["5m","15m"]
+    paths=[]
+    for tf in tfs:
+        rows=_analysis_tf_data(symbol,tf)
+        block=None
+        if tf in ("1h","4h"):
+            try:
+                block=_format_htf_block(symbol,tf)
+            except Exception:
+                block=None
+        elif tf=="5m":
+            try:
+                rows15=_analysis_tf_data(symbol,"15m")
+                cur=rows[-1]["close"]
+                e20=ema([r["close"] for r in rows],20)[-1]
+                e50=ema([r["close"] for r in rows],50)[-1]
+                long_sig=_move_setup(rows,"LONG")
+                short_sig=_move_setup(rows,"SHORT")
+                block={"long_sig":long_sig,"short_sig":short_sig}
+            except Exception:
+                block=None
+        paths.append(make_analysis_chart(symbol,tf,rows,block))
+    return paths
+
 def telegram_url(method):
     if not TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
@@ -854,92 +1024,225 @@ def _normalize_analysis_symbol(raw):
     return symbol + "USDT"
 
 
-def analysis_report(raw_symbol):
-    """On-demand market analysis for /analysis SYMBOL.
+def _normalize_analysis_timeframe(raw):
+    """Normalize an analysis timeframe. Supports 5m/15m/1h/4h."""
+    tf = (raw or "").strip().lower()
+    aliases = {
+        "5": "5m", "5m": "5m",
+        "15": "15m", "15m": "15m",
+        "1h": "1h", "1hr": "1h", "60m": "1h", "60": "1h",
+        "4h": "4h", "4hr": "4h", "240m": "4h", "240": "4h",
+    }
+    return aliases.get(tf)
 
-    Uses the same Bitget closed-candle data and price-action model as the scanner.
-    If a complete LONG/SHORT setup is not present, the report explicitly says WAIT
-    instead of inventing a trade signal.
+
+def _analysis_tf_data(symbol, timeframe):
+    """Fetch closed candles for an on-demand analysis timeframe."""
+    limits = {"5m": CANDLE_LIMIT, "15m": 180, "1h": 180, "4h": 180}
+    rows = get_klines(symbol, timeframe, limits.get(timeframe, 180))
+    if len(rows) < 60:
+        raise RuntimeError(f"not enough {timeframe} candles")
+    return rows
+
+
+def _timeframe_bias(rows):
+    closes = [r["close"] for r in rows]
+    e20 = ema(closes, 20)[-1]
+    e50 = ema(closes, 50)[-1]
+    cur = closes[-1]
+    long_score = int(cur > e20) + int(e20 > e50)
+    short_score = int(cur < e20) + int(e20 < e50)
+    if long_score == 2 and short_score == 0:
+        bias = "LONG"
+    elif short_score == 2 and long_score == 0:
+        bias = "SHORT"
+    else:
+        bias = "MIXED"
+    return cur, e20, e50, long_score, short_score, bias
+
+
+def _timeframe_setup(rows, direction):
+    """Run the existing price-action setup model on any supported timeframe."""
+    try:
+        return _move_setup(rows, direction)
+    except Exception:
+        return None
+
+
+def _format_htf_block(symbol, timeframe):
+    rows = _analysis_tf_data(symbol, timeframe)
+    cur, e20, e50, long_score, short_score, bias = _timeframe_bias(rows)
+    long_sig = _timeframe_setup(rows, "LONG")
+    short_sig = _timeframe_setup(rows, "SHORT")
+
+    if long_sig and not short_sig:
+        setup = "🟢 LONG setup confirmed"
+    elif short_sig and not long_sig:
+        setup = "🔴 SHORT setup confirmed"
+    elif long_sig and short_sig:
+        setup = "🟡 BOTH directions have setup conditions"
+    else:
+        setup = "⚪ No complete ICT setup"
+
+    return {
+        "timeframe": timeframe,
+        "price": cur,
+        "ema20": e20,
+        "ema50": e50,
+        "long_score": long_score,
+        "short_score": short_score,
+        "bias": bias,
+        "setup": setup,
+        "long_sig": long_sig,
+        "short_sig": short_sig,
+    }
+
+
+def _analysis_verdict(blocks):
+    """Combine requested timeframe biases without inventing a trade signal."""
+    long_votes = sum(b["bias"] == "LONG" for b in blocks)
+    short_votes = sum(b["bias"] == "SHORT" for b in blocks)
+    if long_votes and not short_votes:
+        return "🟢 LONG bias across requested timeframes"
+    if short_votes and not long_votes:
+        return "🔴 SHORT bias across requested timeframes"
+    if long_votes == short_votes == 0:
+        return "🟡 WAIT — higher-timeframe bias is mixed"
+    return "🟡 MIXED — higher timeframes disagree"
+
+
+def analysis_report(raw_symbol, requested_timeframes=None):
+    """On-demand multi-timeframe analysis for /analysis SYMBOL [1h] [4h].
+
+    Examples:
+      /analysis BTC
+      /analysis BTC 1h
+      /analysis BTC 4h
+      /analysis BTC 1h 4h
+
+    If no timeframe is supplied, the original 5m + 15m analysis is used.
+    1h/4h analysis uses the same closed-candle price-action model and EMA bias
+    checks as the bot's existing scanner, but does not place trades.
     """
     symbol = _normalize_analysis_symbol(raw_symbol)
     if not symbol or len(symbol) < 6:
-        return "❌ تکایە ناوی کۆین بنووسە.\n\nنموونە:\n/analysis BTCUSDT\n/analysis AVAX"
+        return "❌ تکایە ناوی کۆین بنووسە.\n\nنموونە:\n/analysis BTC\n/analysis BTC 1h\n/analysis BTC 4h\n/analysis BTC 1h 4h"
 
-    rows5 = get_klines(symbol, TF_5M, CANDLE_LIMIT)
-    rows15 = get_klines(symbol, TF_15M, 180)
-    if len(rows5) < 120 or len(rows15) < 30:
-        return f"❌ داتای بەشی پێویست بۆ {symbol} بەردەست نییە. دڵنیابە کۆینەکە لە Bitget USDT Futures هەیە."
+    requested = []
+    for raw_tf in (requested_timeframes or []):
+        tf = _normalize_analysis_timeframe(raw_tf)
+        if tf and tf not in requested:
+            requested.append(tf)
+    requested = requested[:3]
 
-    cur = rows5[-1]["close"]
-    e20_5 = ema([r["close"] for r in rows5], 20)[-1]
-    e50_5 = ema([r["close"] for r in rows5], 50)[-1]
-    e20_15 = ema([r["close"] for r in rows15], 20)[-1]
-    e50_15 = ema([r["close"] for r in rows15], 50)[-1]
+    # Default mode keeps the current behavior exactly: 5m entry + 15m context.
+    if not requested:
+        rows5 = get_klines(symbol, TF_5M, CANDLE_LIMIT)
+        rows15 = get_klines(symbol, TF_15M, 180)
+        if len(rows5) < 120 or len(rows15) < 30:
+            return f"❌ داتای بەشی پێویست بۆ {symbol} بەردەست نییە. دڵنیابە کۆینەکە لە Bitget USDT Futures هەیە."
 
-    long_sig = _move_setup(rows5, "LONG")
-    short_sig = _move_setup(rows5, "SHORT")
+        cur = rows5[-1]["close"]
+        e20_5 = ema([r["close"] for r in rows5], 20)[-1]
+        e50_5 = ema([r["close"] for r in rows5], 50)[-1]
+        e20_15 = ema([r["close"] for r in rows15], 20)[-1]
+        e50_15 = ema([r["close"] for r in rows15], 50)[-1]
 
-    long_score = int(cur > e20_5) + int(e20_5 > e50_5) + int(e20_15 > e50_15)
-    short_score = int(cur < e20_5) + int(e20_5 < e50_5) + int(e20_15 < e50_15)
+        long_sig = _move_setup(rows5, "LONG")
+        short_sig = _move_setup(rows5, "SHORT")
+        long_score = int(cur > e20_5) + int(e20_5 > e50_5) + int(e20_15 > e50_15)
+        short_score = int(cur < e20_5) + int(e20_5 < e50_5) + int(e20_15 < e50_15)
 
-    if long_sig and not short_sig:
-        verdict = "🟢 LONG setup موجودە"
-        setup = long_sig
-    elif short_sig and not long_sig:
-        verdict = "🔴 SHORT setup موجودە"
-        setup = short_sig
-    elif long_sig and short_sig:
-        if long_score > short_score:
-            verdict = "🟢 LONG bias — بەڵام هەردوو لایەن setup هەیە"
+        if long_sig and not short_sig:
+            verdict = "🟢 LONG setup موجودە"
             setup = long_sig
-        elif short_score > long_score:
-            verdict = "🔴 SHORT bias — بەڵام هەردوو لایەن setup هەیە"
+        elif short_sig and not long_sig:
+            verdict = "🔴 SHORT setup موجودە"
             setup = short_sig
+        elif long_sig and short_sig:
+            if long_score > short_score:
+                verdict = "🟢 LONG bias — بەڵام هەردوو لایەن setup هەیە"
+                setup = long_sig
+            elif short_score > long_score:
+                verdict = "🔴 SHORT bias — بەڵام هەردوو لایەن setup هەیە"
+                setup = short_sig
+            else:
+                verdict = "🟡 WAIT — هەردوو لایەن نزیکن"
+                setup = None
         else:
-            verdict = "🟡 WAIT — هەردوو لایەن نزیکن"
+            if long_score >= 2 and short_score == 0:
+                verdict = "🟢 LONG bias — setupی تەواو نییە"
+            elif short_score >= 2 and long_score == 0:
+                verdict = "🔴 SHORT bias — setupی تەواو نییە"
+            else:
+                verdict = "🟡 WAIT — setupی تەواو نییە"
             setup = None
-    else:
-        if long_score >= 2 and short_score == 0:
-            verdict = "🟢 LONG bias — setupی تەواو نییە"
-        elif short_score >= 2 and long_score == 0:
-            verdict = "🔴 SHORT bias — setupی تەواو نییە"
-        else:
-            verdict = "🟡 WAIT — setupی تەواو نییە"
-        setup = None
 
-    context_long = _context_15m(rows15, "LONG")
-    context_short = _context_15m(rows15, "SHORT")
+        context_long = _context_15m(rows15, "LONG")
+        context_short = _context_15m(rows15, "SHORT")
+        lines = [
+            f"🔎 SAIWAN ANALYSIS — {symbol}", "", verdict,
+            f"💵 Price: {fmt_price(cur)}",
+            "⏱ Timeframe: 5m + 15m context", "",
+            f"5m EMA20: {fmt_price(e20_5)} | EMA50: {fmt_price(e50_5)}",
+            f"15m EMA20: {fmt_price(e20_15)} | EMA50: {fmt_price(e50_15)}",
+            f"15m Long context: {context_long}",
+            f"15m Short context: {context_short}", "",
+            f"📊 Bias checks — LONG {long_score}/3 · SHORT {short_score}/3",
+        ]
+        if setup:
+            lines += [
+                "", f"🎯 Entry: {fmt_price(setup['entry'])}",
+                f"🛑 SL: {fmt_price(setup['sl'])}",
+                f"🎯 TP1: {fmt_price(setup['tp1'])}",
+                f"🎯 TP2: {fmt_price(setup['tp2'])}",
+                f"🎯 TP3: {fmt_price(setup['tp3'])}", "",
+                "✅ Liquidity Sweep · MSS · CHOCH · FVG · OB",
+            ]
+        else:
+            lines += [
+                "",
+                "ℹ️ هیچ setupی تەواوی Liquidity Sweep + MSS + FVG + OB لە ئێستادا نییە.",
+                "باشترە بۆ triggerی تەواو چاوەڕێ بکرێت لە جیاتی دروستکردنی سیگناڵی ناڕاست.",
+            ]
+        return "\n".join(lines)
+
+    try:
+        blocks = [_format_htf_block(symbol, tf) for tf in requested]
+    except Exception as e:
+        return f"❌ نەتوانرا شیکاری {symbol} بکرێت بۆ {', '.join(requested)}. دڵنیابە کۆینەکە لە Bitget USDT Futures هەیە."
+
     lines = [
-        f"🔎 SAIWAN ANALYSIS — {symbol}",
-        "",
-        verdict,
-        f"💵 Price: {fmt_price(cur)}",
-        "⏱ Timeframe: 5m + 15m context",
-        "",
-        f"5m EMA20: {fmt_price(e20_5)} | EMA50: {fmt_price(e50_5)}",
-        f"15m EMA20: {fmt_price(e20_15)} | EMA50: {fmt_price(e50_15)}",
-        f"15m Long context: {context_long}",
-        f"15m Short context: {context_short}",
-        "",
-        f"📊 Bias checks — LONG {long_score}/3 · SHORT {short_score}/3",
+        f"🔎 SAIWAN HTF ANALYSIS — {symbol}", "",
+        _analysis_verdict(blocks),
+        "📌 This is market analysis only — no automatic trading.", "",
     ]
-    if setup:
+    for b in blocks:
         lines += [
-            "",
-            f"🎯 Entry: {fmt_price(setup['entry'])}",
-            f"🛑 SL: {fmt_price(setup['sl'])}",
-            f"🎯 TP1: {fmt_price(setup['tp1'])}",
-            f"🎯 TP2: {fmt_price(setup['tp2'])}",
-            f"🎯 TP3: {fmt_price(setup['tp3'])}",
-            "",
-            "✅ Liquidity Sweep · MSS · CHOCH · FVG · OB",
+            f"━━ {b['timeframe'].upper()} ━━",
+            f"💵 Price: {fmt_price(b['price'])}",
+            f"EMA20: {fmt_price(b['ema20'])} | EMA50: {fmt_price(b['ema50'])}",
+            f"Bias: {'🟢 LONG' if b['bias']=='LONG' else '🔴 SHORT' if b['bias']=='SHORT' else '🟡 MIXED'}",
+            f"📊 Checks — LONG {b['long_score']}/2 · SHORT {b['short_score']}/2",
+            f"Setup: {b['setup']}",
         ]
-    else:
-        lines += [
-            "",
-            "ℹ️ هیچ setupی تەواوی Liquidity Sweep + MSS + FVG + OB لە ئێستادا نییە.",
-            "باشترە بۆ triggerی تەواو چاوەڕێ بکرێت لە جیاتی دروستکردنی سیگناڵی ناڕاست.",
-        ]
+        setup = b["long_sig"] or b["short_sig"]
+        if setup:
+            lines += [
+                f"Entry: {fmt_price(setup['entry'])}",
+                f"SL: {fmt_price(setup['sl'])}",
+                f"TP1: {fmt_price(setup['tp1'])}",
+                f"TP2: {fmt_price(setup['tp2'])}",
+                f"TP3: {fmt_price(setup['tp3'])}",
+            ]
+        lines.append("")
+
+    if len(blocks) >= 2:
+        b1, b2 = blocks[0], blocks[1]
+        if b1["bias"] == b2["bias"] and b1["bias"] in ("LONG", "SHORT"):
+            lines += [f"🎯 HTF ALIGNMENT: {b1['bias']} — {b1['timeframe']} + {b2['timeframe']} agree."]
+        else:
+            lines += ["⚠️ HTF ALIGNMENT: Mixed — wait for the timeframes to agree before treating it as a directional setup."]
     return "\n".join(lines)
 
 
@@ -1228,7 +1531,10 @@ def poll_updates():
                         "/scan - Start scanner\n"
                         "/stop - Stop scanner\n"
                         "/status - Bot status\n"
-                        "/analysis COIN - Analyze one coin now\n\n"
+                        "/analysis COIN - Analyze one coin now\n"
+                        "/analysis COIN 1h - Higher-timeframe analysis\n"
+                        "/analysis COIN 4h - Higher-timeframe analysis\n"
+                        "/analysis COIN 1h 4h - Multi-timeframe analysis\n\n"
                         "Market: Bitget USDT Perpetual Futures\n"
                         "Timeframe: 5m entry + 15m context\n"
                         "Model: SAIWAN Move Hunter — Liquidity Sweep + MSS + CHOCH + FVG + OB\n"
@@ -1245,13 +1551,29 @@ def poll_updates():
                 elif text.startswith("/stop"):
                     stop_scanner(); send_message(active_chat_id, "🛑 Scanner stopped.")
                 elif text.startswith("/analysis"):
-                    parts = text.split(maxsplit=1)
+                    parts = text.split()
                     if len(parts) < 2:
-                        send_message(active_chat_id, "🔎 نموونە:\n/analysis BTCUSDT\n/analysis AVAX")
+                        send_message(active_chat_id, "🔎 نموونە:\n/analysis BTCUSDT\n/analysis AVAX 1h\n/analysis ETH 4h\n/analysis BTC 1h 4h")
                     else:
                         try:
-                            send_message(active_chat_id, "🔎 خەریکم {0} شیکاری دەکەم...".format(_normalize_analysis_symbol(parts[1])))
-                            send_message(active_chat_id, analysis_report(parts[1]))
+                            symbol = _normalize_analysis_symbol(parts[1])
+                            timeframes = parts[2:]
+                            valid_tfs = [_normalize_analysis_timeframe(x) for x in timeframes]
+                            invalid = [x for x, tf in zip(timeframes, valid_tfs) if tf is None]
+                            if invalid:
+                                send_message(active_chat_id, "❌ Timeframe ـی دروست: 5m, 15m, 1h, 4h\n\nنموونە: /analysis BTC 1h 4h")
+                            else:
+                                mode = " + ".join(valid_tfs) if valid_tfs else "5m + 15m"
+                                send_message(active_chat_id, f"🔎 خەریکم {symbol} شیکاری دەکەم...\n⏱ {mode}")
+                                report = analysis_report(parts[1], valid_tfs)
+                                send_message(active_chat_id, report)
+                                try:
+                                    chart_paths = make_analysis_charts(parts[1], valid_tfs)
+                                    for chart_path in chart_paths:
+                                        send_photo(active_chat_id, chart_path, f"📊 SAIWAN CHART — {_normalize_analysis_symbol(parts[1])}")
+                                except Exception as chart_error:
+                                    print(f"ANALYSIS CHART ERROR {type(chart_error).__name__}: {chart_error}")
+                                    send_message(active_chat_id, "⚠️ شیکاریەکە هات، بەڵام چارتەکە نەدروستکرا.")
                         except Exception as e:
                             print(f"ANALYSIS ERROR {type(e).__name__}: {e}")
                             send_message(active_chat_id, f"❌ شیکاری سەرکەوتوو نەبوو: {type(e).__name__}")
