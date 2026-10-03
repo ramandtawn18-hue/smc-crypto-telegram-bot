@@ -1332,13 +1332,15 @@ def settings_menu_markup():
 
 
 def welcome_text():
+    label = _scan_timeframe_label(active_scan_timeframe)
     return (
         "🚀 SAIWAN CRYPTO SIGNALS\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "⚡ MOMENTUM ENGINE\n"
-        "📊 15M • BITGET FUTURES\n"
+        "📡 SA-VWAP RETEST ENGINE\n"
+        f"📊 {label} • BITGET FUTURES\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        "🎯 Breakout • Pullback • Volume • ATR\n"
+        "📐 Anchored VWAP • Retest • Strength\n"
+        "🎯 ATR SL • TP1 / TP2 / TP3 • BE\n"
         "🔔 Signal + TP/SL monitoring: ACTIVE\n\n"
         "Choose an action from the buttons below."
     )
@@ -1421,10 +1423,12 @@ def _handle_callback_query(query):
             start_scanner(chat_id, tf)
             edit_message(
                 chat_id, message_id,
-                f"🚀 {label} SCANNER STARTED\n\n"
-                f"The Momentum Engine is now scanning {label} closed candles.\n\n"
-                "⚡ Breakout + Pullback + Volume + ATR\n"
-                "🔒 Anti-chase filter: ON\n"
+                f"🚀 SA-VWAP {label} SCANNER STARTED\n\n"
+                f"The SA-VWAP Retest Engine is now scanning {label} closed candles.\n\n"
+                "📐 Anchored VWAP + Retest + Strength\n"
+                "🛑 ATR Stop Loss: 1.5 ATR\n"
+                "🎯 TP1 1R • TP2 2R • TP3 3R\n"
+                "🛡️ TP1 → Break Even: ON\n"
                 "🎯 TP/SL monitoring: ON",
                 main_menu_markup(),
             )
@@ -2192,9 +2196,11 @@ def status_text():
         f"Scanner: {'RUNNING' if scanner else 'STOPPED'}\n"
         f"Smart Watch: {'ON' if watch_on else 'OFF'} ({watched}/{MAX_WATCH_ITEMS})\n"
         "Market: Bitget USDT Perpetual Futures\n"
-        "Strategy: SAIWAN SA-VWAP — Anchored VWAP + Retest + ATR + BE\n"
-        f"Scan timeframe: {active_scan_timeframe.upper()}\n"
-        "Analysis: 15m only\n"
+        "Strategy: SAIWAN SA-VWAP RETEST\n"
+        "Engine: Anchored VWAP + Retest + Strength\n"
+        f"Scan timeframe: {_scan_timeframe_label(active_scan_timeframe)}\n"
+        f"Analysis timeframe: {_scan_timeframe_label(active_scan_timeframe)}\n"
+        "Risk: ATR 1.5R · TP 1R / 2R / 3R · TP1 → BE\n"
         f"Pending signals: {pending}\n"
         f"Tracked signals: {tracked}\n"
         f"History: {hist}\n"
@@ -2290,7 +2296,7 @@ def signal_caption(sig):
     d = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
     m = _setup_metrics(sig)
     return (
-        f"🚀 SAIWAN MOMENTUM SIGNAL\n\n{d}\n"
+        f"🚀 SAIWAN SA-VWAP SIGNAL\n\n{d}\n"
         f"⭐ {sig['symbol']} · Bitget Futures\n"
         f"⏱ {sig.get('timeframe', SIGNAL_TIMEFRAME).upper()} · CLOSED CANDLES\n\n"
         f"Pattern: {sig.get('pattern','MOMENTUM')}\n"
