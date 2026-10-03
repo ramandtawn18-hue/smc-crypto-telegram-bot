@@ -220,6 +220,18 @@ def best_line(c, indices, atr, mode, direction):
                 continue
             p1 = c[i1]["high"] if mode == "high" else c[i1]["low"]
             p2 = c[i2]["high"] if mode == "high" else c[i2]["low"]
+
+            # Reject practically horizontal candidates.  A wedge boundary
+            # must visibly travel from one swing to another; otherwise the
+            # scanner can accidentally select a flat line made from several
+            # similarly-priced pivots.  The threshold is normalized to price
+            # and is intentionally modest so shallow but real 1H trendlines
+            # are still allowed.
+            avg_price = max((abs(p1) + abs(p2)) / 2.0, 1e-12)
+            move_pct = abs(p2 - p1) / avg_price
+            if move_pct < 0.004:
+                continue
+
             line = (i1, p1, i2, p2)
             result = _line_score(c, pts, atr, mode, line, direction)
             if result:
