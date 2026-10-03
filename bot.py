@@ -19,8 +19,13 @@ BITGET_PRODUCT = "USDT-FUTURES"
 TELEGRAM_API = "https://api.telegram.org/bot"
 
 TF_15M = "15m"
+TF_30M = "30m"
+TF_1H = "1h"
+TF_2H = "2h"
+TF_4H = "4h"
 TF_5M = "5m"
 TIMEFRAME = TF_15M
+SUPPORTED_SCAN_TIMEFRAMES = (TF_15M, TF_30M, TF_1H, TF_2H, TF_4H)
 CANDLE_LIMIT = 260
 # 0 = scan every eligible Bitget USDT perpetual contract (no top-N cap)
 MAX_PAIRS = 0
@@ -63,6 +68,7 @@ state_lock = threading.Lock()
 scanner_thread = None
 scanner_running = False
 active_chat_id = None
+active_scan_timeframe = TF_15M
 pending_signals = []
 seen_signals = set()
 seen_order = []
@@ -172,7 +178,9 @@ def get_klines(symbol, interval=TIMEFRAME, limit=CANDLE_LIMIT):
     api_granularity = {
         "5m": "5m",
         "15m": "15m",
+        "30m": "30m",
         "1h": "1H",
+        "2h": "2H",
         "4h": "4H",
     }.get(str(interval).lower(), interval)
 
@@ -186,7 +194,9 @@ def get_klines(symbol, interval=TIMEFRAME, limit=CANDLE_LIMIT):
     candle_ms = {
         "5m": 5 * 60 * 1000,
         "15m": 15 * 60 * 1000,
+        "30m": 30 * 60 * 1000,
         "1h": 60 * 60 * 1000,
+        "2h": 2 * 60 * 60 * 1000,
         "4h": 4 * 60 * 60 * 1000,
     }.get(str(interval).lower())
     if candle_ms is None:
@@ -760,9 +770,9 @@ def _move_setup(rows, direction):
     return _momentum_setup(rows, direction)
 
 
-def analyze(symbol, rows5, rows15=None):
-    """SAIWAN Momentum Engine: 15m primary signal timeframe, closed candles only."""
-    rows = rows15 if rows15 and len(rows15) >= 90 else None
+def analyze(symbol, rows5=None, rows15=None, timeframe=SIGNAL_TIMEFRAME):
+    """Run the Momentum Engine on the explicitly selected closed-candle timeframe."""
+    rows = rows15 if rows15 and len(rows15) >= 90 else rows5
     if not rows or len(rows) < 90:
         return None
     for r in rows:
@@ -772,7 +782,7 @@ def analyze(symbol, rows5, rows15=None):
         sig = _momentum_setup(rows, direction)
         if sig:
             sig["symbol"] = symbol
-            sig["timeframe"] = SIGNAL_TIMEFRAME
+            sig["timeframe"] = timeframe
             candidates.append(sig)
     return max(candidates, key=lambda x: x["time"]) if candidates else None
 
@@ -1058,9 +1068,9 @@ def main_menu_markup():
 def scan_menu_markup():
     return {
         "inline_keyboard": [
-            [_inline_button("⚡ FULL 15M SCAN", "scan_full")],
-            [_inline_button("🎯 TOP MOMENTUM", "scan_top")],
-            [_inline_button("📈 TOP MOVERS", "movers")],
+            [_inline_button("⚡ 15 MIN", "scan_tf:15m"), _inline_button("🕐 30 MIN", "scan_tf:30m")],
+            [_inline_button("🕐 1 HOUR", "scan_tf:1h"), _inline_button("🕑 2 HOURS", "scan_tf:2h")],
+            [_inline_button("🕓 4 HOURS", "scan_tf:4h")],
             [_inline_button("◀️ BACK", "menu_main")],
         ]
     }
@@ -1117,6 +1127,29 @@ def answer_callback(callback_id, text=None):
         raise RuntimeError(f"Telegram answerCallbackQuery {r.status_code}: {r.text[:500]}")
 
 
+def _scan_timeframe_label(timeframe):
+    return {
+        "15m": "15 MIN",
+        "30m": "30 MIN",
+        "1h": "1 HOUR",
+        "2h": "2 HOURS",
+        "4h": "4 HOURS",
+    }.get(timeframe, str(timeframe).upper())
+
+
+def _normalize_scan_timeframe(raw):
+    tf = (raw or "").strip().lower()
+    aliases = {
+        "15": "15m", "15m": "15m",
+        "30": "30m", "30m": "30m",
+        "1h": "1h", "1hour": "1h", "1hr": "1h",
+        "2h": "2h", "2hour": "2h", "2hr": "2h",
+        "4h": "4h", "4hour": "4h", "4hr": "4h",
+    }
+    tf = aliases.get(tf)
+    return tf if tf in SUPPORTED_SCAN_TIMEFRAMES else None
+
+
 def _handle_callback_query(query):
     global active_chat_id
     callback_id = query.get("id")
@@ -1135,7 +1168,7 @@ def _handle_callback_query(query):
             edit_message(chat_id, message_id, welcome_text(), main_menu_markup())
             answer_callback(callback_id)
         elif data == "menu_scan":
-            edit_message(chat_id, message_id, "🔥 SCAN MARKET\n\nChoose a scan:", scan_menu_markup())
+            edit_message(chat_id, message_id, "🔥 SCAN MARKET\n\nChoose timeframe:", scan_menu_markup())
             answer_callback(callback_id)
         elif data == "menu_analysis":
             edit_message(chat_id, message_id, "🔎 15M ANALYSIS\n\nChoose a coin:", analysis_menu_markup())
@@ -1143,10 +1176,23 @@ def _handle_callback_query(query):
         elif data == "menu_settings":
             edit_message(chat_id, message_id, "⚙️ SETTINGS\n\nChoose an option:", settings_menu_markup())
             answer_callback(callback_id)
-        elif data == "scan_full":
-            start_scanner(chat_id)
-            edit_message(chat_id, message_id, "🚀 15M SCANNER STARTED\n\nThe Momentum Engine is scanning closed candles.\n\n⚡ Breakout + Pullback + Volume + ATR\n🔒 Anti-chase filter: ON\n🎯 TP/SL monitoring: ON", main_menu_markup())
-            answer_callback(callback_id, "Scanner started")
+        elif data.startswith("scan_tf:"):
+            tf = _normalize_scan_timeframe(data.split(":", 1)[1])
+            if not tf:
+                answer_callback(callback_id, "Unsupported timeframe")
+                return
+            label = _scan_timeframe_label(tf)
+            start_scanner(chat_id, tf)
+            edit_message(
+                chat_id, message_id,
+                f"🚀 {label} SCANNER STARTED\n\n"
+                f"The Momentum Engine is now scanning {label} closed candles.\n\n"
+                "⚡ Breakout + Pullback + Volume + ATR\n"
+                "🔒 Anti-chase filter: ON\n"
+                "🎯 TP/SL monitoring: ON",
+                main_menu_markup(),
+            )
+            answer_callback(callback_id, f"{label} scanner started")
         elif data == "scan_top":
             answer_callback(callback_id, "Scanning top momentum setups…")
             report = _smart_scan_report()
@@ -1906,6 +1952,7 @@ def status_text():
         f"Smart Watch: {'ON' if watch_on else 'OFF'} ({watched}/{MAX_WATCH_ITEMS})\n"
         "Market: Bitget USDT Perpetual Futures\n"
         "Strategy: SAIWAN Momentum Engine — Breakout + Pullback + Volume + ATR\n"
+        f"Scan timeframe: {active_scan_timeframe.upper()}\n"
         "Analysis: 15m only\n"
         f"Pending signals: {pending}\n"
         f"Tracked signals: {tracked}\n"
@@ -1928,8 +1975,9 @@ def _error_bucket(exc):
     return type(exc).__name__
 
 
-def scan_once():
+def scan_once(timeframe=None):
     global pending_signals
+    timeframe = _normalize_scan_timeframe(timeframe) or active_scan_timeframe
     contracts = get_contracts()
     tickers = get_tickers()
     tv = {x.get("symbol"): x for x in tickers}
@@ -1948,10 +1996,10 @@ def scan_once():
 
     def check_symbol(symbol):
         try:
-            rows15 = get_klines(symbol, SIGNAL_TIMEFRAME, CANDLE_LIMIT)
-            if len(rows15) < 90:
+            rows_tf = get_klines(symbol, timeframe, CANDLE_LIMIT)
+            if len(rows_tf) < 90:
                 return symbol, None, None
-            return symbol, analyze(symbol, rows15, None), None
+            return symbol, analyze(symbol, rows_tf, None, timeframe), None
         except Exception as e:
             return symbol, None, e
 
@@ -1966,7 +2014,7 @@ def scan_once():
                 error_buckets[key] = error_buckets.get(key, 0) + 1
                 continue
             if sig:
-                key = f"{symbol}:{sig['direction']}:{sig['time']}"
+                key = f"{timeframe}:{symbol}:{sig['direction']}:{sig['time']}"
                 if key not in seen_signals:
                     sig["key"] = key
                     found.append(sig)
@@ -1988,7 +2036,7 @@ def scan_once():
 
     total_errors = sum(error_buckets.values())
     summary = ", ".join(f"{name}={count}" for name, count in sorted(error_buckets.items(), key=lambda kv: kv[1], reverse=True)[:4])
-    print(f"Bitget Momentum Engine scan: universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
+    print(f"Bitget Momentum Engine scan: timeframe={timeframe}, universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
     if not contracts:
         print("Bitget warning: no contracts returned from /api/v2/mix/market/contracts")
     elif not tickers:
@@ -2022,7 +2070,7 @@ def scanner_loop():
     global scanner_running
     scanner_running=True
     while not stop_event.is_set():
-        try: scan_once()
+        try: scan_once(active_scan_timeframe)
         except Exception as e: print(f"SCAN LOOP ERROR {type(e).__name__}: {e}")
         force_scan_event.clear()
         for _ in range(SCAN_INTERVAL):
@@ -2153,9 +2201,11 @@ def sender_loop():
             print(f"SEND ERROR {type(e).__name__}: {e}")
 
 
-def start_scanner(chat_id):
-    global scanner_thread, active_chat_id
+def start_scanner(chat_id, timeframe=TF_15M):
+    global scanner_thread, active_chat_id, active_scan_timeframe
     active_chat_id = chat_id
+    tf = _normalize_scan_timeframe(timeframe) or TF_15M
+    active_scan_timeframe = tf
     with state_lock:
         running = scanner_running
     if not running:
@@ -2201,7 +2251,7 @@ def poll_updates():
                         send_message(active_chat_id, welcome_text(), main_menu_markup())
                     elif cmd == "/scan":
                         if len(parts) == 1:
-                            start_scanner(active_chat_id)
+                            start_scanner(active_chat_id, TF_15M)
                             send_message(active_chat_id, "🚀 SAIWAN MOMENTUM SCANNER STARTED\n\n15m closed candles · breakout + pullback + volume + ATR. Anti-chase filter is enabled. TP/SL monitoring is enabled.")
                         elif parts[1].lower() in ("top", "smart", "smartscan"):
                             send_message(active_chat_id, "📊 Smart Scan خەریکە بازارەکە پشکنین دەکات...")
