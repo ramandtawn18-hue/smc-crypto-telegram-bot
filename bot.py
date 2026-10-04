@@ -74,6 +74,9 @@ SA_VWAP_VOLUME_CLAMP_MEDIAN = 4.0
 SA_VWAP_SL_ATR = 1.75
 SA_VWAP_MAX_RISK_ATR = 4.00
 SA_VWAP_STRUCTURE_BUFFER_ATR = 0.35
+SA_VWAP_STRUCTURE_LEFT = 2
+SA_VWAP_STRUCTURE_RIGHT = 2
+SA_VWAP_MIN_STRUCTURE_RISK_ATR = 0.50
 SA_VWAP_TP_R = (1.5, 3.0, 4.5)
 SA_VWAP_USE_BE = True
 # Fresh signal rule: a confirmed candle must CLOSE across the active SA-VWAP line.
@@ -910,229 +913,166 @@ def _sa_build_leg(rows, start, end, direction, weights, atrs, source_points=None
 
 
 def _sa_vwap_setup(rows, direction):
-    """SA-VWAP signal engine with a confirmed-close cross trigger.
+    """Structure-breakout signal engine.
 
-    The active structure-anchored VWAP is still built from the supplied Pine
-    defaults (55/55 swing, ATR13 RMA, cumulative hl2 VWAP, 4x median volume
-    clamp).  The alert trigger is deliberately simpler and explicit:
+    The signal is based on the visible market structure shown in the user's
+    TradingView examples: a compact consolidation/range is bounded by a
+    confirmed swing high and swing low, then a NEW CLOSED candle breaks one
+    of those boundaries.
 
-      LONG  -> previous CLOSED candle was at/below VWAP and the newest CLOSED
-               candle closes above VWAP, while the active leg is bullish.
-      SHORT -> previous CLOSED candle was at/above VWAP and the newest CLOSED
-               candle closes below VWAP, while the active leg is bearish.
+      LONG  -> closed candle breaks above Structure High.
+      SHORT -> closed candle breaks below Structure Low.
 
-    This prevents the old retest-only logic from waiting for a later touch and
-    missing the actual breakout candle.  Entry is the trigger candle close.
-    SL is structure-aware and has a minimum ATR distance, so Entry/SL/TP are
-    not microscopic clusters on low-volatility coins. Targets are 1.5R/3R/4.5R.
+    Entry is the breakout candle close.  SL is placed beyond the opposite
+    structure boundary (with a small ATR buffer), so risk follows the actual
+    setup instead of collapsing into a tiny ATR-based cluster.  TP1/TP2/TP3
+    are measured from that real structure risk.
     """
     n = len(rows)
-    left = SA_VWAP_PIVOT_LEFT
-    right = SA_VWAP_PIVOT_RIGHT
-    if n < max(left + right + 10, 120):
+    if n < 80:
         return None
 
-    atrs = _pine_atr_series(rows, 13)
-    weights = _sa_weight_series(rows)
-    warmup = max(left + right, 50)
-
-    sw_type = 0
-    sw_hi = sw_lo = None
-    sw_hi_bar = sw_lo_bar = None
-    ref_hi = ref_lo = None
-    last_struct = "—"
-    leg = None
-    structure_points = []
-
-    def classify(cur, ref, is_high, tol_abs):
-        if ref is None:
-            return "H" if is_high else "L"
-        if abs(cur - ref) <= tol_abs:
-            return "EQH" if is_high else "EQL"
-        return ("HH" if is_high else "HL") if cur > ref else ("LH" if is_high else "LL")
-
-    # Rebuild structure + current SA-VWAP through the newest CLOSED candle.
-    for t in range(n):
-        hi_event = lo_event = False
-        if t >= right:
-            p = t - right
-            piv_hi, piv_lo = _pivot_at(rows, p, left, right)
-            atr_now = atrs[t] or 0.0
-            min_swing = SA_VWAP_MIN_SWING_ATR * atr_now
-            eq_tol = 0.1 * atr_now
-
-            if piv_hi:
-                val = rows[p]["high"]
-                if sw_type == 1:
-                    if sw_hi is None or val > sw_hi:
-                        sw_hi, sw_hi_bar = val, p
-                        hi_event = True
-                elif sw_type == 0 or (sw_lo is not None and val - sw_lo >= min_swing):
-                    ref_hi = sw_hi
-                    sw_hi, sw_hi_bar, sw_type = val, p, 1
-                    hi_event = True
-
-            if piv_lo:
-                val = rows[p]["low"]
-                if sw_type == -1:
-                    if sw_lo is None or val < sw_lo:
-                        sw_lo, sw_lo_bar = val, p
-                        lo_event = True
-                elif sw_type == 0 or (sw_hi is not None and sw_hi - val >= min_swing):
-                    ref_lo = sw_lo
-                    sw_lo, sw_lo_bar, sw_type = val, p, -1
-                    lo_event = True
-
-            if hi_event:
-                last_struct = classify(sw_hi, ref_hi, True, eq_tol)
-                structure_points.append((sw_hi_bar, sw_hi, last_struct, "HIGH"))
-            if lo_event:
-                last_struct = classify(sw_lo, ref_lo, False, eq_tol)
-                structure_points.append((sw_lo_bar, sw_lo, last_struct, "LOW"))
-
-        next_dir = 0
-        next_anchor = None
-        if hi_event or lo_event:
-            next_dir = -1 if sw_type == 1 else 1
-            next_anchor = sw_hi_bar if sw_type == 1 else sw_lo_bar
-
-        if next_anchor is not None and next_anchor <= t:
-            pts = _sa_build_leg(rows, next_anchor, t, next_dir, weights, atrs)
-            leg = {
-                "dir": next_dir,
-                "anchor": next_anchor,
-                "anchor_px": rows[next_anchor]["low"] if next_dir > 0 else rows[next_anchor]["high"],
-                "points": pts,
-            }
-        elif leg is not None:
-            leg["points"] = _sa_build_leg(rows, leg["anchor"], t, leg["dir"], weights, atrs)
-
-    if leg is None or n - 1 < warmup or len(leg.get("points", [])) < 2:
+    # Work only with confirmed pivots. The newest two candles are excluded
+    # from structure discovery so the current candle can be the breakout.
+    confirmed = rows[:-2]
+    if len(confirmed) < 30:
         return None
 
-    points = leg["points"]
-    point = points[-1]
-    prev = points[-2]
-    vwap = point["vwap"]
-    sigma = point["sigma"]
-    prev_vwap = prev["vwap"]
-    cur = rows[-1]
-    prev_row = rows[-2]
-    leg_dir = leg["dir"]
-
-    if vwap is None or prev_vwap is None:
-        return None
-
-    long_cross = (
-        direction == "LONG" and
-        prev_row["close"] <= prev_vwap and cur["close"] > vwap
-    )
-    short_cross = (
-        direction == "SHORT" and
-        prev_row["close"] >= prev_vwap and cur["close"] < vwap
-    )
-    # User-requested confirmation mode: every NEW CLOSED candle whose close is
-    # above the active SA-VWAP is a LONG candidate; every NEW CLOSED candle
-    # whose close is below it is a SHORT candidate. The scanner de-duplicates
-    # by timeframe/symbol/candle timestamp, so the same closed candle is never
-    # sent twice.
-    if SA_VWAP_TRIGGER_MODE == "CLOSE_SIDE":
-        long_cross = direction == "LONG" and cur["close"] > vwap
-        short_cross = direction == "SHORT" and cur["close"] < vwap
-        triggered = long_cross or short_cross
-    else:
-        triggered = long_cross or short_cross
-    if not triggered:
-        return None
-
-    actual_direction = "LONG" if long_cross else "SHORT"
-    atr_now = atrs[-1] or 0.0
+    atr_now = atr(rows, 14) or 0.0
     if atr_now <= 0:
         return None
 
-    # Structure-aware stop.  Use the most recent meaningful swing inside the
-    # current leg; then enforce a hard minimum ATR distance. This is what fixes
-    # the old Entry/SL/TP clustering on quiet coins.
-    lookback_start = max(leg["anchor"], n - 24)
-    if actual_direction == "LONG":
-        recent_swing = min(r["low"] for r in rows[lookback_start:n])
-        structural_sl = recent_swing - atr_now * SA_VWAP_STRUCTURE_BUFFER_ATR
-        min_sl = cur["close"] - atr_now * SA_VWAP_SL_ATR
-        sl = min(structural_sl, min_sl)
-        risk = cur["close"] - sl
-    else:
-        recent_swing = max(r["high"] for r in rows[lookback_start:n])
-        structural_sl = recent_swing + atr_now * SA_VWAP_STRUCTURE_BUFFER_ATR
-        min_sl = cur["close"] + atr_now * SA_VWAP_SL_ATR
-        sl = max(structural_sl, min_sl)
-        risk = sl - cur["close"]
-
-    # Do not let an old extreme swing make a microscopic-looking setup turn into
-    # an impractically huge stop. Keep risk inside a controlled ATR envelope.
-    max_risk = atr_now * SA_VWAP_MAX_RISK_ATR
-    if risk > max_risk:
-        risk = max_risk
-        sl = cur["close"] - risk if actual_direction == "LONG" else cur["close"] + risk
-    if risk <= 0:
+    # Search recent confirmed swing points. We deliberately use a short
+    # structural window: this is the local box visible in the examples, not
+    # an old all-chart high/low.
+    search_start = max(0, len(confirmed) - 55)
+    highs, lows = swing_points(confirmed[search_start:], left=2, right=2)
+    highs = [(i + search_start, px) for i, px in highs]
+    lows = [(i + search_start, px) for i, px in lows]
+    if not highs or not lows:
         return None
 
-    entry = cur["close"]
+    cur = rows[-1]
+    prev = rows[-2]
+    candidates = []
+
+    # Candidate range: use the latest swing high/low pair that forms a compact
+    # box with several candles after both pivots. Prefer the most recent pair.
+    for hi_i, hi_px in reversed(highs[-8:]):
+        for lo_i, lo_px in reversed(lows[-8:]):
+            if hi_px <= lo_px:
+                continue
+            start = max(hi_i, lo_i) + 1
+            end = n - 1
+            if start >= end:
+                continue
+            width = hi_px - lo_px
+            if width <= 0 or width > atr_now * 8.0:
+                continue
+            box = rows[start:end]
+            if len(box) < 4:
+                continue
+            # Most of the pre-breakout candles should remain inside/near the
+            # box. A small wick outside is allowed; repeated closes outside
+            # mean this is no longer the same structure.
+            inside = 0
+            for r in box:
+                if lo_px - atr_now * 0.25 <= r["close"] <= hi_px + atr_now * 0.25:
+                    inside += 1
+            if inside / max(1, len(box)) < 0.60:
+                continue
+            candidates.append((max(hi_i, lo_i), hi_i, hi_px, lo_i, lo_px, width))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0])
+    _, hi_i, structure_high, lo_i, structure_low, structure_width = candidates[-1]
+
+    # Fresh confirmed breakout only. This is intentionally based on the
+    # CLOSED candle, not an intrabar wick.
+    long_break = direction == "LONG" and prev["close"] <= structure_high and cur["close"] > structure_high
+    short_break = direction == "SHORT" and prev["close"] >= structure_low and cur["close"] < structure_low
+    if not (long_break or short_break):
+        return None
+
+    actual_direction = "LONG" if long_break else "SHORT"
+    entry = float(cur["close"])
+    buffer = atr_now * 0.12
+
+    if actual_direction == "LONG":
+        sl = structure_low - buffer
+        risk = entry - sl
+        structure_swing_index = lo_i
+        structure_swing_price = structure_low
+        structure_swing_type = "LOW"
+    else:
+        sl = structure_high + buffer
+        risk = sl - entry
+        structure_swing_index = hi_i
+        structure_swing_price = structure_high
+        structure_swing_type = "HIGH"
+
+    # Reject only pathological structures. Do NOT squeeze a valid setup back
+    # toward Entry; the whole point is that risk comes from structure.
+    if risk <= atr_now * 0.30 or risk > atr_now * 12.0:
+        return None
+
     tp1_r, tp2_r, tp3_r = SA_VWAP_TP_R
     if actual_direction == "LONG":
-        tp1 = entry + risk * tp1_r
-        tp2 = entry + risk * tp2_r
-        tp3 = entry + risk * tp3_r
+        tp1, tp2, tp3 = entry + risk * tp1_r, entry + risk * tp2_r, entry + risk * tp3_r
     else:
-        tp1 = entry - risk * tp1_r
-        tp2 = entry - risk * tp2_r
-        tp3 = entry - risk * tp3_r
+        tp1, tp2, tp3 = entry - risk * tp1_r, entry - risk * tp2_r, entry - risk * tp3_r
 
-    # Context strength is informational only.
-    up = dn = 0.0
-    for q in points:
-        if rows[q["index"]]["close"] >= q["vwap"]:
-            up += q["weight"]
-        else:
-            dn += q["weight"]
-    balance = up / (up + dn) * 100.0 if up + dn > 0 else 50.0
-    bal_align = balance if actual_direction == "LONG" else 100.0 - balance
-    dist_sig = ((entry - vwap) / sigma) if sigma > 0 else 0.0
-    strength = bal_align * 0.45
-    strength += 25.0 if (dist_sig > 0 if actual_direction == "LONG" else dist_sig < 0) else 0.0
-    strength += 20.0 if abs(dist_sig) <= 2.0 else 0.0
+    # Informational strength: structure quality + breakout distance. No extra
+    # indicator is allowed to veto the structure signal.
+    body = abs(cur["close"] - cur["open"])
+    body_ratio = body / max(cur["high"] - cur["low"], 1e-12)
+    break_dist = (entry - structure_high) if actual_direction == "LONG" else (structure_low - entry)
+    strength = 55.0
+    strength += min(25.0, max(0.0, break_dist / max(atr_now, 1e-12) * 12.0))
+    strength += min(20.0, body_ratio * 20.0)
     strength = min(100.0, strength)
 
     prior_vol = _rolling_mean([r.get("vol", 0.0) for r in rows[:-1]], 20)
     vol_mult = cur.get("vol", 0.0) / max(prior_vol, 1e-12) if prior_vol > 0 else 0.0
-    extension = abs(entry - vwap) / max(atr_now, 1e-12)
+
+    structure_points = [
+        (hi_i, structure_high, "SH", "HIGH"),
+        (lo_i, structure_low, "SL", "LOW"),
+    ]
 
     return {
         "symbol": "", "direction": actual_direction,
-        "structure": "SA-VWAP CLOSE CROSS", "pattern": "SA-VWAP CLOSE CROSS",
-        "entry": entry, "trigger_level": vwap,
+        "structure": "STRUCTURE BREAKOUT", "pattern": "STRUCTURE BREAKOUT",
+        "entry": entry, "trigger_level": structure_high if actual_direction == "LONG" else structure_low,
         "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
         "score": int(round(strength / 20.0)), "max_score": 5,
-        "strength": strength, "sa_vwap": vwap, "sa_sigma": sigma,
-        "leg_direction": leg_dir,
-        "leg_anchor_index": leg["anchor"], "leg_anchor_px": leg["anchor_px"],
-        "anchor_tag": next((sp[2] for sp in reversed(structure_points) if sp[0] == leg["anchor"]), "—"),
-        "leg_retests": 0, "leg_balance": balance,
+        "strength": strength, "sa_vwap": None, "sa_sigma": 0.0,
+        "leg_direction": 1 if actual_direction == "LONG" else -1,
+        "leg_anchor_index": min(hi_i, lo_i),
+        "leg_anchor_px": structure_low if actual_direction == "LONG" else structure_high,
+        "anchor_tag": "SH/SL",
+        "leg_retests": 0, "leg_balance": 50.0,
         "risk_distance": risk, "risk_atr": risk / atr_now,
         "risk_pct": risk / max(entry, 1e-12) * 100.0,
         "atr": atr_now, "volume_mult": vol_mult,
-        "breakout_volume_mult": vol_mult, "extension_atr": extension,
-        "breakout_index": leg["anchor"], "pullback_index": n - 1,
-        "range_high": max(r["high"] for r in rows[leg["anchor"]:n]),
-        "range_low": min(r["low"] for r in rows[leg["anchor"]:n]),
+        "breakout_volume_mult": vol_mult, "extension_atr": abs(entry - (structure_high if actual_direction == "LONG" else structure_low)) / max(atr_now, 1e-12),
+        "breakout_index": n - 1, "pullback_index": n - 1,
+        "range_high": structure_high, "range_low": structure_low,
+        "structure_swing_index": structure_swing_index,
+        "structure_swing_price": structure_swing_price,
+        "structure_swing_type": structure_swing_type,
+        "structure_high": structure_high, "structure_low": structure_low,
+        "structure_high_index": hi_i, "structure_low_index": lo_i,
+        "structure_width": structure_width,
         "retest_ok": True, "rejection_ok": True, "early_entry": True,
-        "checks": {"Structure": leg_dir != 0, "VWAP": True, "Close cross": True, "Closed candle": True},
+        "checks": {"Structure": True, "Breakout": True, "Closed candle": True},
         "fvg": None, "ob": None,
-        "entry_zone_low": vwap, "entry_zone_high": vwap,
+        "entry_zone_low": structure_low, "entry_zone_high": structure_high,
         "rows": rows, "full_len": len(rows),
-        "vwap_series": [(q["index"], q["vwap"], q["sigma"]) for q in points],
-        "structure_points": structure_points,
-        "leg_dir_series": [(q["index"], leg_dir) for q in points],
-        "signal_bar": n - 1,
+        "vwap_series": [], "structure_points": structure_points,
+        "leg_dir_series": [], "signal_bar": n - 1,
         "signal_time": cur["time"],
     }
 
@@ -1161,11 +1101,11 @@ def analyze(symbol, rows5=None, rows15=None, timeframe=SIGNAL_TIMEFRAME):
     return None
 
 def make_chart(sig):
-    """TradingView-like SA-VWAP chart based on the supplied Pine source."""
-    rows = sig.get("rows", [])[-100:]
+    """Wide TradingView-like structure-breakout chart for Telegram."""
+    rows = sig.get("rows", [])[-120:]
     n = len(rows)
     if n < 2:
-        raise RuntimeError("not enough candles for SA-VWAP chart")
+        raise RuntimeError("not enough candles for structure chart")
 
     BG = "#131722"
     GRID = "#2A2E39"
@@ -1176,101 +1116,91 @@ def make_chart(sig):
     ENTRY = "#5C8AAE"
     SL = "#E57373"
     TP = "#66BB6A"
-    TP_HIT = "#4DB6AC"
-    BE = "#FFA726"
     PANEL = "#131722"
 
-    fig, ax = plt.subplots(figsize=(14.8, 8.2), dpi=180, facecolor=BG)
+    fig, ax = plt.subplots(figsize=(14.8, 7.8), dpi=170, facecolor=BG)
     ax.set_facecolor(BG)
     width = 0.62
     for i, r in enumerate(rows):
         c = BULL if r["close"] >= r["open"] else BEAR
-        ax.vlines(i, r["low"], r["high"], color=c, linewidth=1.0, zorder=4)
+        ax.vlines(i, r["low"], r["high"], color=c, linewidth=0.9, zorder=4)
         lo = min(r["open"], r["close"])
         bh = max(abs(r["close"] - r["open"]), abs(r["close"]) * 1e-6)
-        ax.add_patch(Rectangle((i - width / 2, lo), width, bh, facecolor=c,
-                               edgecolor=c, linewidth=.45, zorder=5))
+        ax.add_patch(Rectangle((i - width / 2, lo), width, bh,
+                               facecolor=c, edgecolor=c, linewidth=.4, zorder=5))
 
     full_start = sig.get("full_len", len(rows)) - len(rows)
-    # Current-leg SA-VWAP + ±0.5σ band, matching the Pine default visual.
-    vmap = {int(i): (float(v), float(s)) for i, v, s in sig.get("vwap_series", [])}
-    xs, vs, ups, dns = [], [], [], []
-    for i in range(n):
-        q = vmap.get(full_start + i)
-        if q:
-            v, sd = q
-            xs.append(i); vs.append(v); ups.append(v + sd * 0.5); dns.append(v - sd * 0.5)
-    if xs:
-        ax.plot(xs, vs, color=BULL if sig["direction"] == "LONG" else BEAR,
-                linewidth=2.0, zorder=7, label="SA-VWAP")
-        ax.plot(xs, ups, color=BULL if sig["direction"] == "LONG" else BEAR,
-                linewidth=.65, alpha=.45, zorder=6)
-        ax.plot(xs, dns, color=BULL if sig["direction"] == "LONG" else BEAR,
-                linewidth=.65, alpha=.45, zorder=6)
-        ax.fill_between(xs, dns, ups, color=BULL if sig["direction"] == "LONG" else BEAR,
-                        alpha=.045, zorder=2)
 
-    # Structure labels, clipped to the visible window.
-    for idx, price, tag, kind in sig.get("structure_points", []):
-        li = idx - full_start
-        if 0 <= li < n:
-            col = BULL if kind == "LOW" else BEAR
-            va = "top" if kind == "HIGH" else "bottom"
-            y = price * (1.0015 if kind == "HIGH" else .9985)
-            ax.text(li, y, tag, color=col, fontsize=7.2, ha="center", va=va, zorder=10)
+    # Structure boundaries: only the local box used for the signal. These are
+    # the two horizontal levels the user wants clearly visible on the chart.
+    sh = sig.get("structure_high")
+    slv = sig.get("structure_low")
+    shi = sig.get("structure_high_index")
+    sli = sig.get("structure_low_index")
+    breakout_i = sig.get("signal_bar", len(sig.get("rows", [])) - 1) - full_start
+    breakout_i = max(0, min(n - 1, breakout_i))
 
-    sig_i = sig.get("signal_bar", len(sig.get("rows", [])) - 1) - full_start
-    sig_i = max(0, min(n - 1, sig_i))
-    if sig["direction"] == "LONG":
-        ax.scatter([sig_i], [rows[sig_i]["low"]], marker="^", s=85, color=BULL,
-                   edgecolors="#004D25", linewidth=.8, zorder=12)
-        ax.text(sig_i, rows[sig_i]["low"], " Long ▲", color="#004D25", fontsize=8.5,
-                fontweight="bold", va="top", ha="left", zorder=13)
-    else:
-        ax.scatter([sig_i], [rows[sig_i]["high"]], marker="v", s=85, color=BEAR,
-                   edgecolors="#FFFFFF", linewidth=.8, zorder=12)
-        ax.text(sig_i, rows[sig_i]["high"], " Short ▼", color="#FFFFFF", fontsize=8.5,
-                fontweight="bold", va="bottom", ha="left", zorder=13)
+    if sh is not None and shi is not None:
+        x0 = max(0, shi - full_start)
+        ax.hlines(sh, x0, breakout_i, color="#D7D7D7", linewidth=1.25, zorder=8)
+        ax.text(x0 + 0.8, sh, "  STRUCTURE HIGH", color="#D7D7D7", fontsize=7.6,
+                fontweight="bold", va="bottom", ha="left", zorder=10)
+    if slv is not None and sli is not None:
+        x0 = max(0, sli - full_start)
+        ax.hlines(slv, x0, breakout_i, color="#D7D7D7", linewidth=1.25, zorder=8)
+        ax.text(x0 + 0.8, slv, "  STRUCTURE LOW", color="#D7D7D7", fontsize=7.6,
+                fontweight="bold", va="top", ha="left", zorder=10)
 
-    entry, sl, tp1, tp2, tp3 = sig["entry"], sig["sl"], sig["tp1"], sig["tp2"], sig["tp3"]
-    ax.axhline(entry, color=ENTRY, linestyle=(0, (2, 2)), linewidth=1.0, zorder=3)
-    ax.axhline(sl, color=SL, linewidth=1.7, zorder=3)
-    for y, label, alpha in ((tp1, "TP1", .65), (tp2, "TP2", .75), (tp3, "TP3", .95)):
+    # Lightly mark the structural box without hiding candles.
+    if sh is not None and slv is not None:
+        left_box = max(0, min((shi or 0), (sli or 0)) - full_start)
+        ax.fill_between([left_box, breakout_i], [slv, slv], [sh, sh],
+                        color="#9E9E9E", alpha=.035, zorder=1)
+
+    entry, stop, tp1, tp2, tp3 = sig["entry"], sig["sl"], sig["tp1"], sig["tp2"], sig["tp3"]
+    ax.axhline(entry, color=ENTRY, linestyle=(0, (2, 2)), linewidth=1.15, zorder=3)
+    ax.axhline(stop, color=SL, linewidth=1.55, zorder=3)
+    for y, alpha in ((tp1, .62), (tp2, .76), (tp3, .92)):
         ax.axhline(y, color=TP, linestyle=(0, (4, 3)), linewidth=1.0, alpha=alpha, zorder=3)
 
-    # Right-side price labels like TradingView.
-    xlab = n + 1.2
+    # Breakout marker is placed on the actual confirmed breakout candle.
+    if sig["direction"] == "LONG":
+        y = rows[breakout_i]["low"]
+        ax.scatter([breakout_i], [y], marker="^", s=95, color=BULL,
+                   edgecolors="#FFFFFF", linewidth=.7, zorder=12)
+        ax.text(breakout_i, y, "  LONG BREAKOUT", color="#FFFFFF", fontsize=8.5,
+                fontweight="bold", va="top", ha="left", zorder=13)
+    else:
+        y = rows[breakout_i]["high"]
+        ax.scatter([breakout_i], [y], marker="v", s=95, color=BEAR,
+                   edgecolors="#FFFFFF", linewidth=.7, zorder=12)
+        ax.text(breakout_i, y, "  SHORT BREAKOUT", color="#FFFFFF", fontsize=8.5,
+                fontweight="bold", va="bottom", ha="left", zorder=13)
+
+    xlab = n + 1.0
     def pct(level):
         return (level - entry) / entry * 100.0 if entry else 0.0
-    ax.text(xlab, entry, f"ENTRY {fmt_price(entry)}", color=ENTRY, fontsize=8.2, fontweight="bold", va="center")
-    ax.text(xlab, sl, f"SL {fmt_price(sl)} ({pct(sl):+.2f}%)", color=SL, fontsize=8.0, fontweight="bold", va="center")
-    ax.text(xlab, tp1, f"TP1 {fmt_price(tp1)} ({pct(tp1):+.2f}%)", color=TP, fontsize=8.0, fontweight="bold", va="center")
-    ax.text(xlab, tp2, f"TP2 {fmt_price(tp2)} ({pct(tp2):+.2f}%)", color=TP, fontsize=8.0, fontweight="bold", va="center")
-    ax.text(xlab, tp3, f"TP3 {fmt_price(tp3)} ({pct(tp3):+.2f}%)", color=TP, fontsize=8.0, fontweight="bold", va="center")
+    labels = [
+        (entry, "ENTRY", ENTRY),
+        (stop, "SL", SL),
+        (tp1, "TP1", TP),
+        (tp2, "TP2", TP),
+        (tp3, "TP3", TP),
+    ]
+    for level, label, col in labels:
+        ax.text(xlab, level, f"{label} {fmt_price(level)} ({pct(level):+.2f}%)",
+                color=col, fontsize=8.0, fontweight="bold", va="center", zorder=15)
 
-    # Dashboard modeled after the Pine dashboard.
     strength = sig.get("strength", 0.0)
-    trend = "Bullish" if sig["direction"] == "LONG" else "Bearish"
-    anchor_i = sig.get("leg_anchor_index", 0)
-    anchor_px = sig.get("leg_anchor_px")
-    leg_age = max(0, sig_i + full_start - anchor_i)
-    move_pct = ((rows[-1]["close"] - anchor_px) / anchor_px * 100.0) if anchor_px else 0.0
+    risk_pct = sig.get("risk_pct", 0.0)
     dashboard = (
-        f"◆ SA-VWAP · {trend}\n"
-        f"Trend          {trend}\n"
+        f"◆ STRUCTURE BREAKOUT\n"
         f"Signal         {sig['direction']}\n"
-        f"Strength       {strength:.0f}  {'▰' * max(0, min(8, round(strength / 12.5)))}{'▱' * max(0, 8 - min(8, round(strength / 12.5)))}\n"
-        f"Last event     Close cross {'▲' if sig['direction']=='LONG' else '▼'}\n"
-        f"Timeframe      {sig.get('timeframe','15m')}\n"
-        f"Mode           Swing / cumulative\n"
-        f"Anchor         {sig.get('anchor_tag', 'SA-VWAP')} @ {fmt_price(anchor_px)}\n"
-        f"Leg age        {leg_age} bars · {move_pct:+.2f}%\n"
-        f"VWAP           {fmt_price(sig['sa_vwap'])}\n"
-        f"Price vs VWAP  {(rows[-1]['close']-sig['sa_vwap'])/sig['sa_vwap']*100:+.2f}%\n"
-        f"\nSL             {fmt_price(sl)} ({pct(sl):+.2f}%)\n"
-        f"TP1            {fmt_price(tp1)} ({pct(tp1):+.2f}%)\n"
-        f"TP2            {fmt_price(tp2)} ({pct(tp2):+.2f}%)\n"
-        f"TP3            {fmt_price(tp3)} ({pct(tp3):+.2f}%)\n"
+        f"Strength       {strength:.0f}/100\n"
+        f"Breakout       CLOSED CANDLE\n"
+        f"Structure High {fmt_price(sh) if sh is not None else '—'}\n"
+        f"Structure Low  {fmt_price(slv) if slv is not None else '—'}\n"
+        f"Risk           {risk_pct:.2f}%\n"
         f"R:R            1.5 / 3.0 / 4.5"
     )
     ax.text(.985, .965, dashboard, transform=ax.transAxes, fontsize=7.4, color=TEXT,
@@ -1279,12 +1209,12 @@ def make_chart(sig):
                       linewidth=1.0, alpha=.97), zorder=20)
 
     ax.text(.018, 1.055, f"{sig.get('symbol','')} · {sig.get('timeframe','15m').upper()}",
-            transform=ax.transAxes, fontsize=15.5, color=TEXT, fontweight="bold", va="top")
-    ax.text(.018, 1.018, "SA-VWAP [WAT] · STRUCTURE-ANCHORED VWAP",
-            transform=ax.transAxes, fontsize=8.4, color=MUTED, fontweight="bold", va="top")
+            transform=ax.transAxes, fontsize=15.0, color=TEXT, fontweight="bold", va="top")
+    ax.text(.018, 1.018, "STRUCTURE BREAKOUT · CLOSED CANDLE", transform=ax.transAxes,
+            fontsize=8.4, color=MUTED, fontweight="bold", va="top")
     dcol = BULL if sig["direction"] == "LONG" else BEAR
-    ax.text(.64, 1.055, sig["direction"], transform=ax.transAxes, fontsize=11.5, color=dcol,
-            fontweight="bold", va="top", ha="center")
+    ax.text(.64, 1.055, sig["direction"], transform=ax.transAxes, fontsize=11.5,
+            color=dcol, fontweight="bold", va="top", ha="center")
 
     ax.yaxis.tick_right()
     ax.tick_params(axis="y", colors="#9E9E9E", labelsize=8, length=0, pad=7)
@@ -1294,18 +1224,19 @@ def make_chart(sig):
     for side in ("top", "left", "bottom"):
         ax.spines[side].set_visible(False)
     ax.spines["right"].set_color(GRID)
-    step = max(1, n // 7)
+
+    step = max(1, n // 8)
     ticks = list(range(0, n, step))
     if not ticks or ticks[-1] != n - 1:
         ticks.append(n - 1)
     ax.set_xticks(ticks)
     ax.set_xticklabels([datetime.fromtimestamp(rows[i]["time"], tz=timezone.utc).strftime("%d\n%H:%M") for i in ticks])
 
-    levels = [r["low"] for r in rows] + [r["high"] for r in rows] + [sl, tp1, tp2, tp3, entry]
+    levels = [r["low"] for r in rows] + [r["high"] for r in rows] + [stop, tp1, tp2, tp3, entry]
     ymin, ymax = min(levels), max(levels)
-    span = max(ymax - ymin, abs(rows[-1]["close"]) * .01)
-    ax.set_ylim(ymin - span * .06, ymax + span * .12)
-    ax.set_xlim(-1, n + 11)
+    span = max(ymax - ymin, abs(rows[-1]["close"]) * .008)
+    ax.set_ylim(ymin - span * .055, ymax + span * .10)
+    ax.set_xlim(-1, n + 10)
     fig.subplots_adjust(left=.025, right=.83, top=.86, bottom=.085)
     safe = "".join(ch if ch.isalnum() else "_" for ch in sig.get("symbol", "SIGNAL"))
     path = f"/tmp/chart_{safe}_{sig['time']}.png"
@@ -1882,7 +1813,7 @@ def analysis_report(raw_symbol, requested_timeframes=None):
     return "\n".join(lines).strip()
 
 def _setup_metrics(sig):
-    """Transparent SA-VWAP Engine metrics; quality is a rule count, not probability."""
+    """Transparent Structure Breakout metrics; quality is a rule count, not probability."""
     entry = float(sig["entry"])
     sl = float(sig["sl"])
     risk = abs(entry - sl)
@@ -1891,17 +1822,19 @@ def _setup_metrics(sig):
     rr1 = abs(float(sig["tp1"])-entry)/risk
     rr2 = abs(float(sig["tp2"])-entry)/risk
     rr3 = abs(float(sig["tp3"])-entry)/risk
-    if str(sig.get("pattern", "")).startswith("SA-VWAP") and sig.get("strength") is not None:
-        # Context strength is a rule score, not a probability.
-        quality = round(float(sig.get("strength", 0.0)) / 10.0)
-        return {"risk":risk,"rr1":rr1,"rr2":rr2,"rr3":rr3,"quality":min(10, max(0, quality))}
+    if sig.get("pattern") == "STRUCTURE BREAKOUT":
+        checks = sig.get("checks") or {}
+        quality = sum(bool(checks.get(k)) for k in ("Structure", "Breakout", "Closed candle"))
+        quality += 1 if sig.get("structure_width", 0) > 0 else 0
+        quality += 1 if sig.get("risk_atr", 99) >= 0.75 else 0
+        quality += 1 if sig.get("volume_mult", 0) >= 1.0 else 0
+        return {"risk":risk,"rr1":rr1,"rr2":rr2,"rr3":rr3,"quality":min(10, quality + 3)}
     checks = sig.get("checks") or {}
     quality = sum(bool(checks.get(k)) for k in ("Range","Breakout","Volume","Trend"))
     quality += 1 if sig.get("retest_ok") else 0
     quality += 1 if sig.get("extension_atr",99) <= 1.20 else 0
     quality += 1 if sig.get("volume_mult",0) >= 1.10 else 0
     return {"risk":risk,"rr1":rr1,"rr2":rr2,"rr3":rr3,"quality":min(10,quality)}
-
 
 def _setup_detail_lines(sig):
     m = _setup_metrics(sig)
@@ -2011,7 +1944,7 @@ def watch_loop():
                     f"🎯 TP2: {fmt_price(sig['tp2'])}\n"
                     f"🎯 TP3: {fmt_price(sig['tp3'])}\n"
                     f"{details[0]}\n{details[1]}\n\n"
-                    f"Pattern: {sig.get('pattern','SA-VWAP CLOSE CROSS')} · confirmed close cross\n"
+                    f"Pattern: {sig.get('pattern','STRUCTURE BREAKOUT')} · confirmed closed-candle breakout\n"
                     "🛡️ Anti-chase filter: ON\n"
                     "⚠️ Signal only — no automatic trading."
                 )
@@ -2512,12 +2445,13 @@ def signal_caption(sig):
     d = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
     m = _setup_metrics(sig)
     return (
-        f"🚀 SAIWAN SA-VWAP SIGNAL\n\n{d}\n"
+        f"🚀 SAIWAN STRUCTURE BREAKOUT SIGNAL\n\n{d}\n"
         f"⭐ {sig['symbol']} · Bitget Futures\n"
         f"⏱ {sig.get('timeframe', SIGNAL_TIMEFRAME).upper()} · CLOSED CANDLES\n\n"
-        f"Pattern: {sig.get('pattern','MOMENTUM')}\n"
-        + (f"VWAP: {fmt_price(sig.get('sa_vwap', 0))} · Strength: {sig.get('strength', 0):.0f}/100\n"
-           if str(sig.get('pattern', '')).startswith('SA-VWAP') else
+        f"Pattern: {sig.get('pattern','STRUCTURE BREAKOUT')}\n"
+        + (f"Structure High: {fmt_price(sig.get('structure_high'))} · Structure Low: {fmt_price(sig.get('structure_low'))}\n"
+           f"Strength: {sig.get('strength', 0):.0f}/100\n"
+           if sig.get('pattern') == 'STRUCTURE BREAKOUT' else
            "Range → Breakout/Breakdown → Pullback/Continuation\n")
         + f"Volume: {sig.get('volume_mult',0):.2f}× avg · Extension: {sig.get('extension_atr',0):.2f}× ATR\n\n"
         f"Entry: {fmt_price(sig['entry'])}\n"
@@ -2526,7 +2460,7 @@ def signal_caption(sig):
         f"TP2: {fmt_price(sig['tp2'])}\n"
         f"TP3: {fmt_price(sig['tp3'])}\n"
         f"⭐ Quality: {m['quality']}/10 · R:R {m['rr1']:.2f} / {m['rr2']:.2f} / {m['rr3']:.2f}\n\n"
-        + ("🛡️ TP1 → SL moved to BE\n" if str(sig.get('pattern', '')).startswith('SA-VWAP') and SA_VWAP_USE_BE else "🛡️ Anti-chase filter: ON\n")
+        + ("🛡️ Structure SL · TP measured from structure risk\n" if sig.get('pattern') == 'STRUCTURE BREAKOUT' else "🛡️ Anti-chase filter: ON\n")
         + "⚠️ Signal only — no automatic trading."
     )
 
