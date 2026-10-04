@@ -1101,11 +1101,16 @@ def analyze(symbol, rows5=None, rows15=None, timeframe=SIGNAL_TIMEFRAME):
     return None
 
 def make_chart(sig):
-    """Wide TradingView-like structure-breakout chart for Telegram."""
-    rows = sig.get("rows", [])[-120:]
+    """Clean, wide TradingView-style signal chart: candles + ENTRY + SL only.
+
+    This function changes chart presentation only. Signal logic, Entry/SL/TP
+    calculations, scanning, monitoring and Telegram message contents are left
+    untouched.
+    """
+    rows = sig.get("rows", [])[-110:]
     n = len(rows)
     if n < 2:
-        raise RuntimeError("not enough candles for structure chart")
+        raise RuntimeError("not enough candles for chart")
 
     BG = "#131722"
     GRID = "#2A2E39"
@@ -1113,265 +1118,108 @@ def make_chart(sig):
     MUTED = "#9E9E9E"
     BULL = "#00E676"
     BEAR = "#FF5252"
-    ENTRY = "#5C8AAE"
-    SL = "#E57373"
-    TP = "#66BB6A"
-    PANEL = "#131722"
+    ENTRY = "#4FC3F7"
+    SL = "#EF5350"
 
-    fig, ax = plt.subplots(figsize=(14.8, 7.8), dpi=170, facecolor=BG)
+    fig, ax = plt.subplots(figsize=(15.2, 7.9), dpi=160, facecolor=BG)
     ax.set_facecolor(BG)
+
+    # Candles: keep them large enough to read, but show a broad section of
+    # price action like the user's TradingView examples.
     width = 0.62
     for i, r in enumerate(rows):
         c = BULL if r["close"] >= r["open"] else BEAR
-        ax.vlines(i, r["low"], r["high"], color=c, linewidth=0.9, zorder=4)
+        ax.vlines(i, r["low"], r["high"], color=c, linewidth=1.0, zorder=4)
         lo = min(r["open"], r["close"])
         bh = max(abs(r["close"] - r["open"]), abs(r["close"]) * 1e-6)
-        ax.add_patch(Rectangle((i - width / 2, lo), width, bh,
-                               facecolor=c, edgecolor=c, linewidth=.4, zorder=5))
+        ax.add_patch(
+            Rectangle(
+                (i - width / 2, lo), width, bh,
+                facecolor=c, edgecolor=c, linewidth=.45, zorder=5
+            )
+        )
 
+    entry = float(sig["entry"])
+    stop = float(sig["sl"])
+
+    # ONLY the two requested trade levels are drawn on the chart.
+    ax.axhline(entry, color=ENTRY, linewidth=1.35, linestyle=(0, (5, 3)), zorder=7)
+    ax.axhline(stop, color=SL, linewidth=1.35, zorder=7)
+
+    # Mark the confirmed signal candle without adding extra structure objects.
+    signal_i = sig.get("signal_bar")
     full_start = sig.get("full_len", len(rows)) - len(rows)
+    if signal_i is not None:
+        local_i = int(signal_i) - int(full_start)
+        if 0 <= local_i < n:
+            if sig.get("direction") == "LONG":
+                y = rows[local_i]["low"]
+                ax.scatter([local_i], [y], marker="^", s=78, color=BULL,
+                           edgecolors="#FFFFFF", linewidth=.65, zorder=10)
+            else:
+                y = rows[local_i]["high"]
+                ax.scatter([local_i], [y], marker="v", s=78, color=BEAR,
+                           edgecolors="#FFFFFF", linewidth=.65, zorder=10)
 
-    # Structure boundaries: only the local box used for the signal. These are
-    # the two horizontal levels the user wants clearly visible on the chart.
-    sh = sig.get("structure_high")
-    slv = sig.get("structure_low")
-    shi = sig.get("structure_high_index")
-    sli = sig.get("structure_low_index")
-    breakout_i = sig.get("signal_bar", len(sig.get("rows", [])) - 1) - full_start
-    breakout_i = max(0, min(n - 1, breakout_i))
+    # Right-side labels: ENTRY and SL only.
+    xlab = n + 1.5
+    ax.text(xlab, entry, f"ENTRY {fmt_price(entry)}",
+            color=ENTRY, fontsize=8.8, fontweight="bold",
+            va="center", ha="left", zorder=15)
+    ax.text(xlab, stop, f"SL {fmt_price(stop)}",
+            color=SL, fontsize=8.8, fontweight="bold",
+            va="center", ha="left", zorder=15)
 
-    if sh is not None and shi is not None:
-        x0 = max(0, shi - full_start)
-        ax.hlines(sh, x0, breakout_i, color="#D7D7D7", linewidth=1.25, zorder=8)
-        ax.text(x0 + 0.8, sh, "  STRUCTURE HIGH", color="#D7D7D7", fontsize=7.6,
-                fontweight="bold", va="bottom", ha="left", zorder=10)
-    if slv is not None and sli is not None:
-        x0 = max(0, sli - full_start)
-        ax.hlines(slv, x0, breakout_i, color="#D7D7D7", linewidth=1.25, zorder=8)
-        ax.text(x0 + 0.8, slv, "  STRUCTURE LOW", color="#D7D7D7", fontsize=7.6,
-                fontweight="bold", va="top", ha="left", zorder=10)
+    # Minimal header, matching the clean TradingView look.
+    symbol = sig.get("symbol", "")
+    timeframe = sig.get("timeframe", "15m").upper()
+    direction = sig.get("direction", "LONG")
+    dcol = BULL if direction == "LONG" else BEAR
 
-    # Lightly mark the structural box without hiding candles.
-    if sh is not None and slv is not None:
-        left_box = max(0, min((shi or 0), (sli or 0)) - full_start)
-        ax.fill_between([left_box, breakout_i], [slv, slv], [sh, sh],
-                        color="#9E9E9E", alpha=.035, zorder=1)
-
-    entry, stop, tp1, tp2, tp3 = sig["entry"], sig["sl"], sig["tp1"], sig["tp2"], sig["tp3"]
-    ax.axhline(entry, color=ENTRY, linestyle=(0, (2, 2)), linewidth=1.15, zorder=3)
-    ax.axhline(stop, color=SL, linewidth=1.55, zorder=3)
-    for y, alpha in ((tp1, .62), (tp2, .76), (tp3, .92)):
-        ax.axhline(y, color=TP, linestyle=(0, (4, 3)), linewidth=1.0, alpha=alpha, zorder=3)
-
-    # Breakout marker is placed on the actual confirmed breakout candle.
-    if sig["direction"] == "LONG":
-        y = rows[breakout_i]["low"]
-        ax.scatter([breakout_i], [y], marker="^", s=95, color=BULL,
-                   edgecolors="#FFFFFF", linewidth=.7, zorder=12)
-        ax.text(breakout_i, y, "  LONG BREAKOUT", color="#FFFFFF", fontsize=8.5,
-                fontweight="bold", va="top", ha="left", zorder=13)
-    else:
-        y = rows[breakout_i]["high"]
-        ax.scatter([breakout_i], [y], marker="v", s=95, color=BEAR,
-                   edgecolors="#FFFFFF", linewidth=.7, zorder=12)
-        ax.text(breakout_i, y, "  SHORT BREAKOUT", color="#FFFFFF", fontsize=8.5,
-                fontweight="bold", va="bottom", ha="left", zorder=13)
-
-    xlab = n + 1.0
-    def pct(level):
-        return (level - entry) / entry * 100.0 if entry else 0.0
-    labels = [
-        (entry, "ENTRY", ENTRY),
-        (stop, "SL", SL),
-        (tp1, "TP1", TP),
-        (tp2, "TP2", TP),
-        (tp3, "TP3", TP),
-    ]
-    for level, label, col in labels:
-        ax.text(xlab, level, f"{label} {fmt_price(level)} ({pct(level):+.2f}%)",
-                color=col, fontsize=8.0, fontweight="bold", va="center", zorder=15)
-
-    strength = sig.get("strength", 0.0)
-    risk_pct = sig.get("risk_pct", 0.0)
-    dashboard = (
-        f"◆ STRUCTURE BREAKOUT\n"
-        f"Signal         {sig['direction']}\n"
-        f"Strength       {strength:.0f}/100\n"
-        f"Breakout       CLOSED CANDLE\n"
-        f"Structure High {fmt_price(sh) if sh is not None else '—'}\n"
-        f"Structure Low  {fmt_price(slv) if slv is not None else '—'}\n"
-        f"Risk           {risk_pct:.2f}%\n"
-        f"R:R            1.5 / 3.0 / 4.5"
-    )
-    ax.text(.985, .965, dashboard, transform=ax.transAxes, fontsize=7.4, color=TEXT,
-            va="top", ha="right", linespacing=1.35,
-            bbox=dict(boxstyle="round,pad=.65", facecolor=PANEL, edgecolor="#2A2E39",
-                      linewidth=1.0, alpha=.97), zorder=20)
-
-    ax.text(.018, 1.055, f"{sig.get('symbol','')} · {sig.get('timeframe','15m').upper()}",
-            transform=ax.transAxes, fontsize=15.0, color=TEXT, fontweight="bold", va="top")
-    ax.text(.018, 1.018, "STRUCTURE BREAKOUT · CLOSED CANDLE", transform=ax.transAxes,
-            fontsize=8.4, color=MUTED, fontweight="bold", va="top")
-    dcol = BULL if sig["direction"] == "LONG" else BEAR
-    ax.text(.64, 1.055, sig["direction"], transform=ax.transAxes, fontsize=11.5,
-            color=dcol, fontweight="bold", va="top", ha="center")
+    ax.text(.018, 1.055, f"{symbol} · {timeframe}",
+            transform=ax.transAxes, fontsize=14.5, color=TEXT,
+            fontweight="bold", va="top")
+    ax.text(.018, 1.018, "SAIWAN · CLOSED CANDLE",
+            transform=ax.transAxes, fontsize=8.3, color=MUTED,
+            fontweight="bold", va="top")
+    ax.text(.985, 1.055, direction,
+            transform=ax.transAxes, fontsize=11.5, color=dcol,
+            fontweight="bold", va="top", ha="right")
 
     ax.yaxis.tick_right()
     ax.tick_params(axis="y", colors="#9E9E9E", labelsize=8, length=0, pad=7)
     ax.tick_params(axis="x", colors="#757575", labelsize=7.5, length=0, pad=8)
     ax.grid(axis="y", color=GRID, linewidth=.55, alpha=.75)
     ax.grid(axis="x", color=GRID, linewidth=.25, alpha=.3)
+
     for side in ("top", "left", "bottom"):
         ax.spines[side].set_visible(False)
     ax.spines["right"].set_color(GRID)
 
-    step = max(1, n // 8)
+    step = max(1, n // 9)
     ticks = list(range(0, n, step))
     if not ticks or ticks[-1] != n - 1:
         ticks.append(n - 1)
     ax.set_xticks(ticks)
-    ax.set_xticklabels([datetime.fromtimestamp(rows[i]["time"], tz=timezone.utc).strftime("%d\n%H:%M") for i in ticks])
+    ax.set_xticklabels([
+        datetime.fromtimestamp(rows[i]["time"], tz=timezone.utc).strftime("%d\n%H:%M")
+        for i in ticks
+    ])
 
-    levels = [r["low"] for r in rows] + [r["high"] for r in rows] + [stop, tp1, tp2, tp3, entry]
-    ymin, ymax = min(levels), max(levels)
-    span = max(ymax - ymin, abs(rows[-1]["close"]) * .008)
-    ax.set_ylim(ymin - span * .055, ymax + span * .10)
-    ax.set_xlim(-1, n + 10)
-    fig.subplots_adjust(left=.025, right=.83, top=.86, bottom=.085)
-    safe = "".join(ch if ch.isalnum() else "_" for ch in sig.get("symbol", "SIGNAL"))
+    # IMPORTANT: TP values are intentionally NOT included in chart scaling.
+    price_levels = [r["low"] for r in rows] + [r["high"] for r in rows] + [entry, stop]
+    ymin, ymax = min(price_levels), max(price_levels)
+    span = max(ymax - ymin, abs(rows[-1]["close"]) * .006)
+    ax.set_ylim(ymin - span * .06, ymax + span * .08)
+    ax.set_xlim(-1, n + 11)
+
+    fig.subplots_adjust(left=.025, right=.84, top=.86, bottom=.085)
+    safe = "".join(ch if ch.isalnum() else "_" for ch in symbol)
     path = f"/tmp/chart_{safe}_{sig['time']}.png"
-    fig.savefig(path, facecolor=BG, edgecolor="none", bbox_inches="tight", pad_inches=.08)
+    fig.savefig(path, facecolor=BG, edgecolor="none",
+                bbox_inches="tight", pad_inches=.08)
     plt.close(fig)
     return path
-
-def make_analysis_chart(symbol, timeframe, rows, block=None):
-    """Render an on-demand analysis chart, even when no complete trade setup exists."""
-    if not rows:
-        raise RuntimeError("no candles for analysis chart")
-    rows = rows[-90:]
-    n = len(rows)
-    BG = "#07101d"
-    PANEL = "#0b1626"
-    GRID = "#1a293b"
-    TEXT = "#e7eef7"
-    MUTED = "#7f93a8"
-    UP = "#12d6a0"
-    DOWN = "#ff3d57"
-    GOLD = "#ffd21f"
-    BLUE = "#4f7cff"
-    PURPLE = "#7c5cff"
-    PINK = "#ff4f87"
-    CYAN = "#31d7ff"
-
-    fig, ax = plt.subplots(figsize=(14.4, 7.8), dpi=170, facecolor=BG)
-    ax.set_facecolor(BG)
-    width = .62
-    for i, r in enumerate(rows):
-        c = UP if r["close"] >= r["open"] else DOWN
-        ax.vlines(i, r["low"], r["high"], color=c, linewidth=1.1, zorder=4)
-        lo = min(r["open"], r["close"])
-        bh = max(abs(r["close"]-r["open"]), abs(r["close"])*1e-5)
-        ax.add_patch(Rectangle((i-width/2, lo), width, bh, facecolor=c,
-                               edgecolor=c, linewidth=.6, zorder=5))
-
-    closes=[r["close"] for r in rows]
-    e20=ema(closes,20)
-    e50=ema(closes,50)
-    ax.plot(range(n), e20, color=BLUE, linewidth=1.35, alpha=.95, label="EMA20", zorder=6)
-    ax.plot(range(n), e50, color=GOLD, linewidth=1.25, alpha=.9, label="EMA50", zorder=6)
-
-    # Recent swing structure for a chart-first analysis.
-    highs, lows = swing_points(rows, left=2, right=2)
-    for idx, price in highs[-6:]:
-        ax.scatter([idx], [price], s=20, facecolors="none", edgecolors=DOWN, linewidth=.9, zorder=8)
-    for idx, price in lows[-6:]:
-        ax.scatter([idx], [price], s=20, facecolors="none", edgecolors=UP, linewidth=.9, zorder=8)
-
-    # If a complete SA-VWAP Engine setup exists, overlay its range and levels.
-    if block:
-        setup = block.get("long_sig") or block.get("short_sig")
-        if setup:
-            direction = setup["direction"]
-            rh, rl = setup.get("range_high"), setup.get("range_low")
-            time_to_local = {r["time"]: i for i, r in enumerate(rows)}
-            setup_rows = setup.get("rows", rows)
-            if rh is not None and rl is not None:
-                x = max(0, len(rows)-min(20, len(rows)-1))
-                ax.add_patch(Rectangle((x, rl), len(rows)-1-x, rh-rl,
-                                       facecolor=GOLD, edgecolor=GOLD, alpha=.10, linewidth=1.0, zorder=1))
-                ax.axhline(rh if direction == "LONG" else rl, color=CYAN, linestyle="--", linewidth=1.0, alpha=.85)
-                ax.text(x+1, rh if direction == "LONG" else rl,
-                        "BREAKOUT" if direction == "LONG" else "BREAKDOWN",
-                        color=CYAN, fontsize=8, fontweight="bold", va="bottom" if direction == "LONG" else "top")
-            if "entry" in setup:
-                entry, sl = setup["entry"], setup["sl"]
-                ax.axhline(entry,color=BLUE,linestyle="--",linewidth=1.15,zorder=3)
-                ax.axhline(sl,color=DOWN,linewidth=1.1,zorder=3)
-                for y,lab in ((setup["tp1"],"TP1"),(setup["tp2"],"TP2"),(setup["tp3"],"TP3")):
-                    ax.axhline(y,color=UP,linestyle="--",linewidth=.9,alpha=.8,zorder=2)
-                    ax.text(len(rows)+1,y,f"{lab} {fmt_price(y)}",color=UP,fontsize=8,fontweight="bold",va="center")
-                ax.text(len(rows)+1,entry,f"ENTRY {fmt_price(entry)}",color=BLUE,fontsize=8,fontweight="bold",va="center")
-                ax.text(len(rows)+1,sl,f"SL {fmt_price(sl)}",color=DOWN,fontsize=8,fontweight="bold",va="center")
-                ax.text(.72,.95,setup.get("pattern","MOMENTUM"),transform=ax.transAxes,
-                        color=UP if direction=="LONG" else DOWN,fontsize=9,fontweight="bold",ha="left",va="top")
-
-    cur=rows[-1]["close"]
-    e20v=e20[-1]; e50v=e50[-1]
-    if cur > e20v and e20v > e50v:
-        bias="LONG"
-        bias_color=UP
-    elif cur < e20v and e20v < e50v:
-        bias="SHORT"
-        bias_color=DOWN
-    else:
-        bias="MIXED"
-        bias_color=GOLD
-
-    ax.text(.018,1.065,f"{symbol} · {timeframe.upper()}",transform=ax.transAxes,
-            fontsize=16,color=TEXT,fontweight="bold",va="top")
-    ax.text(.018,1.025,"SAIWAN ANALYSIS · BITGET FUTURES",transform=ax.transAxes,
-            fontsize=8.8,color=MUTED,fontweight="bold",va="top")
-    ax.text(.985,1.055,bias,transform=ax.transAxes,fontsize=12,color=bias_color,
-            fontweight="bold",ha="right",va="top",
-            bbox=dict(boxstyle="round,pad=.38",facecolor=BG,edgecolor=bias_color,linewidth=1.0))
-
-    panel=(f"{symbol} · {timeframe.upper()}\\n"
-           f"Price  {fmt_price(cur)}\\n"
-           f"EMA20  {fmt_price(e20v)}\\n"
-           f"EMA50  {fmt_price(e50v)}\\n\\n"
-           f"Bias: {bias}\\n"
-           f"Candles: CLOSED")
-    ax.text(.022,.035,panel,transform=ax.transAxes,fontsize=8.8,color=TEXT,va="bottom",
-            ha="left",linespacing=1.45,bbox=dict(boxstyle="round,pad=.72",facecolor=PANEL,
-            edgecolor="#2a4664",linewidth=1.0,alpha=.97),zorder=20)
-    ax.legend(loc="upper left",bbox_to_anchor=(.36,1.055),frameon=False,labelcolor=TEXT,
-              fontsize=8.5,ncol=2)
-
-    ax.yaxis.tick_right()
-    ax.tick_params(axis="y",colors="#9bb0c5",labelsize=8.2,length=0,pad=7)
-    ax.tick_params(axis="x",colors="#71879d",labelsize=7.8,length=0,pad=8)
-    ax.grid(axis="y",color=GRID,linewidth=.65,alpha=.8)
-    ax.grid(axis="x",color=GRID,linewidth=.35,alpha=.35)
-    for side in ["top","left","bottom"]: ax.spines[side].set_visible(False)
-    ax.spines["right"].set_color("#22364b")
-    step=max(1,n//7)
-    ticks=list(range(0,n,step))
-    if not ticks or ticks[-1]!=n-1: ticks.append(n-1)
-    ax.set_xticks(ticks)
-    ax.set_xticklabels([datetime.fromtimestamp(rows[i]["time"],tz=timezone.utc).strftime("%d\\n%H:%M") for i in ticks])
-    all_lows=[r["low"] for r in rows]
-    all_highs=[r["high"] for r in rows]
-    ymin,ymax=min(all_lows),max(all_highs)
-    span=max(ymax-ymin,abs(cur)*.012)
-    ax.set_ylim(ymin-span*.06,ymax+span*.16)
-    ax.set_xlim(-1,n+10)
-    fig.subplots_adjust(left=.025,right=.87,top=.86,bottom=.085)
-    safe="".join(ch if ch.isalnum() else "_" for ch in symbol)
-    path=f"/tmp/analysis_{safe}_{timeframe}_{int(time.time())}.png"
-    fig.savefig(path,facecolor=BG,edgecolor="none",bbox_inches="tight",pad_inches=.08)
-    plt.close(fig)
-    return path
-
 
 def make_analysis_charts(raw_symbol, requested_timeframes=None):
     symbol=_normalize_analysis_symbol(raw_symbol)
