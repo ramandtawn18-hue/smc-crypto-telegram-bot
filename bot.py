@@ -25,7 +25,7 @@ TF_2H = "2h"
 TF_4H = "4h"
 TF_5M = "5m"
 TIMEFRAME = TF_15M
-SUPPORTED_SCAN_TIMEFRAMES = (TF_15M, TF_30M, TF_1H, TF_2H, TF_4H)
+SUPPORTED_SCAN_TIMEFRAMES = ("1m", TF_5M, TF_15M, TF_30M, TF_1H, TF_2H, TF_4H)
 CANDLE_LIMIT = 260
 # 0 = scan every eligible Bitget USDT perpetual contract (no top-N cap)
 MAX_PAIRS = 0
@@ -79,7 +79,7 @@ SA_VWAP_USE_BE = True
 # Fresh signal rule: a confirmed candle must CLOSE across the active SA-VWAP line.
 # LONG = previous close at/below VWAP -> current close above VWAP.
 # SHORT = previous close at/above VWAP -> current close below VWAP.
-SA_VWAP_TRIGGER_MODE = "CLOSE_CROSS"
+SA_VWAP_TRIGGER_MODE = "CLOSE_SIDE"
 
 MOM_EMA_FAST = 9
 MOM_EMA_MID = 21
@@ -200,6 +200,7 @@ def get_tickers():
 def get_klines(symbol, interval=TIMEFRAME, limit=CANDLE_LIMIT):
     # Bitget requires 1H/4H for hourly candles; minute intervals stay lowercase.
     api_granularity = {
+        "1m": "1m",
         "5m": "5m",
         "15m": "15m",
         "30m": "30m",
@@ -216,6 +217,7 @@ def get_klines(symbol, interval=TIMEFRAME, limit=CANDLE_LIMIT):
     raw = payload.get("data") or []
     now_ms = int(time.time() * 1000)
     candle_ms = {
+        "1m": 60 * 1000,
         "5m": 5 * 60 * 1000,
         "15m": 15 * 60 * 1000,
         "30m": 30 * 60 * 1000,
@@ -1022,20 +1024,24 @@ def _sa_vwap_setup(rows, direction):
         return None
 
     long_cross = (
-        direction == "LONG" and leg_dir > 0 and
+        direction == "LONG" and
         prev_row["close"] <= prev_vwap and cur["close"] > vwap
     )
     short_cross = (
-        direction == "SHORT" and leg_dir < 0 and
+        direction == "SHORT" and
         prev_row["close"] >= prev_vwap and cur["close"] < vwap
     )
-    if SA_VWAP_TRIGGER_MODE == "CLOSE_CROSS":
+    # User-requested confirmation mode: every NEW CLOSED candle whose close is
+    # above the active SA-VWAP is a LONG candidate; every NEW CLOSED candle
+    # whose close is below it is a SHORT candidate. The scanner de-duplicates
+    # by timeframe/symbol/candle timestamp, so the same closed candle is never
+    # sent twice.
+    if SA_VWAP_TRIGGER_MODE == "CLOSE_SIDE":
+        long_cross = direction == "LONG" and cur["close"] > vwap
+        short_cross = direction == "SHORT" and cur["close"] < vwap
         triggered = long_cross or short_cross
     else:
-        triggered = (
-            (direction == "LONG" and leg_dir > 0 and cur["close"] > vwap) or
-            (direction == "SHORT" and leg_dir < 0 and cur["close"] < vwap)
-        )
+        triggered = long_cross or short_cross
     if not triggered:
         return None
 
@@ -1481,6 +1487,7 @@ def main_menu_markup():
 def scan_menu_markup():
     return {
         "inline_keyboard": [
+            [_inline_button("⚡ 1 MIN", "scan_tf:1m"), _inline_button("⚡ 5 MIN", "scan_tf:5m")],
             [_inline_button("⚡ 15 MIN", "scan_tf:15m"), _inline_button("🕐 30 MIN", "scan_tf:30m")],
             [_inline_button("🕐 1 HOUR", "scan_tf:1h"), _inline_button("🕑 2 HOURS", "scan_tf:2h")],
             [_inline_button("🕓 4 HOURS", "scan_tf:4h")],
@@ -1500,6 +1507,7 @@ def analysis_menu_markup():
 
 def analysis_timeframe_markup(symbol):
     return {"inline_keyboard": [
+        [_inline_button("1 MIN", f"analysis:{symbol}:1m"), _inline_button("5 MIN", f"analysis:{symbol}:5m")],
         [_inline_button("15 MIN", f"analysis:{symbol}:15m"), _inline_button("30 MIN", f"analysis:{symbol}:30m")],
         [_inline_button("1 HOUR", f"analysis:{symbol}:1h"), _inline_button("4 HOURS", f"analysis:{symbol}:4h")],
         [_inline_button("◀️ COINS", "menu_analysis")],
@@ -1550,6 +1558,8 @@ def answer_callback(callback_id, text=None):
 
 def _scan_timeframe_label(timeframe):
     return {
+        "1m": "1 MIN",
+        "5m": "5 MIN",
         "15m": "15 MIN",
         "30m": "30 MIN",
         "1h": "1 HOUR",
@@ -1561,6 +1571,8 @@ def _scan_timeframe_label(timeframe):
 def _normalize_scan_timeframe(raw):
     tf = (raw or "").strip().lower()
     aliases = {
+        "1": "1m", "1m": "1m",
+        "5": "5m", "5m": "5m",
         "15": "15m", "15m": "15m",
         "30": "30m", "30m": "30m",
         "1h": "1h", "1hour": "1h", "1hr": "1h",
@@ -1718,6 +1730,8 @@ def _normalize_analysis_timeframe(raw):
     """Normalize on-demand analysis to the supported 15m/30m/1h/4h set."""
     tf = (raw or "").strip().lower()
     aliases = {
+        "1": "1m", "1m": "1m",
+        "5": TF_5M, "5m": TF_5M,
         "15": TF_15M, "15m": TF_15M,
         "30": TF_30M, "30m": TF_30M,
         "1h": TF_1H, "1hour": TF_1H, "1hr": TF_1H,
@@ -1729,7 +1743,7 @@ def _normalize_analysis_timeframe(raw):
 def _analysis_tf_data(symbol, timeframe):
     """Fetch closed candles for an on-demand analysis timeframe."""
     tf = _normalize_analysis_timeframe(timeframe)
-    if tf not in (TF_15M, TF_30M, TF_1H, TF_4H):
+    if tf not in ("1m", TF_5M, TF_15M, TF_30M, TF_1H, TF_4H):
         raise RuntimeError("unsupported analysis timeframe")
     rows = get_klines(symbol, tf, max(CANDLE_LIMIT, 180))
     if len(rows) < 120:
@@ -1804,7 +1818,7 @@ def _analysis_verdict(blocks):
 
 
 def analysis_report(raw_symbol, requested_timeframes=None):
-    """On-demand SA-VWAP analysis for 15m, 30m, 1h and 4h."""
+    """On-demand SA-VWAP analysis for 1m, 5m, 15m, 30m, 1h and 4h."""
     symbol = _normalize_analysis_symbol(raw_symbol)
     if not symbol or len(symbol) < 6:
         return "❌ تکایە ناوی کۆین بنووسە.\n\nنموونە: /analysis BTC 15m"
@@ -1812,7 +1826,7 @@ def analysis_report(raw_symbol, requested_timeframes=None):
     requested = []
     for raw_tf in (requested_timeframes or [SIGNAL_TIMEFRAME]):
         tf = _normalize_analysis_timeframe(raw_tf)
-        if tf in (TF_15M, TF_30M, TF_1H, TF_4H) and tf not in requested:
+        if tf in ("1m", TF_5M, TF_15M, TF_30M, TF_1H, TF_4H) and tf not in requested:
             requested.append(tf)
     if not requested:
         return "❌ Timeframe ـەکە هەڵەیە.\nبەردەستە: 15m, 30m, 1h, 4h"
@@ -2082,10 +2096,10 @@ def _get_historical_klines(symbol, timeframe, days=30):
     Bitget's historical-candle endpoint returns up to 200 rows per request, so
     we walk backward from now. The exact available history depends on timeframe.
     """
-    granularity = {"15m":"15m"}.get(str(timeframe).lower())
+    granularity = {"1m":"1m", "5m":"5m", "15m":"15m"}.get(str(timeframe).lower())
     if not granularity:
         raise ValueError("unsupported timeframe")
-    candle_ms = {"15m":900000}[str(timeframe).lower()]
+    candle_ms = {"1m":60000, "5m":300000, "15m":900000}[str(timeframe).lower()]
     now_ms = int(time.time()*1000)
     start_ms = now_ms - int(days*86400000)
     cursor_end = now_ms
@@ -2766,7 +2780,7 @@ def poll_updates():
                         else:
                             symbol = _normalize_analysis_symbol(parts[1]); tf = _normalize_analysis_timeframe(parts[2])
                             if not tf:
-                                send_message(active_chat_id, "❌ Timeframe ـی بۆتەکە تەنها 15m ـە. نموونە: /analysis BTC 15m")
+                                send_message(active_chat_id, "❌ Timeframe ـی هەڵەیە. نموونە: /analysis BTC 1m یان /analysis BTC 5m")
                             else:
                                 send_message(active_chat_id, f"🔎 خەریکم {symbol} شیکاری دەکەم...\n⏱ {tf.upper()}")
                                 send_message(active_chat_id, analysis_report(symbol, [tf]))
