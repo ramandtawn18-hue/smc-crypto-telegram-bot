@@ -62,8 +62,9 @@ MOM_MAX_RISK_ATR = 3.50
 
 # SA-VWAP port from the supplied TradingView Pine source.
 # Primary trigger: anchored VWAP retest after price has spent enough bars away
-# from VWAP in the current structural leg. Risk preset mirrors the source's
-# Balanced preset: 1.5 ATR SL and 1R / 2R / 3R targets, with BE after TP1.
+# from VWAP in the current structural leg. Entry/SL logic follows the supplied
+# Pine source; targets use the bot's Adaptive profile by default because the
+# user found the source's Balanced 1R/2R/3R targets too compressed on some coins.
 SA_VWAP_ENABLED = True
 SA_VWAP_PIVOT_LEFT = 55
 SA_VWAP_PIVOT_RIGHT = 55
@@ -72,12 +73,19 @@ SA_VWAP_RETEST_MIN_AWAY = 5
 SA_VWAP_RETEST_TOL_SIGMA = 0.25
 SA_VWAP_VOLUME_CLAMP_MEDIAN = 4.0
 SA_VWAP_SL_ATR = 1.50
-SA_VWAP_TP_R = (1.0, 2.0, 3.0)
+SA_VWAP_RISK_MODE = "Adaptive"
+# Adaptive targets keep the TradingView SA-VWAP entry/SL model intact, while
+# widening targets on low-volatility coins where the old 1R/2R/3R targets
+# were visibly too compressed.
+SA_VWAP_BALANCED_TP_R = (1.0, 2.0, 3.0)
+SA_VWAP_ADAPTIVE_TP_LOWVOL = (2.0, 4.0, 6.0)
+SA_VWAP_ADAPTIVE_TP_NORMAL = (1.5, 3.0, 5.0)
+SA_VWAP_ADAPTIVE_TP_MID = (1.25, 2.5, 4.0)
+SA_VWAP_ADAPTIVE_TP_HIGH = (1.0, 2.0, 3.0)
 SA_VWAP_USE_BE = True
+SA_VWAP_REQUIRE_SLOPE_CONFIRM = True
+SA_VWAP_SLOPE_LOOKBACK = 5
 
-MOM_EMA_FAST = 9
-MOM_EMA_MID = 21
-MOM_EMA_SLOW = 50
 
 app = Flask(__name__)
 stop_event = threading.Event()
@@ -901,6 +909,33 @@ def _sa_build_leg(rows, start, end, direction, weights, atrs, source_points=None
     return points
 
 
+def _sa_target_profile(entry, risk_distance):
+    """Return TP R-multipliers without changing the Pine-derived signal trigger.
+
+    The supplied Pine source uses Balanced 1R/2R/3R. The bot now defaults to an
+    adaptive target profile because the user observed that this is too compressed
+    on low-volatility perpetuals. SL remains exactly 1.5 ATR; only target distance
+    changes according to the stop distance as a percentage of entry.
+    """
+    if entry <= 0 or risk_distance <= 0:
+        return SA_VWAP_BALANCED_TP_R, "Balanced"
+    risk_pct = risk_distance / entry * 100.0
+    if SA_VWAP_RISK_MODE == "Balanced":
+        return SA_VWAP_BALANCED_TP_R, "Balanced"
+    if SA_VWAP_RISK_MODE == "Aggressive":
+        return (1.5, 2.5, 4.0), "Aggressive"
+    if SA_VWAP_RISK_MODE == "Conservative":
+        return (1.0, 2.0, 4.0), "Conservative"
+    # Adaptive: wider targets for quiet coins, normal targets for volatile coins.
+    if risk_pct <= 0.35:
+        return SA_VWAP_ADAPTIVE_TP_LOWVOL, "Adaptive-LowVol"
+    if risk_pct <= 0.75:
+        return SA_VWAP_ADAPTIVE_TP_NORMAL, "Adaptive-Normal"
+    if risk_pct <= 1.25:
+        return SA_VWAP_ADAPTIVE_TP_MID, "Adaptive-Mid"
+    return SA_VWAP_ADAPTIVE_TP_HIGH, "Adaptive-HighVol"
+
+
 def _sa_vwap_setup(rows, direction):
     """Bit-for-bit-oriented port of the supplied TradingView SA-VWAP default mode.
 
@@ -945,16 +980,18 @@ def _sa_vwap_setup(rows, direction):
         sl_dist = risk_atr * SA_VWAP_SL_ATR
         if sl_dist <= 0:
             return None
+        tps, risk_profile = _sa_target_profile(entry, sl_dist)
+        tp1_r, tp2_r, tp3_r = tps
         if leg_dir > 0:
             sl = entry - sl_dist
-            tp1 = entry + sl_dist * 1.0
-            tp2 = entry + sl_dist * 2.0
-            tp3 = entry + sl_dist * 3.0
+            tp1 = entry + sl_dist * tp1_r
+            tp2 = entry + sl_dist * tp2_r
+            tp3 = entry + sl_dist * tp3_r
         else:
             sl = entry + sl_dist
-            tp1 = entry - sl_dist * 1.0
-            tp2 = entry - sl_dist * 2.0
-            tp3 = entry - sl_dist * 3.0
+            tp1 = entry - sl_dist * tp1_r
+            tp2 = entry - sl_dist * tp2_r
+            tp3 = entry - sl_dist * tp3_r
         if sl <= 0 and leg_dir > 0:
             return None
         if risk_atr > 0 and sl_dist > entry * 0.12:
@@ -962,6 +999,7 @@ def _sa_vwap_setup(rows, direction):
         return {
             "direction": "LONG" if leg_dir > 0 else "SHORT",
             "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+            "tp_r": tuple(tps), "risk_profile": risk_profile,
             "active_sl": sl, "tp1_hit": False, "tp2_hit": False,
             "tp3_hit": False, "be_active": False, "entry_bar": j,
             "vwap": vwap, "sigma": sigma, "strength": strength,
@@ -1059,9 +1097,13 @@ def _sa_vwap_setup(rows, direction):
         # Simulate the Pine single-position trade state. A signal is allowed only
         # while flat at the start of this bar; exits are evaluated after entry.
         hit = bool(point["hit"])
+        slope_lookback = SA_VWAP_SLOPE_LOOKBACK
+        slope_ok = True
+        if SA_VWAP_REQUIRE_SLOPE_CONFIRM and len(leg["points"]) > slope_lookback:
+            slope_ok = (vwap - leg["points"][-1 - slope_lookback]["vwap"]) * leg["dir"] > 0
         can_open = active_trade is None
         opened = None
-        if can_open and hit and (leg["dir"] != 0):
+        if can_open and hit and slope_ok and (leg["dir"] != 0):
             opened = make_trade(t, leg["dir"], vwap, sigma, strength, retests)
             if opened:
                 active_trade = opened
@@ -1116,15 +1158,20 @@ def _sa_vwap_setup(rows, direction):
         "leg_retests": sig["retests"], "leg_balance": None,
         "risk_distance": abs(sig["entry"] - sig["sl"]),
         "risk_atr": SA_VWAP_SL_ATR,
+        "tp_r": sig.get("tp_r", SA_VWAP_BALANCED_TP_R),
+        "risk_profile": sig.get("risk_profile", "Balanced"),
         "risk_pct": abs(sig["entry"] - sig["sl"]) / max(sig["entry"], 1e-12) * 100.0,
         "atr": atrs[j] or 0.0, "volume_mult": vol_mult,
         "breakout_volume_mult": vol_mult, "extension_atr": extension,
+        "vwap_slope": (vwap - points[-6]["vwap"]) if len(points) >= 6 else 0.0,
+        "trend_word": "BULLISH" if leg["dir"] > 0 else "BEARISH",
         "breakout_index": leg["anchor"] if leg else 0,
         "pullback_index": j,
         "range_high": max(r["high"] for r in rows[leg["anchor"]:j + 1]) if leg else rows[j]["high"],
         "range_low": min(r["low"] for r in rows[leg["anchor"]:j + 1]) if leg else rows[j]["low"],
         "retest_ok": True, "rejection_ok": True, "early_entry": True,
-        "checks": {"Structure": True, "VWAP": True, "Retest": True, "Closed candle": True},
+        "slope_confirmed": (sig.get("vwap_slope", 0.0) * (1 if sig["direction"] == "LONG" else -1) > 0) if SA_VWAP_REQUIRE_SLOPE_CONFIRM else True,
+        "checks": {"Structure": True, "VWAP": True, "Retest": True, "Slope": True, "Closed candle": True},
         "fvg": None, "ob": None,
         "entry_zone_low": sig["vwap"] - sig["sigma"] * SA_VWAP_RETEST_TOL_SIGMA,
         "entry_zone_high": sig["vwap"] + sig["sigma"] * SA_VWAP_RETEST_TOL_SIGMA,
@@ -1146,7 +1193,7 @@ def _move_setup(rows, direction):
 def analyze(symbol, rows5=None, rows15=None, timeframe=SIGNAL_TIMEFRAME):
     """SA-VWAP only. Signals are generated from the newest confirmed candle."""
     rows = rows15 if rows15 and len(rows15) >= 120 else rows5
-    if not rows or len(rows) < 120:
+    if not rows or len(rows) < 130:
         return None
     for r in rows:
         r["symbol"] = symbol
@@ -1255,9 +1302,17 @@ def make_chart(sig):
     anchor_px = sig.get("leg_anchor_px")
     leg_age = max(0, sig_i + full_start - anchor_i)
     move_pct = ((rows[-1]["close"] - anchor_px) / anchor_px * 100.0) if anchor_px else 0.0
+    # Direction line = current anchored SA-VWAP slope. It is informational and
+    # does not replace the Pine retest trigger.
+    slope = 0.0
+    if len(vs) >= 6:
+        slope = vs[-1] - vs[-6]
+    slope_word = "↗ Rising" if slope > 0 else "↘ Falling" if slope < 0 else "→ Flat"
+    rr = sig.get("tp_r", SA_VWAP_BALANCED_TP_R)
     dashboard = (
         f"◆ SA-VWAP · {trend}\n"
         f"Trend          {trend}\n"
+        f"VWAP slope     {slope_word}\n"
         f"Signal         {sig['direction']}\n"
         f"Strength       {strength:.0f}  {'▰' * max(0, min(8, round(strength / 12.5)))}{'▱' * max(0, 8 - min(8, round(strength / 12.5)))}\n"
         f"Last event     Retest {'▲' if sig['direction']=='LONG' else '▼'}\n"
@@ -1271,7 +1326,7 @@ def make_chart(sig):
         f"TP1            {fmt_price(tp1)} ({pct(tp1):+.2f}%)\n"
         f"TP2            {fmt_price(tp2)} ({pct(tp2):+.2f}%)\n"
         f"TP3            {fmt_price(tp3)} ({pct(tp3):+.2f}%)\n"
-        f"R:R            1.0 / 2.0 / 3.0"
+        f"R:R            {rr[0]:.2f} / {rr[1]:.2f} / {rr[2]:.2f}"
     )
     ax.text(.985, .965, dashboard, transform=ax.transAxes, fontsize=7.4, color=TEXT,
             va="top", ha="right", linespacing=1.35,
@@ -1740,9 +1795,9 @@ def _timeframe_bias(rows):
 
 
 def _timeframe_setup(rows, direction):
-    """Run the SA-VWAP Engine on any supported timeframe."""
+    """Run the same SA-VWAP engine used by the main scanner."""
     try:
-        return _momentum_setup(rows, direction)
+        return _sa_vwap_setup(rows, direction)
     except Exception:
         return None
 
@@ -1838,7 +1893,7 @@ def analysis_report(raw_symbol, requested_timeframes=None):
             f"⚡ {setup.get('pattern','SA-VWAP RETEST')} · VWAP retest",
         ]
     else:
-        lines += ["", "ℹ️ هیچ Momentum setup ـێکی تەواو لە ئێستادا نییە."]
+        lines += ["", "ℹ️ هیچ SA-VWAP setup ـێکی تەواو لە ئێستادا نییە."]
     return "\n".join(lines)
 
 def _setup_metrics(sig):
@@ -2099,7 +2154,7 @@ def _backtest_one(rows, direction, sl_buffer, tps, max_hold_bars=48):
         if i < cooldown_until:
             i += 1; continue
         hist=rows[:i+1]
-        sig=_momentum_setup(hist,direction,sl_atr_buffer=sl_buffer,tp_multipliers=tps)
+        sig=_sa_vwap_setup(hist,direction)
         if not sig or sig.get("time") != rows[i]["time"]:
             i += 1; continue
         entry=float(sig["entry"]); sl=float(sig["sl"]); risk=abs(entry-sl)
@@ -2276,7 +2331,7 @@ def _quick_scan(raw_symbol):
                       f"TP1: {fmt_price(setup['tp1'])}", f"TP2: {fmt_price(setup['tp2'])}", f"TP3: {fmt_price(setup['tp3'])}"]
             lines += _setup_detail_lines(setup)
         else:
-            lines.append("🟡 WAIT — breakout/pullback setupی تەواو نییە.")
+            lines.append("🟡 WAIT — SA-VWAP retest setup ـێکی تەواو نییە.")
         return "\n".join(lines)
     except Exception as e:
         return f"❌ Quick scan سەرکەوتوو نەبوو: {_error_bucket(e)}"
@@ -2421,7 +2476,7 @@ def scan_once(timeframe=None):
     def check_symbol(symbol):
         try:
             rows_tf = get_klines(symbol, timeframe, CANDLE_LIMIT)
-            if len(rows_tf) < 90:
+            if len(rows_tf) < 130:
                 return symbol, None, None
             return symbol, analyze(symbol, rows_tf, None, timeframe), None
         except Exception as e:
@@ -2476,8 +2531,9 @@ def signal_caption(sig):
         f"🚀 SAIWAN SA-VWAP SIGNAL\n\n{d}\n"
         f"⭐ {sig['symbol']} · Bitget Futures\n"
         f"⏱ {sig.get('timeframe', SIGNAL_TIMEFRAME).upper()} · CLOSED CANDLES\n\n"
-        f"Pattern: {sig.get('pattern','MOMENTUM')}\n"
+        f"Pattern: {sig.get('pattern','SA-VWAP RETEST')}\n"
         + (f"VWAP: {fmt_price(sig.get('sa_vwap', 0))} · Strength: {sig.get('strength', 0):.0f}/100\n"
+           f"Trend line: {'↗ Rising' if sig.get('vwap_slope', 0) > 0 else '↘ Falling'}\n"
            if sig.get('pattern') == 'SA-VWAP RETEST' else
            "Range → Breakout/Breakdown → Pullback/Continuation\n")
         + f"Volume: {sig.get('volume_mult',0):.2f}× avg · Extension: {sig.get('extension_atr',0):.2f}× ATR\n\n"
@@ -2486,7 +2542,8 @@ def signal_caption(sig):
         f"TP1: {fmt_price(sig['tp1'])}\n"
         f"TP2: {fmt_price(sig['tp2'])}\n"
         f"TP3: {fmt_price(sig['tp3'])}\n"
-        f"⭐ Quality: {m['quality']}/10 · R:R {m['rr1']:.2f} / {m['rr2']:.2f} / {m['rr3']:.2f}\n\n"
+        f"⭐ Quality: {m['quality']}/10 · R:R {m['rr1']:.2f} / {m['rr2']:.2f} / {m['rr3']:.2f}\n"
+        f"🎯 Target mode: {sig.get('risk_profile', 'Balanced')}\n\n"
         + ("🛡️ TP1 → SL moved to BE\n" if sig.get('pattern') == 'SA-VWAP RETEST' and SA_VWAP_USE_BE else "🛡️ Anti-chase filter: ON\n")
         + "⚠️ Signal only — no automatic trading."
     )
