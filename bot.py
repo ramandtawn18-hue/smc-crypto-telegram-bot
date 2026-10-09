@@ -25,13 +25,13 @@ TF_2H = "2h"
 TF_4H = "4h"
 TF_5M = "5m"
 TIMEFRAME = TF_15M
-SUPPORTED_SCAN_TIMEFRAMES = ("1m", TF_5M, TF_15M, TF_30M, TF_1H, TF_2H, TF_4H)
+SUPPORTED_SCAN_TIMEFRAMES = (TF_15M, TF_30M, TF_1H, TF_2H, TF_4H)
 CANDLE_LIMIT = 260
 # 0 = scan every eligible Bitget USDT perpetual contract (no top-N cap)
 MAX_PAIRS = 0
-SCAN_WORKERS = 10
+SCAN_WORKERS = 6
 SCAN_INTERVAL = 60
-SEND_INTERVAL = 60  # SA-VWAP: deliver as soon as the confirmed 15m trigger is found
+SEND_INTERVAL = 600  # minimum 10 minutes between sent signals
 SIGNAL_TIMEFRAME = TF_15M
 CHART_CANDLES = 80
 HTTP_TIMEOUT = 15
@@ -46,7 +46,7 @@ TP1_R = 1.5
 TP2_R = 2.5
 TP3_R = 4.0
 
-# SAIWAN Legacy Momentum helpers retained for compatibility; the active signal engine is SA-VWAP close-cross.
+# SAIWAN Momentum Engine — tuned as a starting point for backtesting.
 MOM_RANGE_LOOKBACK = 20
 MOM_BREAKOUT_WINDOW = 12
 MOM_MAX_PULLBACK_BARS = 12
@@ -63,7 +63,7 @@ MOM_MAX_RISK_ATR = 3.50
 # SA-VWAP port from the supplied TradingView Pine source.
 # Primary trigger: anchored VWAP retest after price has spent enough bars away
 # from VWAP in the current structural leg. Risk preset mirrors the source's
-# Signal preset: structure-aware SL with a 1.75 ATR minimum and 1.5R / 3R / 4.5R targets, with BE after TP1.
+# Balanced preset: 1.5 ATR SL and 1R / 2R / 3R targets, with BE after TP1.
 SA_VWAP_ENABLED = True
 SA_VWAP_PIVOT_LEFT = 55
 SA_VWAP_PIVOT_RIGHT = 55
@@ -71,18 +71,9 @@ SA_VWAP_MIN_SWING_ATR = 1.50
 SA_VWAP_RETEST_MIN_AWAY = 5
 SA_VWAP_RETEST_TOL_SIGMA = 0.25
 SA_VWAP_VOLUME_CLAMP_MEDIAN = 4.0
-SA_VWAP_SL_ATR = 1.75
-SA_VWAP_MAX_RISK_ATR = 4.00
-SA_VWAP_STRUCTURE_BUFFER_ATR = 0.35
-SA_VWAP_STRUCTURE_LEFT = 2
-SA_VWAP_STRUCTURE_RIGHT = 2
-SA_VWAP_MIN_STRUCTURE_RISK_ATR = 0.50
-SA_VWAP_TP_R = (1.5, 3.0, 4.5)
+SA_VWAP_SL_ATR = 1.50
+SA_VWAP_TP_R = (1.0, 2.0, 3.0)
 SA_VWAP_USE_BE = True
-# Fresh signal rule: a confirmed candle must CLOSE across the active SA-VWAP line.
-# LONG = previous close at/below VWAP -> current close above VWAP.
-# SHORT = previous close at/above VWAP -> current close below VWAP.
-SA_VWAP_TRIGGER_MODE = "CLOSE_SIDE"
 
 MOM_EMA_FAST = 9
 MOM_EMA_MID = 21
@@ -203,7 +194,6 @@ def get_tickers():
 def get_klines(symbol, interval=TIMEFRAME, limit=CANDLE_LIMIT):
     # Bitget requires 1H/4H for hourly candles; minute intervals stay lowercase.
     api_granularity = {
-        "1m": "1m",
         "5m": "5m",
         "15m": "15m",
         "30m": "30m",
@@ -220,7 +210,6 @@ def get_klines(symbol, interval=TIMEFRAME, limit=CANDLE_LIMIT):
     raw = payload.get("data") or []
     now_ms = int(time.time() * 1000)
     candle_ms = {
-        "1m": 60 * 1000,
         "5m": 5 * 60 * 1000,
         "15m": 15 * 60 * 1000,
         "30m": 30 * 60 * 1000,
@@ -633,7 +622,7 @@ def _ema_alignment(rows, direction):
 
 def _momentum_setup(rows, direction, sl_atr_buffer=MOM_SL_ATR_BUFFER,
                     tp_multipliers=(TP1_R, TP2_R, TP3_R)):
-    """SAIWAN SA-VWAP Engine: breakout/breakdown -> controlled pullback -> continuation.
+    """SAIWAN Momentum Engine: breakout/breakdown -> controlled pullback -> continuation.
 
     Only closed candles in ``rows`` are used. The current last candle is the
     confirmed trigger. Signals are rejected when price is already too extended,
@@ -812,421 +801,428 @@ def _momentum_setup(rows, direction, sl_atr_buffer=MOM_SL_ATR_BUFFER,
     return None
 
 
-def _pine_rma(values, period):
-    """TradingView ta.rma() equivalent for a fully known historical series."""
-    out = [None] * len(values)
-    if len(values) < period:
-        return out
-    seed = sum(values[:period]) / float(period)
-    out[period - 1] = seed
-    alpha = 1.0 / float(period)
-    prev = seed
-    for i in range(period, len(values)):
-        v = values[i]
-        prev = alpha * v + (1.0 - alpha) * prev
-        out[i] = prev
-    return out
-
-
-def _pine_atr_series(rows, period=13):
-    if not rows:
-        return []
-    trs = []
-    for i, r in enumerate(rows):
-        if i == 0:
-            tr = r["high"] - r["low"]
-        else:
-            pc = rows[i - 1]["close"]
-            tr = max(r["high"] - r["low"], abs(r["high"] - pc), abs(r["low"] - pc))
-        trs.append(max(float(tr), 0.0))
-    return _pine_rma(trs, period)
-
-
-def _pine_median(values):
-    vals = sorted(float(v) for v in values if v is not None and math.isfinite(float(v)))
-    if not vals:
-        return 0.0
-    m = len(vals)
-    mid = m // 2
-    if m % 2:
-        return vals[mid]
-    return (vals[mid - 1] + vals[mid]) / 2.0
-
-
-def _sa_weight_series(rows):
-    """Exact default SA-VWAP weighting: cumulative volume, capped at 4x median(50)."""
-    weights = []
-    for i, r in enumerate(rows):
-        raw = max(float(r.get("vol", 0.0)), 0.0)
-        med = _pine_median([rows[k].get("vol", 0.0) for k in range(max(0, i - 49), i + 1)])
-        wt = min(raw, med * SA_VWAP_VOLUME_CLAMP_MEDIAN) if med > 0 else raw
-        weights.append(wt)
-    return weights
-
-
-def _pivot_at(rows, p, left=55, right=55):
-    if p < left or p + right >= len(rows):
-        return False, False
-    h = rows[p]["high"]
-    l = rows[p]["low"]
-    hs = [rows[k]["high"] for k in range(p - left, p + right + 1)]
-    ls = [rows[k]["low"] for k in range(p - left, p + right + 1)]
-    # Pine ta.pivothigh/low accepts equality at the pivot extreme.
-    return h >= max(hs), l <= min(ls)
-
-
-def _sa_build_leg(rows, start, end, direction, weights, atrs, source_points=None):
-    """Rebuild one Pine Leg from its anchor through a confirmed bar."""
-    sum_w = sum_pw = sum_p2 = 0.0
-    away = 0
-    retests = 0
-    points = []
-    for j in range(start, end + 1):
-        px = (rows[j]["high"] + rows[j]["low"]) / 2.0
-        wt = weights[j]
-        sum_w += wt
-        sum_pw += px * wt
-        sum_p2 += px * px * wt
-        if sum_w > 0:
-            vwap = sum_pw / sum_w
-            sigma = math.sqrt(max(sum_p2 / sum_w - vwap * vwap, 0.0))
-        else:
-            vwap = None
-            sigma = 0.0
-        if vwap is None:
-            continue
-        tol = sigma * SA_VWAP_RETEST_TOL_SIGMA if sigma > 0 else (atrs[j] or 0.0) * 0.1
-        r = rows[j]
-        touch = r["low"] <= vwap + tol and r["high"] >= vwap - tol
-        outside = (r["low"] > vwap + tol) if direction > 0 else (r["high"] < vwap - tol)
-        hit = touch and away >= SA_VWAP_RETEST_MIN_AWAY
-        if hit:
-            retests += 1
-        points.append({
-            "index": j, "vwap": vwap, "sigma": sigma, "hit": hit,
-            "away_before": away, "touch": touch, "outside": outside,
-            "retests": retests, "weight": wt,
-        })
-        # Pine's putPoint commits the current bar on a confirmed historical bar.
-        away = 0 if touch else (away + 1 if outside else 0)
-    return points
-
-
 def _sa_vwap_setup(rows, direction):
-    """Structure-breakout signal engine.
+    """Python port of the supplied SA-VWAP Pine signal/risk core.
 
-    The signal is based on the visible market structure shown in the user's
-    TradingView examples: a compact consolidation/range is bounded by a
-    confirmed swing high and swing low, then a NEW CLOSED candle breaks one
-    of those boundaries.
-
-      LONG  -> closed candle breaks above Structure High.
-      SHORT -> closed candle breaks below Structure Low.
-
-    Entry is the breakout candle close.  SL is placed beyond the opposite
-    structure boundary (with a small ATR buffer), so risk follows the actual
-    setup instead of collapsing into a tiny ATR-based cluster.  TP1/TP2/TP3
-    are measured from that real structure risk.
+    The source uses Swing anchoring by default, cumulative volume-weighted VWAP,
+    volume-weighted sigma bands, a 5-bar minimum-away retest and the Balanced
+    risk preset (1.5 ATR SL, 1R/2R/3R TP). Only closed candles are supplied by
+    the scanner, so no realtime candle is used here.
     """
     n = len(rows)
-    if n < 80:
+    left, right = SA_VWAP_PIVOT_LEFT, SA_VWAP_PIVOT_RIGHT
+    if n < max(120, left + right + 20):
         return None
 
-    # Work only with confirmed pivots. The newest two candles are excluded
-    # from structure discovery so the current candle can be the breakout.
-    confirmed = rows[:-2]
-    if len(confirmed) < 30:
+    # Reproduce the Pine Swing market-structure engine closely enough for the
+    # signal layer: confirmed pivots, minimum swing amplitude, newest pivot wins.
+    sw_type = 0
+    sw_hi = sw_lo = None
+    sw_hi_bar = sw_lo_bar = None
+    events = []
+    for i in range(left, n - right):
+        hi = rows[i]["high"]
+        lo = rows[i]["low"]
+        hi_window = [r["high"] for r in rows[i-left:i+right+1]]
+        lo_window = [r["low"] for r in rows[i-left:i+right+1]]
+        piv_hi = hi >= max(hi_window)
+        piv_lo = lo <= min(lo_window)
+        a = _atr_at(rows, i, 14) or 0.0
+        min_swing = SA_VWAP_MIN_SWING_ATR * a
+
+        if piv_hi:
+            if sw_type == 1:
+                if sw_hi is None or hi > sw_hi:
+                    sw_hi, sw_hi_bar = hi, i
+                    events.append((i, "HIGH", hi))
+            elif sw_type == 0 or (sw_lo is not None and hi - sw_lo >= min_swing):
+                sw_hi, sw_hi_bar, sw_type = hi, i, 1
+                events.append((i, "HIGH", hi))
+        if piv_lo:
+            if sw_type == -1:
+                if sw_lo is None or lo < sw_lo:
+                    sw_lo, sw_lo_bar = lo, i
+                    events.append((i, "LOW", lo))
+            elif sw_type == 0 or (sw_hi is not None and sw_hi - lo >= min_swing):
+                sw_lo, sw_lo_bar, sw_type = lo, i, -1
+                events.append((i, "LOW", lo))
+
+    if sw_type == 1 and sw_hi_bar is not None:
+        leg_dir = -1
+        anchor = sw_hi_bar
+    elif sw_type == -1 and sw_lo_bar is not None:
+        leg_dir = 1
+        anchor = sw_lo_bar
+    else:
         return None
 
-    atr_now = atr(rows, 14) or 0.0
-    if atr_now <= 0:
+    if (direction == "LONG" and leg_dir != 1) or (direction == "SHORT" and leg_dir != -1):
+        return None
+    if anchor >= n - 2:
         return None
 
-    # Search recent confirmed swing points. We deliberately use a short
-    # structural window: this is the local box visible in the examples, not
-    # an old all-chart high/low.
-    search_start = max(0, len(confirmed) - 55)
-    highs, lows = swing_points(confirmed[search_start:], left=2, right=2)
-    highs = [(i + search_start, px) for i, px in highs]
-    lows = [(i + search_start, px) for i, px in lows]
-    if not highs or not lows:
+    # Build the anchored cumulative VWAP and weighted sigma exactly on the
+    # current leg. Volume is capped at 4x the 50-bar median, as in the source.
+    sum_w = sum_pw = sum_p2w = 0.0
+    points = []
+    for j in range(anchor, n):
+        px = (rows[j]["high"] + rows[j]["low"]) / 2.0
+        recent_vols = [max(float(x.get("vol", 0.0)), 0.0) for x in rows[max(0, j-49):j+1]]
+        med = sorted(recent_vols)[len(recent_vols)//2] if recent_vols else 0.0
+        raw_w = max(float(rows[j].get("vol", 0.0)), 0.0)
+        if med > 0:
+            wt = min(raw_w, med * SA_VWAP_VOLUME_CLAMP_MEDIAN)
+        else:
+            wt = 1.0
+        if wt <= 0:
+            wt = 1.0
+        sum_w += wt
+        sum_pw += px * wt
+        sum_p2w += px * px * wt
+        vwap = sum_pw / sum_w
+        sigma = math.sqrt(max(sum_p2w / sum_w - vwap * vwap, 0.0))
+        points.append((j, vwap, sigma, wt))
+
+    if not points:
+        return None
+
+    # Retest state mirrors the source's awayC/hit logic. A bar must stay on the
+    # leg's side of VWAP, outside tolerance, for >=5 bars before a touch counts.
+    away = 0
+    retests = 0
+    last_hit = False
+    last_vwap = last_sigma = None
+    leg_weight_above = 0.0
+    leg_weight_below = 0.0
+    for j, vwap, sigma, wt in points:
+        r = rows[j]
+        tol = sigma * SA_VWAP_RETEST_TOL_SIGMA if sigma > 0 else (_atr_at(rows, j, 14) or 0.0) * 0.1
+        touch = r["low"] <= vwap + tol and r["high"] >= vwap - tol
+        outside = r["low"] > vwap + tol if leg_dir > 0 else r["high"] < vwap - tol
+        hit = touch and away >= SA_VWAP_RETEST_MIN_AWAY
+        if r["close"] >= vwap:
+            leg_weight_above += wt
+        else:
+            leg_weight_below += wt
+        if hit:
+            retests += 1
+        away = 0 if touch else (away + 1 if outside else 0)
+        last_hit = hit
+        last_vwap, last_sigma = vwap, sigma
+
+    if not last_hit or last_vwap is None:
         return None
 
     cur = rows[-1]
-    prev = rows[-2]
-    candidates = []
-
-    # Candidate range: use the latest swing high/low pair that forms a compact
-    # box with several candles after both pivots. Prefer the most recent pair.
-    for hi_i, hi_px in reversed(highs[-8:]):
-        for lo_i, lo_px in reversed(lows[-8:]):
-            if hi_px <= lo_px:
-                continue
-            start = max(hi_i, lo_i) + 1
-            end = n - 1
-            if start >= end:
-                continue
-            width = hi_px - lo_px
-            if width <= 0 or width > atr_now * 8.0:
-                continue
-            box = rows[start:end]
-            if len(box) < 4:
-                continue
-            # Most of the pre-breakout candles should remain inside/near the
-            # box. A small wick outside is allowed; repeated closes outside
-            # mean this is no longer the same structure.
-            inside = 0
-            for r in box:
-                if lo_px - atr_now * 0.25 <= r["close"] <= hi_px + atr_now * 0.25:
-                    inside += 1
-            if inside / max(1, len(box)) < 0.60:
-                continue
-            candidates.append((max(hi_i, lo_i), hi_i, hi_px, lo_i, lo_px, width))
-
-    if not candidates:
+    atr_now = _atr_at(rows, n - 1, 13) or _atr_at(rows, n - 1, 14) or 0.0
+    if atr_now <= 0:
         return None
 
-    candidates.sort(key=lambda x: x[0])
-    _, hi_i, structure_high, lo_i, structure_low, structure_width = candidates[-1]
-
-    # Fresh confirmed breakout only. This is intentionally based on the
-    # CLOSED candle, not an intrabar wick.
-    long_break = direction == "LONG" and prev["close"] <= structure_high and cur["close"] > structure_high
-    short_break = direction == "SHORT" and prev["close"] >= structure_low and cur["close"] < structure_low
-    if not (long_break or short_break):
+    dist_sig = (cur["close"] - last_vwap) / last_sigma if last_sigma > 0 else 0.0
+    if abs(dist_sig) > 2.0:
         return None
 
-    actual_direction = "LONG" if long_break else "SHORT"
-    entry = float(cur["close"])
-    buffer = atr_now * 0.12
+    # Source strength: 40 balance + 25 price side + 20 not stretched + 15
+    # prior retest. It is a context score, not a probability.
+    total_weight = leg_weight_above + leg_weight_below
+    balance = (leg_weight_above / total_weight * 100.0) if total_weight > 0 else 50.0
+    bal_align = balance if leg_dir > 0 else 100.0 - balance
+    strength = bal_align * 0.4
+    strength += 25.0 if dist_sig * leg_dir > 0 else 0.0
+    strength += 20.0 if abs(dist_sig) <= 2.0 else 0.0
+    strength += 15.0 if retests > 1 else 0.0
+    strength = min(strength, 100.0)
 
-    if actual_direction == "LONG":
-        sl = structure_low - buffer
-        risk = entry - sl
-        structure_swing_index = lo_i
-        structure_swing_price = structure_low
-        structure_swing_type = "LOW"
+    entry = cur["close"]
+    risk = atr_now * SA_VWAP_SL_ATR
+    if risk <= 0 or risk > entry * 0.12:
+        return None
+    if direction == "LONG":
+        sl = entry - risk
+        tp1 = entry + risk * SA_VWAP_TP_R[0]
+        tp2 = entry + risk * SA_VWAP_TP_R[1]
+        tp3 = entry + risk * SA_VWAP_TP_R[2]
     else:
-        sl = structure_high + buffer
-        risk = sl - entry
-        structure_swing_index = hi_i
-        structure_swing_price = structure_high
-        structure_swing_type = "HIGH"
+        sl = entry + risk
+        tp1 = entry - risk * SA_VWAP_TP_R[0]
+        tp2 = entry - risk * SA_VWAP_TP_R[1]
+        tp3 = entry - risk * SA_VWAP_TP_R[2]
 
-    # Reject only pathological structures. Do NOT squeeze a valid setup back
-    # toward Entry; the whole point is that risk comes from structure.
-    if risk <= atr_now * 0.30 or risk > atr_now * 12.0:
-        return None
-
-    tp1_r, tp2_r, tp3_r = SA_VWAP_TP_R
-    if actual_direction == "LONG":
-        tp1, tp2, tp3 = entry + risk * tp1_r, entry + risk * tp2_r, entry + risk * tp3_r
-    else:
-        tp1, tp2, tp3 = entry - risk * tp1_r, entry - risk * tp2_r, entry - risk * tp3_r
-
-    # Informational strength: structure quality + breakout distance. No extra
-    # indicator is allowed to veto the structure signal.
-    body = abs(cur["close"] - cur["open"])
-    body_ratio = body / max(cur["high"] - cur["low"], 1e-12)
-    break_dist = (entry - structure_high) if actual_direction == "LONG" else (structure_low - entry)
-    strength = 55.0
-    strength += min(25.0, max(0.0, break_dist / max(atr_now, 1e-12) * 12.0))
-    strength += min(20.0, body_ratio * 20.0)
-    strength = min(100.0, strength)
-
+    # Current candle volume relative to its preceding 20 bars, for display and
+    # optional quality scoring; it is not required by the supplied source.
     prior_vol = _rolling_mean([r.get("vol", 0.0) for r in rows[:-1]], 20)
     vol_mult = cur.get("vol", 0.0) / max(prior_vol, 1e-12) if prior_vol > 0 else 0.0
+    extension = abs(entry - last_vwap) / max(atr_now, 1e-12)
 
-    structure_points = [
-        (hi_i, structure_high, "SH", "HIGH"),
-        (lo_i, structure_low, "SL", "LOW"),
-    ]
-
+    # Approximate structural label from the confirmed pivot that anchors the leg.
+    pattern = "SA-VWAP RETEST"
     return {
-        "symbol": "", "direction": actual_direction,
-        "structure": "STRUCTURE BREAKOUT", "pattern": "STRUCTURE BREAKOUT",
-        "entry": entry, "trigger_level": structure_high if actual_direction == "LONG" else structure_low,
+        "symbol": "", "direction": direction,
+        "structure": pattern, "pattern": pattern,
+        "entry": entry, "trigger_level": last_vwap,
         "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
         "score": int(round(strength / 20.0)), "max_score": 5,
-        "strength": strength, "sa_vwap": None, "sa_sigma": 0.0,
-        "leg_direction": 1 if actual_direction == "LONG" else -1,
-        "leg_anchor_index": min(hi_i, lo_i),
-        "leg_anchor_px": structure_low if actual_direction == "LONG" else structure_high,
-        "anchor_tag": "SH/SL",
-        "leg_retests": 0, "leg_balance": 50.0,
-        "risk_distance": risk, "risk_atr": risk / atr_now,
+        "strength": strength, "sa_vwap": last_vwap, "sa_sigma": last_sigma,
+        "leg_direction": leg_dir, "leg_anchor_index": anchor,
+        "leg_retests": retests, "leg_balance": balance,
+        "risk_distance": risk, "risk_atr": SA_VWAP_SL_ATR,
         "risk_pct": risk / max(entry, 1e-12) * 100.0,
         "atr": atr_now, "volume_mult": vol_mult,
-        "breakout_volume_mult": vol_mult, "extension_atr": abs(entry - (structure_high if actual_direction == "LONG" else structure_low)) / max(atr_now, 1e-12),
-        "breakout_index": n - 1, "pullback_index": n - 1,
-        "range_high": structure_high, "range_low": structure_low,
-        "structure_swing_index": structure_swing_index,
-        "structure_swing_price": structure_swing_price,
-        "structure_swing_type": structure_swing_type,
-        "structure_high": structure_high, "structure_low": structure_low,
-        "structure_high_index": hi_i, "structure_low_index": lo_i,
-        "structure_width": structure_width,
+        "breakout_volume_mult": vol_mult, "extension_atr": extension,
+        "breakout_index": anchor, "pullback_index": n - 1,
+        "range_high": max(r["high"] for r in rows[anchor:n]),
+        "range_low": min(r["low"] for r in rows[anchor:n]),
         "retest_ok": True, "rejection_ok": True, "early_entry": True,
-        "checks": {"Structure": True, "Breakout": True, "Closed candle": True},
+        "checks": {"Range": True, "Breakout": True, "Volume": vol_mult >= 1.0,
+                    "Trend": True, "Pullback": True, "Continuation": True,
+                    "VWAP": True, "Retest": True},
         "fvg": None, "ob": None,
-        "entry_zone_low": structure_low, "entry_zone_high": structure_high,
-        "rows": rows, "full_len": len(rows),
-        "vwap_series": [], "structure_points": structure_points,
-        "leg_dir_series": [], "signal_bar": n - 1,
-        "signal_time": cur["time"],
+        "entry_zone_low": last_vwap - (last_sigma * SA_VWAP_RETEST_TOL_SIGMA),
+        "entry_zone_high": last_vwap + (last_sigma * SA_VWAP_RETEST_TOL_SIGMA),
+        "rows": rows[max(0, anchor - 10):], "full_len": len(rows),
+        "vwap_series": [(j, v) for j, v, _, _ in points],
     }
 
+
+def _luxalgo_trendline_series(rows, length=14, mult=1.0, method="Atr"):
+    """Causal Python port of LuxAlgo Trendlines with Breaks (backpaint=False logic)."""
+    n=len(rows)
+    if n < length*2+5: return None
+    highs=[float(r['high']) for r in rows]; lows=[float(r['low']) for r in rows]
+    closes=[float(r['close']) for r in rows]
+    # Pine ta.atr uses Wilder's RMA of true range.
+    tr=[highs[0]-lows[0]]
+    for i in range(1,n): tr.append(max(highs[i]-lows[i],abs(highs[i]-closes[i-1]),abs(lows[i]-closes[i-1])))
+    atrs=[]; prev=None
+    for i,x in enumerate(tr):
+        if i==length-1: prev=sum(tr[:length])/length
+        elif i>=length: prev=(prev*(length-1)+x)/length
+        atrs.append(prev if i>=length-1 else None)
+    upper=[None]*n; lower=[None]*n; upper_line=[None]*n; lower_line=[None]*n
+    upos=[0]*n; dnos=[0]*n; phs=[None]*n; pls=[None]*n
+    slope_ph=slope_pl=0.0; up=lo=0.0
+    for i in range(n):
+        center=i-length
+        ph=pl=None
+        if center>=length and i>=length*2:
+            hh=highs[center]; ll=lows[center]
+            if all(hh>highs[j] for j in range(center-length,center)) and all(hh>=highs[j] for j in range(center+1,center+length+1)): ph=hh
+            if all(ll<lows[j] for j in range(center-length,center)) and all(ll<=lows[j] for j in range(center+1,center+length+1)): pl=ll
+        # Pine slope is calculated every bar, then latched when pivot confirms.
+        if method=='Atr': slope=(atrs[i]/length*mult) if atrs[i] is not None else 0.0
+        elif method=='Stdev':
+            chunk=closes[max(0,i-length+1):i+1]; mean=sum(chunk)/len(chunk); slope=(sum((v-mean)**2 for v in chunk)/len(chunk))**0.5/length*mult
+        else:
+            # Pine's linreg formula; guard degenerate variance.
+            ns=list(range(max(0,i-length+1),i+1)); cs=closes[max(0,i-length+1):i+1]
+            mn=sum(ns)/len(ns); mc=sum(cs)/len(cs); var=sum((x-mn)**2 for x in ns)/len(ns)
+            slope=(abs(sum(x*y for x,y in zip(cs,ns))/len(ns)-mc*mn)/var/2*mult) if var else 0.0
+        if ph is not None: slope_ph=slope; up=ph; upos[i]=0
+        else:
+            up=up-slope_ph
+            upos[i]=1 if closes[i] > up-slope_ph*length else (upos[i-1] if i else 0)
+        if pl is not None: slope_pl=slope; lo=pl; dnos[i]=0
+        else:
+            lo=lo+slope_pl
+            dnos[i]=1 if closes[i] < lo+slope_pl*length else (dnos[i-1] if i else 0)
+        upper[i]=up; lower[i]=lo
+        upper_line[i]=up-slope_ph*length
+        lower_line[i]=lo+slope_pl*length
+        phs[i]=ph; pls[i]=pl
+    return {'upper':upper,'lower':lower,'upper_line':upper_line,'lower_line':lower_line,'upos':upos,'dnos':dnos,'ph':phs,'pl':pls,'atr':atrs}
+
+
+def _luxalgo_setup(rows, direction):
+    """Signal only on a fresh LuxAlgo breakout transition on the newest closed candle."""
+    if not rows or len(rows)<45: return None
+    data=_luxalgo_trendline_series(rows)
+    if not data: return None
+    i=len(rows)-1
+    if direction=='LONG':
+        if not (data['upos'][i]==1 and data['upos'][i-1]==0): return None
+    else:
+        if not (data['dnos'][i]==1 and data['dnos'][i-1]==0): return None
+    entry=float(rows[i]['close']); a=data['atr'][i]
+    if not a or a<=0: return None
+    # ATR-based protective levels keep existing signal-monitoring interface intact.
+    if direction=='LONG':
+        stop=min(float(rows[i]['low']), entry-1.5*a); risk=entry-stop
+        if risk<=0: return None
+        tps=[entry+risk*x for x in (1.5,2.5,4.0)]
+    else:
+        stop=max(float(rows[i]['high']), entry+1.5*a); risk=stop-entry
+        if risk<=0: return None
+        tps=[entry-risk*x for x in (1.5,2.5,4.0)]
+    return {'symbol':rows[i].get('symbol',''),'direction':direction,'pattern':'LUXALGO TRENDLINE BREAK','entry':entry,'sl':stop,'tp1':tps[0],'tp2':tps[1],'tp3':tps[2],
+      'score':5,'max_score':5,'confidence':75,'strength':75,'time':rows[i]['time'],'candle_time':rows[i]['time'],'atr':a,'volume_mult':1.0,'breakout_index':i,'pullback_index':None,'range_high':None,'range_low':None,'risk_distance':risk,'risk_atr':risk/a,'risk_pct':risk/max(entry,1e-12)*100,
+      'checks':{'Trendline Break':True,'Closed Candle':True},'rows':rows,'full_len':len(rows),'luxalgo':data,'extension_atr':0.0,'retest_ok':True,'rejection_ok':True,'early_entry':True,'fvg':None,'ob':None,'entry_zone_low':entry,'entry_zone_high':entry}
+
 def _move_setup(rows, direction):
-    """Use the supplied TradingView SA-VWAP logic as the bot's signal engine."""
-    if not SA_VWAP_ENABLED:
-        return None
-    return _sa_vwap_setup(rows, direction)
+    """Use LuxAlgo Trendlines with Breaks as the sole signal strategy."""
+    return _luxalgo_setup(rows, direction)
 
 
 def analyze(symbol, rows5=None, rows15=None, timeframe=SIGNAL_TIMEFRAME):
-    """SA-VWAP only. Signals are generated from the newest confirmed candle."""
-    rows = rows15 if rows15 and len(rows15) >= 120 else rows5
-    if not rows or len(rows) < 120:
+    """Analyze the selected timeframe using confirmed LuxAlgo breakout transitions."""
+    rows = rows15 if rows15 and len(rows15) >= 45 else rows5
+    if not rows or len(rows) < 45:
         return None
-    for r in rows:
-        r["symbol"] = symbol
-    for direction in ("LONG", "SHORT"):
-        sig = _move_setup(rows, direction)
+    for r in rows: r["symbol"] = symbol
+    candidates=[]
+    for direction in ("LONG","SHORT"):
+        sig=_move_setup(rows,direction)
         if sig:
-            sig["symbol"] = symbol
-            sig["timeframe"] = timeframe
-            sig["time"] = sig.get("signal_time", rows[-1]["time"])
-            sig["candle_time"] = sig["time"]
-            return sig
-    return None
+            sig["symbol"]=symbol; sig["timeframe"]=timeframe
+            sig["time"]=rows[-1]["time"]; sig["candle_time"]=rows[-1]["time"]
+            candidates.append(sig)
+    return candidates[0] if candidates else None
+
+def _draw_luxalgo_chart(ax, rows, line_data, offset=0):
+    """Draw candles, teal upper and red lower projected trendlines, plus B break labels."""
+    n=len(rows); up=line_data['upper_line']; dn=line_data['lower_line']
+    x=list(range(n))
+    ax.plot(x,up,color='#16a89a',linewidth=1.35,linestyle='--',alpha=.95,label='Upper trendline',zorder=2)
+    ax.plot(x,dn,color='#f04f5b',linewidth=1.35,linestyle='--',alpha=.95,label='Lower trendline',zorder=2)
+    for i in range(n):
+        if line_data['upos'][i] > line_data['upos'][i-1] if i>0 else False:
+            ax.annotate('B',(i,rows[i]['low']),xytext=(0,-14),textcoords='offset points',ha='center',va='top',color='white',fontsize=8,fontweight='bold',bbox=dict(boxstyle='round,pad=.25',fc='#078f7c',ec='none'),zorder=10)
+        if line_data['dnos'][i] > line_data['dnos'][i-1] if i>0 else False:
+            ax.annotate('B',(i,rows[i]['high']),xytext=(0,14),textcoords='offset points',ha='center',va='bottom',color='white',fontsize=8,fontweight='bold',bbox=dict(boxstyle='round,pad=.25',fc='#ef4c58',ec='none'),zorder=10)
+
 
 def make_chart(sig):
-    """Clean, wide TradingView-style signal chart: candles + ENTRY + SL only.
+    """TradingView-inspired LuxAlgo chart; only entry and SL levels are shown."""
+    all_rows=sig.get('rows') or []
+    rows=all_rows[-CHART_CANDLES:]; n=len(rows); direction=sig['direction']
+    data=_luxalgo_trendline_series(all_rows)
+    if not data: raise RuntimeError('not enough candles to draw LuxAlgo trendlines')
+    start=len(all_rows)-n
+    BG='#11151f'; GRID='#252b37'; TEXT='#f0f2f5'; UP='#078f7c'; DOWN='#ef4c58'; TEAL='#159b91'
+    fig,ax=plt.subplots(figsize=(14.4,7.4),dpi=160,facecolor=BG); ax.set_facecolor(BG)
+    width=.62
+    for i,r in enumerate(rows):
+        c=UP if r['close']>=r['open'] else DOWN
+        ax.vlines(i,r['low'],r['high'],color=c,linewidth=1.05,zorder=4)
+        lo=min(r['open'],r['close']); bh=max(abs(r['close']-r['open']),abs(r['close'])*1e-5)
+        ax.add_patch(Rectangle((i-width/2,lo),width,bh,facecolor=c,edgecolor=c,linewidth=.5,zorder=5))
+    local={k:(v[start:] if isinstance(v,list) else v) for k,v in data.items()}
+    _draw_luxalgo_chart(ax,rows,local,start)
+    entry=float(sig['entry']); sl=float(sig['sl'])
+    # finite segments near the signal, avoiding full-chart long lines
+    x0=max(0,n-18); x1=n+1
+    ax.plot([x0,x1],[entry,entry],color='#6b9cff',linestyle='--',linewidth=1.2,zorder=7)
+    ax.plot([x0,x1],[sl,sl],color=DOWN,linewidth=1.15,zorder=7)
+    ax.text(x1+.2,entry,f'ENTRY {fmt_price(entry)}',color='#8fb1ff',fontsize=8,fontweight='bold',va='center')
+    ax.text(x1+.2,sl,f'SL {fmt_price(sl)}',color=DOWN,fontsize=8,fontweight='bold',va='center')
+    dcolor=UP if direction=='LONG' else DOWN
+    ax.text(.018,1.07,f"{sig.get('symbol','')} · {sig.get('timeframe','15m').upper()}",transform=ax.transAxes,fontsize=15,color=TEXT,fontweight='bold',va='top')
+    ax.text(.018,1.025,'LuxAlgo · Trendlines with Breaks',transform=ax.transAxes,fontsize=9,color='#b2bac8',fontweight='bold',va='top')
+    ax.text(.985,1.055,direction,transform=ax.transAxes,fontsize=12,color=dcolor,fontweight='bold',ha='right',va='top',bbox=dict(boxstyle='round,pad=.35',facecolor=BG,edgecolor=dcolor,linewidth=1))
+    ax.yaxis.tick_right(); ax.tick_params(axis='y',colors='#b8c0cc',labelsize=8,length=0,pad=7); ax.tick_params(axis='x',colors='#929cab',labelsize=8,length=0,pad=8)
+    ax.grid(axis='y',color=GRID,linewidth=.6,alpha=.8); ax.grid(axis='x',color=GRID,linewidth=.3,alpha=.35)
+    for side in ('top','left','bottom'): ax.spines[side].set_visible(False)
+    ax.spines['right'].set_color('#343b48')
+    step=max(1,n//7); ticks=list(range(0,n,step))
+    if not ticks or ticks[-1]!=n-1:ticks.append(n-1)
+    ax.set_xticks(ticks); ax.set_xticklabels([datetime.fromtimestamp(rows[i]['time'],tz=timezone.utc).strftime('%d\n%H:%M') for i in ticks])
+    ymin=min(min(r['low'] for r in rows),sl,entry); ymax=max(max(r['high'] for r in rows),sl,entry); span=max(ymax-ymin,abs(entry)*.008)
+    ax.set_ylim(ymin-span*.07,ymax+span*.12); ax.set_xlim(-1,n+11)
+    ax.legend(loc='upper left',bbox_to_anchor=(.38,1.055),frameon=False,labelcolor=TEXT,fontsize=8,ncol=2)
+    fig.subplots_adjust(left=.025,right=.865,top=.86,bottom=.085)
+    safe=''.join(ch if ch.isalnum() else '_' for ch in sig.get('symbol','SIGNAL'))
+    path=f"/tmp/chart_{safe}_{sig['time']}.png"; fig.savefig(path,facecolor=BG,edgecolor='none',bbox_inches='tight',pad_inches=.08); plt.close(fig); return path
 
-    This function changes chart presentation only. Signal logic, Entry/SL/TP
-    calculations, scanning, monitoring and Telegram message contents are left
-    untouched.
-    """
-    rows = sig.get("rows", [])[-110:]
+
+def make_analysis_chart(symbol, timeframe, rows, block=None):
+    """Render an on-demand analysis chart, even when no complete trade setup exists."""
+    if not rows:
+        raise RuntimeError("no candles for analysis chart")
+    rows = rows[-90:]
     n = len(rows)
-    if n < 2:
-        raise RuntimeError("not enough candles for chart")
+    BG = "#07101d"
+    PANEL = "#0b1626"
+    GRID = "#1a293b"
+    TEXT = "#e7eef7"
+    MUTED = "#7f93a8"
+    UP = "#12d6a0"
+    DOWN = "#ff3d57"
+    GOLD = "#ffd21f"
+    BLUE = "#4f7cff"
+    PURPLE = "#7c5cff"
+    PINK = "#ff4f87"
+    CYAN = "#31d7ff"
 
-    BG = "#131722"
-    GRID = "#2A2E39"
-    TEXT = "#E0E0E0"
-    MUTED = "#9E9E9E"
-    BULL = "#00E676"
-    BEAR = "#FF5252"
-    ENTRY = "#4FC3F7"
-    SL = "#EF5350"
-
-    fig, ax = plt.subplots(figsize=(15.2, 7.9), dpi=160, facecolor=BG)
+    fig, ax = plt.subplots(figsize=(14.4, 7.8), dpi=170, facecolor=BG)
     ax.set_facecolor(BG)
-
-    # Candles: keep them large enough to read, but show a broad section of
-    # price action like the user's TradingView examples.
-    width = 0.62
+    width = .62
     for i, r in enumerate(rows):
-        c = BULL if r["close"] >= r["open"] else BEAR
-        ax.vlines(i, r["low"], r["high"], color=c, linewidth=1.0, zorder=4)
+        c = UP if r["close"] >= r["open"] else DOWN
+        ax.vlines(i, r["low"], r["high"], color=c, linewidth=1.1, zorder=4)
         lo = min(r["open"], r["close"])
-        bh = max(abs(r["close"] - r["open"]), abs(r["close"]) * 1e-6)
-        ax.add_patch(
-            Rectangle(
-                (i - width / 2, lo), width, bh,
-                facecolor=c, edgecolor=c, linewidth=.45, zorder=5
-            )
-        )
+        bh = max(abs(r["close"]-r["open"]), abs(r["close"])*1e-5)
+        ax.add_patch(Rectangle((i-width/2, lo), width, bh, facecolor=c,
+                               edgecolor=c, linewidth=.6, zorder=5))
 
-    entry = float(sig["entry"])
-    stop = float(sig["sl"])
+    full_rows=rows
+    line_data=_luxalgo_trendline_series(full_rows)
+    if line_data:
+        _draw_luxalgo_chart(ax, rows, {k:(v[-n:] if isinstance(v,list) else v) for k,v in line_data.items()}, len(full_rows)-n)
 
-    # ONLY the two requested trade levels are drawn on the chart.
-    # They are short local segments around the signal, never full-width lines.
-    signal_i = sig.get("signal_bar")
-    full_start = sig.get("full_len", len(rows)) - len(rows)
-    local_i = None if signal_i is None else int(signal_i) - int(full_start)
-    if local_i is None or not (0 <= local_i < n):
-        local_i = n - 8
-    line_start = max(0, local_i - 18)
-    line_end = min(n - 1, local_i + 10)
-    ax.plot([line_start, line_end], [entry, entry], color=ENTRY, linewidth=1.35,
-            linestyle=(0, (5, 3)), solid_capstyle="butt", zorder=7)
-    ax.plot([line_start, line_end], [stop, stop], color=SL, linewidth=1.35,
-            solid_capstyle="butt", zorder=7)
+    # Recent swing structure for a chart-first analysis.
+    highs, lows = swing_points(rows, left=2, right=2)
+    for idx, price in highs[-6:]:
+        ax.scatter([idx], [price], s=20, facecolors="none", edgecolors=DOWN, linewidth=.9, zorder=8)
+    for idx, price in lows[-6:]:
+        ax.scatter([idx], [price], s=20, facecolors="none", edgecolors=UP, linewidth=.9, zorder=8)
 
-    # Mark the confirmed signal candle without adding extra structure objects.
-    if signal_i is not None:
-        if 0 <= local_i < n:
-            if sig.get("direction") == "LONG":
-                y = rows[local_i]["low"]
-                ax.scatter([local_i], [y], marker="^", s=78, color=BULL,
-                           edgecolors="#FFFFFF", linewidth=.65, zorder=10)
-            else:
-                y = rows[local_i]["high"]
-                ax.scatter([local_i], [y], marker="v", s=78, color=BEAR,
-                           edgecolors="#FFFFFF", linewidth=.65, zorder=10)
+    cur=rows[-1]["close"]
+    if line_data and line_data['upos'][-1] and not line_data['dnos'][-1]: bias,bias_color='LONG',UP
+    elif line_data and line_data['dnos'][-1] and not line_data['upos'][-1]: bias,bias_color='SHORT',DOWN
+    else: bias,bias_color='WAIT',GOLD
 
-    # Right-side labels: ENTRY and SL only.
-    xlab = n + 1.5
-    ax.text(xlab, entry, f"ENTRY {fmt_price(entry)}",
-            color=ENTRY, fontsize=8.8, fontweight="bold",
-            va="center", ha="left", zorder=15)
-    ax.text(xlab, stop, f"SL {fmt_price(stop)}",
-            color=SL, fontsize=8.8, fontweight="bold",
-            va="center", ha="left", zorder=15)
+    ax.text(.018,1.065,f"{symbol} · {timeframe.upper()}",transform=ax.transAxes,
+            fontsize=16,color=TEXT,fontweight="bold",va="top")
+    ax.text(.018,1.025,"LUXALGO · TRENDLINES WITH BREAKS",transform=ax.transAxes,
+            fontsize=8.8,color=MUTED,fontweight="bold",va="top")
+    ax.text(.985,1.055,bias,transform=ax.transAxes,fontsize=12,color=bias_color,
+            fontweight="bold",ha="right",va="top",
+            bbox=dict(boxstyle="round,pad=.38",facecolor=BG,edgecolor=bias_color,linewidth=1.0))
 
-    # Minimal header, matching the clean TradingView look.
-    symbol = sig.get("symbol", "")
-    timeframe = sig.get("timeframe", "15m").upper()
-    direction = sig.get("direction", "LONG")
-    dcol = BULL if direction == "LONG" else BEAR
-
-    ax.text(.018, 1.055, f"{symbol} · {timeframe}",
-            transform=ax.transAxes, fontsize=14.5, color=TEXT,
-            fontweight="bold", va="top")
-    ax.text(.018, 1.018, "SAIWAN · CLOSED CANDLE",
-            transform=ax.transAxes, fontsize=8.3, color=MUTED,
-            fontweight="bold", va="top")
-    ax.text(.985, 1.055, direction,
-            transform=ax.transAxes, fontsize=11.5, color=dcol,
-            fontweight="bold", va="top", ha="right")
+    panel=(f"{symbol} · {timeframe.upper()}\\n"
+           f"Price  {fmt_price(cur)}\\n\\n"
+           f"Trendline state: {bias}\\n"
+           f"Candles: CLOSED")
+    ax.text(.022,.035,panel,transform=ax.transAxes,fontsize=8.8,color=TEXT,va="bottom",
+            ha="left",linespacing=1.45,bbox=dict(boxstyle="round,pad=.72",facecolor=PANEL,
+            edgecolor="#2a4664",linewidth=1.0,alpha=.97),zorder=20)
+    ax.legend(loc="upper left",bbox_to_anchor=(.36,1.055),frameon=False,labelcolor=TEXT,
+              fontsize=8.5,ncol=2)
 
     ax.yaxis.tick_right()
-    ax.tick_params(axis="y", colors="#9E9E9E", labelsize=8, length=0, pad=7)
-    ax.tick_params(axis="x", colors="#757575", labelsize=7.5, length=0, pad=8)
-    ax.grid(axis="y", color=GRID, linewidth=.55, alpha=.75)
-    ax.grid(axis="x", color=GRID, linewidth=.25, alpha=.3)
-
-    for side in ("top", "left", "bottom"):
-        ax.spines[side].set_visible(False)
-    ax.spines["right"].set_color(GRID)
-
-    step = max(1, n // 9)
-    ticks = list(range(0, n, step))
-    if not ticks or ticks[-1] != n - 1:
-        ticks.append(n - 1)
+    ax.tick_params(axis="y",colors="#9bb0c5",labelsize=8.2,length=0,pad=7)
+    ax.tick_params(axis="x",colors="#71879d",labelsize=7.8,length=0,pad=8)
+    ax.grid(axis="y",color=GRID,linewidth=.65,alpha=.8)
+    ax.grid(axis="x",color=GRID,linewidth=.35,alpha=.35)
+    for side in ["top","left","bottom"]: ax.spines[side].set_visible(False)
+    ax.spines["right"].set_color("#22364b")
+    step=max(1,n//7)
+    ticks=list(range(0,n,step))
+    if not ticks or ticks[-1]!=n-1: ticks.append(n-1)
     ax.set_xticks(ticks)
-    ax.set_xticklabels([
-        datetime.fromtimestamp(rows[i]["time"], tz=timezone.utc).strftime("%d\n%H:%M")
-        for i in ticks
-    ])
-
-    # IMPORTANT: TP values are intentionally NOT included in chart scaling.
-    price_levels = [r["low"] for r in rows] + [r["high"] for r in rows] + [entry, stop]
-    ymin, ymax = min(price_levels), max(price_levels)
-    span = max(ymax - ymin, abs(rows[-1]["close"]) * .006)
-    ax.set_ylim(ymin - span * .06, ymax + span * .08)
-    ax.set_xlim(-1, n + 4)
-
-    fig.subplots_adjust(left=.025, right=.84, top=.86, bottom=.085)
-    safe = "".join(ch if ch.isalnum() else "_" for ch in symbol)
-    path = f"/tmp/chart_{safe}_{sig['time']}.png"
-    fig.savefig(path, facecolor=BG, edgecolor="none",
-                bbox_inches="tight", pad_inches=.08)
+    ax.set_xticklabels([datetime.fromtimestamp(rows[i]["time"],tz=timezone.utc).strftime("%d\\n%H:%M") for i in ticks])
+    all_lows=[r["low"] for r in rows]
+    all_highs=[r["high"] for r in rows]
+    ymin,ymax=min(all_lows),max(all_highs)
+    span=max(ymax-ymin,abs(cur)*.012)
+    ax.set_ylim(ymin-span*.06,ymax+span*.16)
+    ax.set_xlim(-1,n+10)
+    fig.subplots_adjust(left=.025,right=.87,top=.86,bottom=.085)
+    safe="".join(ch if ch.isalnum() else "_" for ch in symbol)
+    path=f"/tmp/analysis_{safe}_{timeframe}_{int(time.time())}.png"
+    fig.savefig(path,facecolor=BG,edgecolor="none",bbox_inches="tight",pad_inches=.08)
     plt.close(fig)
     return path
+
 
 def make_analysis_charts(raw_symbol, requested_timeframes=None):
     symbol=_normalize_analysis_symbol(raw_symbol)
@@ -1238,8 +1234,8 @@ def make_analysis_charts(raw_symbol, requested_timeframes=None):
         rows=_analysis_tf_data(symbol,tf)
         block=None
         try:
-            long_sig=_sa_vwap_setup(rows,"LONG")
-            short_sig=_sa_vwap_setup(rows,"SHORT")
+            long_sig=_momentum_setup(rows,"LONG")
+            short_sig=_momentum_setup(rows,"SHORT")
             block={"long_sig":long_sig,"short_sig":short_sig}
         except Exception:
             block=None
@@ -1260,7 +1256,7 @@ def _inline_button(text, callback_data):
 def main_menu_markup():
     return {
         "inline_keyboard": [
-            [_inline_button("🔥 SCAN MARKET", "menu_scan"), _inline_button("🎯 TOP SA-VWAP", "scan_top")],
+            [_inline_button("🔥 SCAN MARKET", "menu_scan"), _inline_button("🎯 TOP LUXALGO", "scan_top")],
             [_inline_button("📈 MOVERS", "movers"), _inline_button("🔎 ANALYSIS", "menu_analysis")],
             [_inline_button("👁 WATCHLIST", "watchlist"), _inline_button("🔔 ALERTS", "alerts")],
             [_inline_button("📜 HISTORY", "history"), _inline_button("📊 STATS", "stats")],
@@ -1273,7 +1269,6 @@ def main_menu_markup():
 def scan_menu_markup():
     return {
         "inline_keyboard": [
-            [_inline_button("⚡ 1 MIN", "scan_tf:1m"), _inline_button("⚡ 5 MIN", "scan_tf:5m")],
             [_inline_button("⚡ 15 MIN", "scan_tf:15m"), _inline_button("🕐 30 MIN", "scan_tf:30m")],
             [_inline_button("🕐 1 HOUR", "scan_tf:1h"), _inline_button("🕑 2 HOURS", "scan_tf:2h")],
             [_inline_button("🕓 4 HOURS", "scan_tf:4h")],
@@ -1286,18 +1281,9 @@ def analysis_menu_markup():
     coins = [("BTC", "BTC"), ("ETH", "ETH"), ("SOL", "SOL"), ("BNB", "BNB"), ("XRP", "XRP"), ("AVAX", "AVAX")]
     rows = []
     for i in range(0, len(coins), 2):
-        rows.append([_inline_button(f"🔎 {coins[i][0]}", f"analysis_coin:{coins[i][1]}"), _inline_button(f"🔎 {coins[i+1][0]}", f"analysis_coin:{coins[i+1][1]}")])
+        rows.append([_inline_button(f"🔎 {coins[i][0]} 15M", f"analysis:{coins[i][1]}"), _inline_button(f"🔎 {coins[i+1][0]} 15M", f"analysis:{coins[i+1][1]}")])
     rows.append([_inline_button("◀️ BACK", "menu_main")])
     return {"inline_keyboard": rows}
-
-
-def analysis_timeframe_markup(symbol):
-    return {"inline_keyboard": [
-        [_inline_button("1 MIN", f"analysis:{symbol}:1m"), _inline_button("5 MIN", f"analysis:{symbol}:5m")],
-        [_inline_button("15 MIN", f"analysis:{symbol}:15m"), _inline_button("30 MIN", f"analysis:{symbol}:30m")],
-        [_inline_button("1 HOUR", f"analysis:{symbol}:1h"), _inline_button("4 HOURS", f"analysis:{symbol}:4h")],
-        [_inline_button("◀️ COINS", "menu_analysis")],
-    ]}
 
 
 def settings_menu_markup():
@@ -1314,10 +1300,10 @@ def welcome_text():
     return (
         "🚀 SAIWAN CRYPTO SIGNALS\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "📐 SA-VWAP ENGINE\n"
+        "📐 LUXALGO TRENDLINES WITH BREAKS\n"
         "📊 15M • BITGET FUTURES\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        "🎯 Anchored VWAP • Confirmed Close Cross • Structure SL • ATR Targets • Break-even\n"
+        "🎯 Anchored VWAP • Retest • ATR • Break-even\n"
         "🔔 Signal + TP/SL monitoring: ACTIVE\n\n"
         "Choose an action from the buttons below."
     )
@@ -1344,8 +1330,6 @@ def answer_callback(callback_id, text=None):
 
 def _scan_timeframe_label(timeframe):
     return {
-        "1m": "1 MIN",
-        "5m": "5 MIN",
         "15m": "15 MIN",
         "30m": "30 MIN",
         "1h": "1 HOUR",
@@ -1357,8 +1341,6 @@ def _scan_timeframe_label(timeframe):
 def _normalize_scan_timeframe(raw):
     tf = (raw or "").strip().lower()
     aliases = {
-        "1": "1m", "1m": "1m",
-        "5": "5m", "5m": "5m",
         "15": "15m", "15m": "15m",
         "30": "30m", "30m": "30m",
         "1h": "1h", "1hour": "1h", "1hr": "1h",
@@ -1405,7 +1387,7 @@ def _handle_callback_query(query):
             edit_message(
                 chat_id, message_id,
                 f"🚀 {label} SCANNER STARTED\n\n"
-                f"The SA-VWAP Engine is now scanning {label} closed candles.\n\n"
+                f"The LuxAlgo Trendlines is now scanning {label} closed candles.\n\n"
                 "📐 Anchored VWAP + Retest + ATR + BE\n"
                 "🔒 Anti-chase filter: ON\n"
                 "🎯 TP/SL monitoring: ON",
@@ -1413,7 +1395,7 @@ def _handle_callback_query(query):
             )
             answer_callback(callback_id, f"{label} scanner started")
         elif data == "scan_top":
-            answer_callback(callback_id, "Scanning top SA-VWAP setups…")
+            answer_callback(callback_id, "Scanning top momentum setups…")
             report = _smart_scan_report()
             edit_message(chat_id, message_id, report, main_menu_markup())
         elif data == "movers":
@@ -1441,20 +1423,14 @@ def _handle_callback_query(query):
             stop_scanner()
             answer_callback(callback_id, "Scanner stopped")
             edit_message(chat_id, message_id, "🛑 SCANNER STOPPED\n\nSmart Watch remains available if enabled.", main_menu_markup())
-        elif data.startswith("analysis_coin:"):
-            symbol = _normalize_analysis_symbol(data.split(":", 1)[1])
-            answer_callback(callback_id, f"Choose timeframe for {symbol}")
-            edit_message(chat_id, message_id, f"🔎 ANALYSIS — {symbol}\n\nChoose timeframe:", analysis_timeframe_markup(symbol))
         elif data.startswith("analysis:"):
-            parts = data.split(":")
-            symbol = _normalize_analysis_symbol(parts[1])
-            tf = _normalize_analysis_timeframe(parts[2] if len(parts) > 2 else TF_15M) or TF_15M
-            answer_callback(callback_id, f"Analyzing {symbol} {tf.upper()}…")
-            report = analysis_report(symbol, [tf])
-            edit_message(chat_id, message_id, f"🔎 {tf.upper()} ANALYSIS\n\n" + report, analysis_timeframe_markup(symbol))
+            symbol = _normalize_analysis_symbol(data.split(":", 1)[1])
+            answer_callback(callback_id, f"Analyzing {symbol}…")
+            report = analysis_report(symbol, [TF_15M])
+            edit_message(chat_id, message_id, "🔎 15M ANALYSIS\n\n" + report, analysis_menu_markup())
             try:
-                for chart_path in make_analysis_charts(symbol, [tf]):
-                    send_photo(chat_id, chart_path, f"📊 SAIWAN CHART — {symbol} · {tf.upper()}")
+                for chart_path in make_analysis_charts(symbol, [TF_15M]):
+                    send_photo(chat_id, chart_path, f"📊 SAIWAN CHART — {symbol} · 15M")
             except Exception as e:
                 print(f"BUTTON ANALYSIS CHART ERROR {type(e).__name__}: {e}")
         elif data == "settings_alerts_on":
@@ -1513,50 +1489,39 @@ def _normalize_analysis_symbol(raw):
 
 
 def _normalize_analysis_timeframe(raw):
-    """Normalize on-demand analysis to the supported 15m/30m/1h/4h set."""
+    """Normalize analysis to the bot's single 15-minute timeframe."""
     tf = (raw or "").strip().lower()
-    aliases = {
-        "1": "1m", "1m": "1m",
-        "5": TF_5M, "5m": TF_5M,
-        "15": TF_15M, "15m": TF_15M,
-        "30": TF_30M, "30m": TF_30M,
-        "1h": TF_1H, "1hour": TF_1H, "1hr": TF_1H,
-        "4h": TF_4H, "4hour": TF_4H, "4hr": TF_4H,
-    }
+    aliases = {"15": "15m", "15m": "15m"}
     return aliases.get(tf)
 
 
 def _analysis_tf_data(symbol, timeframe):
     """Fetch closed candles for an on-demand analysis timeframe."""
-    tf = _normalize_analysis_timeframe(timeframe)
-    if tf not in ("1m", TF_5M, TF_15M, TF_30M, TF_1H, TF_4H):
-        raise RuntimeError("unsupported analysis timeframe")
-    rows = get_klines(symbol, tf, max(CANDLE_LIMIT, 180))
-    if len(rows) < 120:
-        raise RuntimeError(f"not enough {tf} candles")
+    if timeframe != TF_15M:
+        raise RuntimeError("SAIWAN is configured for 15m only")
+    rows = get_klines(symbol, TF_15M, max(CANDLE_LIMIT, 180))
+    if len(rows) < 90:
+        raise RuntimeError("not enough 15m candles")
     return rows
 
 
 def _timeframe_bias(rows):
-    closes = [r["close"] for r in rows]
-    e20 = ema(closes, 20)[-1]
-    e50 = ema(closes, 50)[-1]
-    cur = closes[-1]
-    long_score = int(cur > e20) + int(e20 > e50)
-    short_score = int(cur < e20) + int(e20 < e50)
-    if long_score == 2 and short_score == 0:
-        bias = "LONG"
-    elif short_score == 2 and long_score == 0:
-        bias = "SHORT"
-    else:
-        bias = "MIXED"
-    return cur, e20, e50, long_score, short_score, bias
-
+    """Describe current position relative to LuxAlgo's projected trendlines."""
+    cur=float(rows[-1]["close"])
+    data=_luxalgo_trendline_series(rows)
+    if not data:
+        return cur, cur, cur, 0, 0, "MIXED"
+    upper=float(data["upper_line"][-1]); lower=float(data["lower_line"][-1])
+    long_score=int(cur>upper); short_score=int(cur<lower)
+    if data["upos"][-1] and not data["dnos"][-1]: bias="LONG"
+    elif data["dnos"][-1] and not data["upos"][-1]: bias="SHORT"
+    else: bias="MIXED"
+    return cur, upper, lower, long_score, short_score, bias
 
 def _timeframe_setup(rows, direction):
-    """Run the same SA-VWAP close-cross engine used by the live scanner."""
+    """Run the LuxAlgo Trendlines with Breaks signal logic on a supported timeframe."""
     try:
-        return _sa_vwap_setup(rows, direction)
+        return _luxalgo_setup(rows, direction)
     except Exception:
         return None
 
@@ -1574,7 +1539,7 @@ def _format_htf_block(symbol, timeframe):
     elif long_sig and short_sig:
         setup = "🟡 BOTH directions have setup conditions"
     else:
-        setup = "⚪ No fresh SA-VWAP close-cross setup"
+        setup = "⚪ No new confirmed LuxAlgo breakout"
 
     return {
         "timeframe": timeframe,
@@ -1604,7 +1569,7 @@ def _analysis_verdict(blocks):
 
 
 def analysis_report(raw_symbol, requested_timeframes=None):
-    """On-demand SA-VWAP analysis for 1m, 5m, 15m, 30m, 1h and 4h."""
+    """On-demand analysis for the bot's single 15-minute timeframe."""
     symbol = _normalize_analysis_symbol(raw_symbol)
     if not symbol or len(symbol) < 6:
         return "❌ تکایە ناوی کۆین بنووسە.\n\nنموونە: /analysis BTC 15m"
@@ -1612,63 +1577,51 @@ def analysis_report(raw_symbol, requested_timeframes=None):
     requested = []
     for raw_tf in (requested_timeframes or [SIGNAL_TIMEFRAME]):
         tf = _normalize_analysis_timeframe(raw_tf)
-        if tf in ("1m", TF_5M, TF_15M, TF_30M, TF_1H, TF_4H) and tf not in requested:
+        if tf == TF_15M and tf not in requested:
             requested.append(tf)
-    if not requested:
-        return "❌ Timeframe ـەکە هەڵەیە.\nبەردەستە: 15m, 30m, 1h, 4h"
+    if requested != [TF_15M]:
+        return "❌ SAIWAN تەنها لەسەر 15m کار دەکات.\nنموونە: /analysis BTC 15m"
 
-    blocks = []
-    errors = []
-    for tf in requested:
-        try:
-            blocks.append(_format_htf_block(symbol, tf))
-        except Exception as e:
-            errors.append(f"{tf.upper()}: {type(e).__name__}")
+    try:
+        block = _format_htf_block(symbol, TF_15M)
+    except Exception:
+        return f"❌ نەتوانرا شیکاری {symbol} لە 15m بکرێت. دڵنیابە کۆینەکە لە Bitget USDT Futures هەیە."
 
-    if not blocks:
-        return f"❌ نەتوانرا شیکاری {symbol} بکرێت. دڵنیابە کۆینەکە لە Bitget USDT Futures هەیە."
+    setup = block["long_sig"] or block["short_sig"]
+    if block["bias"] == "LONG":
+        verdict = "🟢 LONG bias"
+    elif block["bias"] == "SHORT":
+        verdict = "🔴 SHORT bias"
+    else:
+        verdict = "🟡 MIXED bias"
 
-    lines = [f"🔎 SAIWAN ANALYSIS — {symbol}", ""]
-    if len(blocks) > 1:
-        lines += [f"🧭 { _analysis_verdict(blocks) }", ""]
-
-    for block in blocks:
-        setup = block["long_sig"] or block["short_sig"]
-        tf = block["timeframe"]
-        if block["bias"] == "LONG":
-            verdict = "🟢 LONG bias"
-        elif block["bias"] == "SHORT":
-            verdict = "🔴 SHORT bias"
-        else:
-            verdict = "🟡 MIXED bias"
+    lines = [
+        f"🔎 SAIWAN ANALYSIS — {symbol}",
+        "",
+        verdict,
+        "⏱ Timeframe: 15M ONLY · CLOSED CANDLES",
+        f"💵 Price: {fmt_price(block['price'])}",
+        f"Upper line: {fmt_price(block['ema20'])} | Lower line: {fmt_price(block['ema50'])}",
+        f"📊 Checks — LONG {block['long_score']}/2 · SHORT {block['short_score']}/2",
+        f"Setup: {block['setup']}",
+    ]
+    if setup:
         lines += [
-            f"⏱ {tf.upper()} · CLOSED CANDLES",
-            verdict,
-            f"💵 Price: {fmt_price(block['price'])}",
-            f"EMA20: {fmt_price(block['ema20'])} | EMA50: {fmt_price(block['ema50'])}",
-            f"📊 Checks — LONG {block['long_score']}/2 · SHORT {block['short_score']}/2",
-            f"Setup: {block['setup']}",
+            "",
+            f"🎯 Entry: {fmt_price(setup['entry'])}",
+            f"🛑 SL: {fmt_price(setup['sl'])}",
+            f"🎯 TP1: {fmt_price(setup['tp1'])}",
+            f"🎯 TP2: {fmt_price(setup['tp2'])}",
+            f"🎯 TP3: {fmt_price(setup['tp3'])}",
+            "",
+            f"⚡ {setup.get('pattern','MOMENTUM')} · volume {setup.get('volume_mult',0):.2f}× · extension {setup.get('extension_atr',0):.2f}× ATR",
         ]
-        if setup:
-            lines += [
-                f"🎯 Entry: {fmt_price(setup['entry'])}",
-                f"🛑 SL: {fmt_price(setup['sl'])}",
-                f"🎯 TP1: {fmt_price(setup['tp1'])}",
-                f"🎯 TP2: {fmt_price(setup['tp2'])}",
-                f"🎯 TP3: {fmt_price(setup['tp3'])}",
-                f"📐 Risk: {setup.get('risk_atr', 0):.2f}× ATR · R:R 1.5 / 3.0 / 4.5",
-                f"⚡ {setup.get('pattern','SA-VWAP CLOSE CROSS')}",
-            ]
-        else:
-            lines.append("ℹ️ No fresh SA-VWAP close-cross signal on the newest closed candle.")
-        lines.append("")
-
-    if errors:
-        lines += [f"⚠️ بەشێک شیکاری نەکرا: {', '.join(errors)}"]
-    return "\n".join(lines).strip()
+    else:
+        lines += ["", "ℹ️ لە کندڵی داخراوی ئێستا هیچ breakout ـێکی نوێ نییە."]
+    return "\n".join(lines)
 
 def _setup_metrics(sig):
-    """Transparent Structure Breakout metrics; quality is a rule count, not probability."""
+    """Transparent Momentum Engine metrics; quality is a rule count, not probability."""
     entry = float(sig["entry"])
     sl = float(sig["sl"])
     risk = abs(entry - sl)
@@ -1677,13 +1630,11 @@ def _setup_metrics(sig):
     rr1 = abs(float(sig["tp1"])-entry)/risk
     rr2 = abs(float(sig["tp2"])-entry)/risk
     rr3 = abs(float(sig["tp3"])-entry)/risk
-    if sig.get("pattern") == "STRUCTURE BREAKOUT":
-        checks = sig.get("checks") or {}
-        quality = sum(bool(checks.get(k)) for k in ("Structure", "Breakout", "Closed candle"))
-        quality += 1 if sig.get("structure_width", 0) > 0 else 0
-        quality += 1 if sig.get("risk_atr", 99) >= 0.75 else 0
-        quality += 1 if sig.get("volume_mult", 0) >= 1.0 else 0
-        return {"risk":risk,"rr1":rr1,"rr2":rr2,"rr3":rr3,"quality":min(10, quality + 3)}
+    if sig.get("pattern") == "SA-VWAP RETEST" and sig.get("strength") is not None:
+        # The supplied Pine script calls this a context strength score, not a
+        # backtested probability. Convert it only for the bot's compact /10 UI.
+        quality = round(float(sig.get("strength", 0.0)) / 10.0)
+        return {"risk":risk,"rr1":rr1,"rr2":rr2,"rr3":rr3,"quality":min(10, max(0, quality))}
     checks = sig.get("checks") or {}
     quality = sum(bool(checks.get(k)) for k in ("Range","Breakout","Volume","Trend"))
     quality += 1 if sig.get("retest_ok") else 0
@@ -1691,10 +1642,11 @@ def _setup_metrics(sig):
     quality += 1 if sig.get("volume_mult",0) >= 1.10 else 0
     return {"risk":risk,"rr1":rr1,"rr2":rr2,"rr3":rr3,"quality":min(10,quality)}
 
+
 def _setup_detail_lines(sig):
     m = _setup_metrics(sig)
     return [
-        (f"⭐ SA-VWAP Strength: {sig.get('strength',0):.0f}/100" if str(sig.get('pattern', '')).startswith('SA-VWAP') else f"⭐ Quality: {m['quality']}/10 (rule-based)"),
+        (f"⭐ SA-VWAP Strength: {sig.get('strength',0):.0f}/100" if sig.get('pattern') == 'SA-VWAP RETEST' else f"⭐ Quality: {m['quality']}/10 (rule-based)"),
         f"📐 R:R — TP1 {m['rr1']:.2f}R · TP2 {m['rr2']:.2f}R · TP3 {m['rr3']:.2f}R",
         f"📊 Volume {sig.get('volume_mult',0):.2f}× · Extension {sig.get('extension_atr',0):.2f}×ATR",
     ]
@@ -1799,7 +1751,7 @@ def watch_loop():
                     f"🎯 TP2: {fmt_price(sig['tp2'])}\n"
                     f"🎯 TP3: {fmt_price(sig['tp3'])}\n"
                     f"{details[0]}\n{details[1]}\n\n"
-                    f"Pattern: {sig.get('pattern','STRUCTURE BREAKOUT')} · confirmed closed-candle breakout\n"
+                    f"Pattern: {sig.get('pattern','MOMENTUM')} · Volume {sig.get('volume_mult',0):.2f}× · Extension {sig.get('extension_atr',0):.2f}×ATR\n"
                     "🛡️ Anti-chase filter: ON\n"
                     "⚠️ Signal only — no automatic trading."
                 )
@@ -1884,10 +1836,10 @@ def _get_historical_klines(symbol, timeframe, days=30):
     Bitget's historical-candle endpoint returns up to 200 rows per request, so
     we walk backward from now. The exact available history depends on timeframe.
     """
-    granularity = {"1m":"1m", "5m":"5m", "15m":"15m"}.get(str(timeframe).lower())
+    granularity = {"15m":"15m"}.get(str(timeframe).lower())
     if not granularity:
         raise ValueError("unsupported timeframe")
-    candle_ms = {"1m":60000, "5m":300000, "15m":900000}[str(timeframe).lower()]
+    candle_ms = {"15m":900000}[str(timeframe).lower()]
     now_ms = int(time.time()*1000)
     start_ms = now_ms - int(days*86400000)
     cursor_end = now_ms
@@ -2008,7 +1960,7 @@ def _backtest_text(parts):
     if not profiles:
         return f"🧪 BACKTEST — {symbol} · {tf.upper()}\n\n🟡 هیچ trade ـێک نەدۆزرایەوە لە {len(rows)} candle ـدا."
     best=profiles[0]
-    lines=[f"🧪 SAIWAN SA-VWAP BACKTEST",f"⭐ {symbol} · {tf.upper()} · {days} days",f"Candles: {len(rows)}","",
+    lines=[f"🧪 SAIWAN LUXALGO BACKTEST",f"⭐ {symbol} · {tf.upper()} · {days} days",f"Candles: {len(rows)}","",
            "📌 TP/SL sweep (historical, closed candles only)",
            f"Best gross R: {best['gross_r']:+.2f}R",
            f"SL buffer: {best['sl']:.2f}× ATR",
@@ -2156,7 +2108,7 @@ def _smart_scan_report(limit=8):
             f"{i}. {d} · ⭐ {sig['symbol']}",
             f"   Entry {fmt_price(sig['entry'])} · SL {fmt_price(sig['sl'])}",
             f"   TP1 {fmt_price(sig['tp1'])} · TP2 {fmt_price(sig['tp2'])} · TP3 {fmt_price(sig['tp3'])}",
-            f"   Quality {m['quality']}/10 · TP3 {m['rr3']:.2f}R · {sig.get('pattern','SA-VWAP CLOSE CROSS')}",
+            f"   Quality {m['quality']}/10 · TP3 {m['rr3']:.2f}R · {sig.get('pattern','MOMENTUM')}",
             "",
         ]
     lines.append("⚠️ Radar is informational; no automatic trading.")
@@ -2202,9 +2154,9 @@ def status_text():
         f"Scanner: {'RUNNING' if scanner else 'STOPPED'}\n"
         f"Smart Watch: {'ON' if watch_on else 'OFF'} ({watched}/{MAX_WATCH_ITEMS})\n"
         "Market: Bitget USDT Perpetual Futures\n"
-        "Strategy: SAIWAN SA-VWAP — Anchored VWAP close-cross + structure SL + ATR targets + BE\n"
+        "Strategy: LuxAlgo Trendlines with Breaks\n"
         f"Scan timeframe: {active_scan_timeframe.upper()}\n"
-        "Analysis: 15m / 30m / 1h / 4h\n"
+        "Analysis: 15m only\n"
         f"Pending signals: {pending}\n"
         f"Tracked signals: {tracked}\n"
         f"History: {hist}\n"
@@ -2287,7 +2239,7 @@ def scan_once(timeframe=None):
 
     total_errors = sum(error_buckets.values())
     summary = ", ".join(f"{name}={count}" for name, count in sorted(error_buckets.items(), key=lambda kv: kv[1], reverse=True)[:4])
-    print(f"Bitget SA-VWAP scan: timeframe={timeframe}, universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
+    print(f"Bitget LuxAlgo scan: timeframe={timeframe}, universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
     if not contracts:
         print("Bitget warning: no contracts returned from /api/v2/mix/market/contracts")
     elif not tickers:
@@ -2300,14 +2252,11 @@ def signal_caption(sig):
     d = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
     m = _setup_metrics(sig)
     return (
-        f"🚀 SAIWAN STRUCTURE BREAKOUT SIGNAL\n\n{d}\n"
+        f"🚀 SAIWAN LUXALGO TRENDLINE SIGNAL\n\n{d}\n"
         f"⭐ {sig['symbol']} · Bitget Futures\n"
         f"⏱ {sig.get('timeframe', SIGNAL_TIMEFRAME).upper()} · CLOSED CANDLES\n\n"
-        f"Pattern: {sig.get('pattern','STRUCTURE BREAKOUT')}\n"
-        + (f"Structure High: {fmt_price(sig.get('structure_high'))} · Structure Low: {fmt_price(sig.get('structure_low'))}\n"
-           f"Strength: {sig.get('strength', 0):.0f}/100\n"
-           if sig.get('pattern') == 'STRUCTURE BREAKOUT' else
-           "Range → Breakout/Breakdown → Pullback/Continuation\n")
+        f"Pattern: {sig.get('pattern','LUXALGO TRENDLINE BREAK')}\n"
+        + "Trendline break confirmed on closed candle\n"
         + f"Volume: {sig.get('volume_mult',0):.2f}× avg · Extension: {sig.get('extension_atr',0):.2f}× ATR\n\n"
         f"Entry: {fmt_price(sig['entry'])}\n"
         f"SL: {fmt_price(sig['sl'])}\n"
@@ -2315,7 +2264,7 @@ def signal_caption(sig):
         f"TP2: {fmt_price(sig['tp2'])}\n"
         f"TP3: {fmt_price(sig['tp3'])}\n"
         f"⭐ Quality: {m['quality']}/10 · R:R {m['rr1']:.2f} / {m['rr2']:.2f} / {m['rr3']:.2f}\n\n"
-        + ("🛡️ Structure SL · TP measured from structure risk\n" if sig.get('pattern') == 'STRUCTURE BREAKOUT' else "🛡️ Anti-chase filter: ON\n")
+        + "📐 LuxAlgo Trendlines with Breaks\n"
         + "⚠️ Signal only — no automatic trading."
     )
 
@@ -2347,7 +2296,7 @@ def track_sent_signal(sig, chat_id, message_id, source="scanner"):
             "sl": sig["sl"],
             "active_sl": sig["sl"],
             "be_active": False,
-            "tp1_be_enabled": bool(SA_VWAP_USE_BE and str(sig.get("pattern", "")).startswith("SA-VWAP")),
+            "tp1_be_enabled": bool(SA_VWAP_USE_BE and sig.get("pattern") == "SA-VWAP RETEST"),
             "tp1": sig["tp1"],
             "tp2": sig["tp2"],
             "tp3": sig["tp3"],
@@ -2449,7 +2398,7 @@ def sender_loop():
         sig = None
         with state_lock:
             if pending_signals:
-                # Send the newest confirmed SA-VWAP trigger as soon as possible.
+                # One new signal per 10-minute window; send the strongest candidate.
                 pending_signals.sort(key=lambda x: (x.get("radar_score", 0), x.get("score", 0), x.get("confidence", 0), x.get("time", 0)), reverse=True)
                 sig = pending_signals.pop(0)
                 pending_signals.clear()
@@ -2517,7 +2466,7 @@ def poll_updates():
                     elif cmd == "/scan":
                         if len(parts) == 1:
                             start_scanner(active_chat_id, TF_15M)
-                            send_message(active_chat_id, "🚀 SAIWAN SA-VWAP SCANNER STARTED\n\n15m closed candles · Anchored VWAP + Retest + ATR + BE. TP/SL monitoring is enabled.")
+                            send_message(active_chat_id, "🚀 SAIWAN LUXALGO SCANNER STARTED\n\nClosed candles · Trendlines with Breaks. TP/SL monitoring is enabled.")
                         elif parts[1].lower() in ("top", "smart", "smartscan"):
                             send_message(active_chat_id, "📊 Smart Scan خەریکە بازارەکە پشکنین دەکات...")
                             send_message(active_chat_id, _smart_scan_report())
@@ -2569,7 +2518,7 @@ def poll_updates():
                         else:
                             symbol = _normalize_analysis_symbol(parts[1]); tf = _normalize_analysis_timeframe(parts[2])
                             if not tf:
-                                send_message(active_chat_id, "❌ Timeframe ـی هەڵەیە. نموونە: /analysis BTC 1m یان /analysis BTC 5m")
+                                send_message(active_chat_id, "❌ Timeframe ـی بۆتەکە تەنها 15m ـە. نموونە: /analysis BTC 15m")
                             else:
                                 send_message(active_chat_id, f"🔎 خەریکم {symbol} شیکاری دەکەم...\n⏱ {tf.upper()}")
                                 send_message(active_chat_id, analysis_report(symbol, [tf]))
