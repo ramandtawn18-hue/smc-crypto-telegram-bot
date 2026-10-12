@@ -37,6 +37,11 @@ CHART_CANDLES = 80
 HTTP_TIMEOUT = 15
 MIN_SCORE = 5
 
+# ADX/DI confirmation filter: suppress weak or directionally conflicting breakouts.
+ENABLE_ADX_FILTER = True
+ADX_LENGTH = 14
+ADX_MIN = 20.0
+
 # SAIWAN AI Market Radar / risk-aware leverage (informational only)
 RADAR_MIN_SCORE = 72
 MAX_SUGGESTED_LEVERAGE = 5
@@ -1000,7 +1005,6 @@ def _luxalgo_trendline_series(rows, length=14, mult=1.0, method="Atr"):
         atrs.append(prev if i>=length-1 else None)
     upper=[None]*n; lower=[None]*n; upper_line=[None]*n; lower_line=[None]*n
     upos=[0]*n; dnos=[0]*n; phs=[None]*n; pls=[None]*n
-    slope_phs=[0.0]*n; slope_pls=[0.0]*n
     slope_ph=slope_pl=0.0; up=lo=0.0
     for i in range(n):
         center=i-length
@@ -1030,8 +1034,58 @@ def _luxalgo_trendline_series(rows, length=14, mult=1.0, method="Atr"):
         upper_line[i]=up-slope_ph*length
         lower_line[i]=lo+slope_pl*length
         phs[i]=ph; pls[i]=pl
-        slope_phs[i]=slope_ph; slope_pls[i]=slope_pl
-    return {'upper':upper,'lower':lower,'upper_line':upper_line,'lower_line':lower_line,'upos':upos,'dnos':dnos,'ph':phs,'pl':pls,'atr':atrs,'slope_ph':slope_phs,'slope_pl':slope_pls,'length':length}
+    return {'upper':upper,'lower':lower,'upper_line':upper_line,'lower_line':lower_line,'upos':upos,'dnos':dnos,'ph':phs,'pl':pls,'atr':atrs}
+
+
+def _adx_di_last(rows, length=14):
+    """Return (plus_di, minus_di, adx) from OHLC candles using Wilder smoothing."""
+    if not rows or len(rows) < length * 2 + 2:
+        return None
+    tr_values, plus_dm, minus_dm = [], [], []
+    for i in range(1, len(rows)):
+        cur, prev = rows[i], rows[i - 1]
+        up_move = float(cur["high"]) - float(prev["high"])
+        down_move = float(prev["low"]) - float(cur["low"])
+        plus_dm.append(up_move if up_move > down_move and up_move > 0 else 0.0)
+        minus_dm.append(down_move if down_move > up_move and down_move > 0 else 0.0)
+        tr_values.append(max(float(cur["high"]) - float(cur["low"]),
+                             abs(float(cur["high"]) - float(prev["close"])),
+                             abs(float(cur["low"]) - float(prev["close"]))))
+    # Wilder's initial sums and recursive smoothing.
+    tr_s = sum(tr_values[:length])
+    plus_s = sum(plus_dm[:length])
+    minus_s = sum(minus_dm[:length])
+    dx_values = []
+    plus_di = minus_di = 0.0
+    for i in range(length, len(tr_values)):
+        tr_s = tr_s - tr_s / length + tr_values[i]
+        plus_s = plus_s - plus_s / length + plus_dm[i]
+        minus_s = minus_s - minus_s / length + minus_dm[i]
+        if tr_s <= 0:
+            plus_di = minus_di = 0.0
+        else:
+            plus_di = 100.0 * plus_s / tr_s
+            minus_di = 100.0 * minus_s / tr_s
+        denom = plus_di + minus_di
+        dx_values.append(100.0 * abs(plus_di - minus_di) / denom if denom > 0 else 0.0)
+    if len(dx_values) < length:
+        return None
+    adx = sum(dx_values[:length]) / length
+    for dx in dx_values[length:]:
+        adx = ((adx * (length - 1)) + dx) / length
+    return plus_di, minus_di, adx
+
+
+def _adx_filter_passes(rows, direction):
+    if not ENABLE_ADX_FILTER:
+        return True
+    values = _adx_di_last(rows, ADX_LENGTH)
+    if values is None:
+        return False
+    plus_di, minus_di, adx_value = values
+    if adx_value < ADX_MIN:
+        return False
+    return plus_di > minus_di if direction == "LONG" else minus_di > plus_di
 
 
 def _luxalgo_setup(rows, direction):
@@ -1044,17 +1098,27 @@ def _luxalgo_setup(rows, direction):
         if not (data['upos'][i]==1 and data['upos'][i-1]==0): return None
     else:
         if not (data['dnos'][i]==1 and data['dnos'][i-1]==0): return None
+    # Confirm the closed-candle LuxAlgo breakout with ADX strength and aligned DI.
+    if not _adx_filter_passes(rows, direction): return None
     entry=float(rows[i]['close']); a=data['atr'][i]
     if not a or a<=0: return None
-    # ATR-based protective levels keep existing signal-monitoring interface intact.
-    if direction=='LONG':
-        stop=min(float(rows[i]['low']), entry-1.5*a); risk=entry-stop
-        if risk<=0: return None
-        tps=[entry+risk*x for x in (1.5,2.5,4.0)]
+    # Wider protective stop: enforce a minimum volatility/price-distance floor,
+    # and keep the stop beyond the recent 7-candle swing when that is farther away.
+    # This changes only the risk levels; the LuxAlgo breakout signal remains untouched.
+    recent = rows[max(0, i-6):i+1]
+    min_risk = max(2.0 * float(a), entry * 0.01)
+    if direction == 'LONG':
+        swing_low = min(float(r['low']) for r in recent)
+        stop = min(swing_low, entry - min_risk)
+        risk = entry - stop
+        if risk <= 0: return None
+        tps = [entry + risk*x for x in (1.5, 2.5, 4.0)]
     else:
-        stop=max(float(rows[i]['high']), entry+1.5*a); risk=stop-entry
-        if risk<=0: return None
-        tps=[entry-risk*x for x in (1.5,2.5,4.0)]
+        swing_high = max(float(r['high']) for r in recent)
+        stop = max(swing_high, entry + min_risk)
+        risk = stop - entry
+        if risk <= 0: return None
+        tps = [entry - risk*x for x in (1.5, 2.5, 4.0)]
     return {'symbol':rows[i].get('symbol',''),'direction':direction,'pattern':'LUXALGO TRENDLINE BREAK','entry':entry,'sl':stop,'tp1':tps[0],'tp2':tps[1],'tp3':tps[2],
       'score':5,'max_score':5,'confidence':75,'strength':75,'time':rows[i]['time'],'candle_time':rows[i]['time'],'atr':a,'volume_mult':1.0,'breakout_index':i,'pullback_index':None,'range_high':None,'range_low':None,'risk_distance':risk,'risk_atr':risk/a,'risk_pct':risk/max(entry,1e-12)*100,
       'checks':{'Trendline Break':True,'Closed Candle':True},'rows':rows,'full_len':len(rows),'luxalgo':data,'extension_atr':0.0,'retest_ok':True,'rejection_ok':True,'early_entry':True,'fvg':None,'ob':None,'entry_zone_low':entry,'entry_zone_high':entry}
@@ -1080,86 +1144,16 @@ def analyze(symbol, rows5=None, rows15=None, timeframe=SIGNAL_TIMEFRAME):
     return candidates[0] if candidates else None
 
 def _draw_luxalgo_chart(ax, rows, line_data, offset=0):
-    """Render LuxAlgo-style historical trendline segments and separate right-side projections.
-
-    line_data contains the full candle history; offset is the global index of rows[0].
-    Historical plot points are backpainted by `length` bars, matching the Pine source.
-    """
-    visible_n = len(rows)
-    length = int(line_data.get("length", 14))
-    upper = line_data.get("upper", [])
-    lower = line_data.get("lower", [])
-    phs = line_data.get("ph", [])
-    pls = line_data.get("pl", [])
-    slopes_up = line_data.get("slope_ph", [])
-    slopes_dn = line_data.get("slope_pl", [])
-    upos = line_data.get("upos", [])
-    dnos = line_data.get("dnos", [])
-    total = min(len(upper), len(lower), len(phs), len(pls))
-    if not total:
-        return
-
-    # The indicator's solid historical plots are backpainted `length` candles.
-    # Pivot-confirmation bars are gaps in the plot, as in Pine's `ph ? na : upCss`.
-    hist_x = []
-    hist_up = []
-    hist_dn = []
-    for j in range(total):
-        x = j - length - offset
-        hist_x.append(x)
-        hist_up.append(float("nan") if phs[j] is not None else upper[j])
-        hist_dn.append(float("nan") if pls[j] is not None else lower[j])
-    ax.plot(hist_x, hist_up, color="#168f83", linewidth=1.65, linestyle="-",
-            alpha=.98, label="Upper trendline", zorder=2)
-    ax.plot(hist_x, hist_dn, color="#df626a", linewidth=1.65, linestyle="-",
-            alpha=.98, label="Lower trendline", zorder=2)
-
-    # Project each latest confirmed pivot as a separate dashed trendline.
-    # This is intentionally distinct from the solid historical section.
-    right_x = visible_n + 9
-    latest_ph = next((j for j in range(total - 1, -1, -1) if phs[j] is not None), None)
-    if latest_ph is not None and latest_ph < len(slopes_up):
-        anchor_x = latest_ph - length - offset
-        anchor_y = float(phs[latest_ph])
-        slope = float(slopes_up[latest_ph])
-        if anchor_x <= right_x:
-            xs = [max(-1, anchor_x), right_x]
-            ys = [anchor_y - slope * (xs[0] - anchor_x),
-                  anchor_y - slope * (xs[1] - anchor_x)]
-            ax.plot(xs, ys, color="#168f83", linewidth=1.55, linestyle=(0, (4, 4)),
-                    alpha=.95, zorder=2.2)
-
-    latest_pl = next((j for j in range(total - 1, -1, -1) if pls[j] is not None), None)
-    if latest_pl is not None and latest_pl < len(slopes_dn):
-        anchor_x = latest_pl - length - offset
-        anchor_y = float(pls[latest_pl])
-        slope = float(slopes_dn[latest_pl])
-        if anchor_x <= right_x:
-            xs = [max(-1, anchor_x), right_x]
-            ys = [anchor_y + slope * (xs[0] - anchor_x),
-                  anchor_y + slope * (xs[1] - anchor_x)]
-            ax.plot(xs, ys, color="#df626a", linewidth=1.55, linestyle=(0, (4, 4)),
-                    alpha=.95, zorder=2.2)
-
-    # Breakout labels are placed on the actual confirmation candle, not backpainted.
-    first = max(1, offset)
-    last = min(total, offset + visible_n)
-    for global_i in range(first, last):
-        i = global_i - offset
-        if i < 0 or i >= visible_n:
-            continue
-        if upos[global_i] > upos[global_i - 1]:
-            ax.annotate("B", (i, rows[i]["low"]), xytext=(0, -12),
-                        textcoords="offset points", ha="center", va="top",
-                        color="white", fontsize=9, fontweight="bold",
-                        bbox=dict(boxstyle="round,pad=.28", fc="#078f7c", ec="none"),
-                        zorder=10)
-        if dnos[global_i] > dnos[global_i - 1]:
-            ax.annotate("B", (i, rows[i]["high"]), xytext=(0, 12),
-                        textcoords="offset points", ha="center", va="bottom",
-                        color="white", fontsize=9, fontweight="bold",
-                        bbox=dict(boxstyle="round,pad=.28", fc="#ef4c58", ec="none"),
-                        zorder=10)
+    """Draw candles, teal upper and red lower projected trendlines, plus B break labels."""
+    n=len(rows); up=line_data['upper_line']; dn=line_data['lower_line']
+    x=list(range(n))
+    ax.plot(x,up,color='#16a89a',linewidth=1.35,linestyle='--',alpha=.95,label='Upper trendline',zorder=2)
+    ax.plot(x,dn,color='#f04f5b',linewidth=1.35,linestyle='--',alpha=.95,label='Lower trendline',zorder=2)
+    for i in range(n):
+        if line_data['upos'][i] > line_data['upos'][i-1] if i>0 else False:
+            ax.annotate('B',(i,rows[i]['low']),xytext=(0,-14),textcoords='offset points',ha='center',va='top',color='white',fontsize=8,fontweight='bold',bbox=dict(boxstyle='round,pad=.25',fc='#078f7c',ec='none'),zorder=10)
+        if line_data['dnos'][i] > line_data['dnos'][i-1] if i>0 else False:
+            ax.annotate('B',(i,rows[i]['high']),xytext=(0,14),textcoords='offset points',ha='center',va='bottom',color='white',fontsize=8,fontweight='bold',bbox=dict(boxstyle='round,pad=.25',fc='#ef4c58',ec='none'),zorder=10)
 
 
 def make_chart(sig):
@@ -1177,7 +1171,15 @@ def make_chart(sig):
         ax.vlines(i,r['low'],r['high'],color=c,linewidth=1.05,zorder=4)
         lo=min(r['open'],r['close']); bh=max(abs(r['close']-r['open']),abs(r['close'])*1e-5)
         ax.add_patch(Rectangle((i-width/2,lo),width,bh,facecolor=c,edgecolor=c,linewidth=.5,zorder=5))
-    _draw_luxalgo_chart(ax,rows,data,start)
+    local={k:(v[start:] if isinstance(v,list) else v) for k,v in data.items()}
+    _draw_luxalgo_chart(ax,rows,local,start)
+    entry=float(sig['entry']); sl=float(sig['sl'])
+    # finite segments near the signal, avoiding full-chart long lines
+    x0=max(0,n-18); x1=n+1
+    ax.plot([x0,x1],[entry,entry],color='#6b9cff',linestyle='--',linewidth=1.2,zorder=7)
+    ax.plot([x0,x1],[sl,sl],color=DOWN,linewidth=1.15,zorder=7)
+    ax.text(x1+.2,entry,f'ENTRY {fmt_price(entry)}',color='#8fb1ff',fontsize=8,fontweight='bold',va='center')
+    ax.text(x1+.2,sl,f'SL {fmt_price(sl)}',color=DOWN,fontsize=8,fontweight='bold',va='center')
     dcolor=UP if direction=='LONG' else DOWN
     ax.text(.018,1.07,f"{sig.get('symbol','')} · {sig.get('timeframe','15m').upper()}",transform=ax.transAxes,fontsize=15,color=TEXT,fontweight='bold',va='top')
     ax.text(.018,1.025,'LuxAlgo · Trendlines with Breaks',transform=ax.transAxes,fontsize=9,color='#b2bac8',fontweight='bold',va='top')
@@ -1189,7 +1191,7 @@ def make_chart(sig):
     step=max(1,n//7); ticks=list(range(0,n,step))
     if not ticks or ticks[-1]!=n-1:ticks.append(n-1)
     ax.set_xticks(ticks); ax.set_xticklabels([datetime.fromtimestamp(rows[i]['time'],tz=timezone.utc).strftime('%d\n%H:%M') for i in ticks])
-    ymin=min(r['low'] for r in rows); ymax=max(r['high'] for r in rows); span=max(ymax-ymin,abs(rows[-1]['close'])*.008)
+    ymin=min(min(r['low'] for r in rows),sl,entry); ymax=max(max(r['high'] for r in rows),sl,entry); span=max(ymax-ymin,abs(entry)*.008)
     ax.set_ylim(ymin-span*.07,ymax+span*.12); ax.set_xlim(-1,n+11)
     ax.legend(loc='upper left',bbox_to_anchor=(.38,1.055),frameon=False,labelcolor=TEXT,fontsize=8,ncol=2)
     fig.subplots_adjust(left=.025,right=.865,top=.86,bottom=.085)
@@ -1230,7 +1232,14 @@ def make_analysis_chart(symbol, timeframe, rows, block=None):
     full_rows=rows
     line_data=_luxalgo_trendline_series(full_rows)
     if line_data:
-        _draw_luxalgo_chart(ax, rows, line_data, 0)
+        _draw_luxalgo_chart(ax, rows, {k:(v[-n:] if isinstance(v,list) else v) for k,v in line_data.items()}, len(full_rows)-n)
+
+    # Recent swing structure for a chart-first analysis.
+    highs, lows = swing_points(rows, left=2, right=2)
+    for idx, price in highs[-6:]:
+        ax.scatter([idx], [price], s=20, facecolors="none", edgecolors=DOWN, linewidth=.9, zorder=8)
+    for idx, price in lows[-6:]:
+        ax.scatter([idx], [price], s=20, facecolors="none", edgecolors=UP, linewidth=.9, zorder=8)
 
     cur=rows[-1]["close"]
     if line_data and line_data['upos'][-1] and not line_data['dnos'][-1]: bias,bias_color='LONG',UP
@@ -1245,6 +1254,13 @@ def make_analysis_chart(symbol, timeframe, rows, block=None):
             fontweight="bold",ha="right",va="top",
             bbox=dict(boxstyle="round,pad=.38",facecolor=BG,edgecolor=bias_color,linewidth=1.0))
 
+    panel=(f"{symbol} · {timeframe.upper()}\\n"
+           f"Price  {fmt_price(cur)}\\n\\n"
+           f"Trendline state: {bias}\\n"
+           f"Candles: CLOSED")
+    ax.text(.022,.035,panel,transform=ax.transAxes,fontsize=8.8,color=TEXT,va="bottom",
+            ha="left",linespacing=1.45,bbox=dict(boxstyle="round,pad=.72",facecolor=PANEL,
+            edgecolor="#2a4664",linewidth=1.0,alpha=.97),zorder=20)
     ax.legend(loc="upper left",bbox_to_anchor=(.36,1.055),frameon=False,labelcolor=TEXT,
               fontsize=8.5,ncol=2)
 
