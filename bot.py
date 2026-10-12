@@ -1369,6 +1369,7 @@ def welcome_text():
         "📐 LUXALGO TRENDLINES WITH BREAKS\n"
         "📊 15M • BITGET FUTURES\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
+        "🧭 ADX(14) + DI filter: ON • Min ADX 20\n"
         "🎯 Anchored VWAP • Retest • ATR • Break-even\n"
         "🔔 Signal + TP/SL monitoring: ACTIVE\n\n"
         "Choose an action from the buttons below."
@@ -1454,7 +1455,8 @@ def _handle_callback_query(query):
                 chat_id, message_id,
                 f"🚀 {label} SCANNER STARTED\n\n"
                 f"The LuxAlgo Trendlines is now scanning {label} closed candles.\n\n"
-                "📐 Anchored VWAP + Retest + ATR + BE\n"
+                "🧭 LuxAlgo Breakout + ADX(14)/DI filter: ON\n"
+                "🎯 ATR-based SL/TP + Break-even monitoring\n"
                 "🔒 Anti-chase filter: ON\n"
                 "🎯 TP/SL monitoring: ON",
                 main_menu_markup(),
