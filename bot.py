@@ -1173,7 +1173,6 @@ def make_chart(sig):
     """TradingView-inspired LuxAlgo chart; only entry and SL levels are shown."""
     all_rows=sig.get('rows') or []
     rows=all_rows[-CHART_CANDLES:]; n=len(rows); direction=sig['direction']
-    data=_luxalgo_trendline_series(all_rows)
     start=len(all_rows)-n
     BG='#11151f'; GRID='#252b37'; TEXT='#f0f2f5'; UP='#078f7c'; DOWN='#ef4c58'; TEAL='#159b91'
     fig,ax=plt.subplots(figsize=(14.4,7.4),dpi=160,facecolor=BG); ax.set_facecolor(BG)
@@ -1183,16 +1182,22 @@ def make_chart(sig):
         ax.vlines(i,r['low'],r['high'],color=c,linewidth=1.05,zorder=4)
         lo=min(r['open'],r['close']); bh=max(abs(r['close']-r['open']),abs(r['close'])*1e-5)
         ax.add_patch(Rectangle((i-width/2,lo),width,bh,facecolor=c,edgecolor=c,linewidth=.5,zorder=5))
-    if data:
-        local={k:(v[start:] if isinstance(v,list) else v) for k,v in data.items()}
-        _draw_luxalgo_chart(ax,rows,local,start)
     entry=float(sig['entry']); sl=float(sig['sl'])
+    zone_low = sig.get('entry_zone_low')
+    zone_high = sig.get('entry_zone_high')
+    if zone_low is not None and zone_high is not None:
+        ax.axhspan(float(zone_low), float(zone_high), xmin=0.55, xmax=0.98,
+                   facecolor='#9b59b6', alpha=.20, zorder=1, label='Breaker / FVG zone')
     # finite segments near the signal, avoiding full-chart long lines
     x0=max(0,n-18); x1=n+1
     ax.plot([x0,x1],[entry,entry],color='#6b9cff',linestyle='--',linewidth=1.2,zorder=7)
     ax.plot([x0,x1],[sl,sl],color=DOWN,linewidth=1.15,zorder=7)
     ax.text(x1+.2,entry,f'ENTRY {fmt_price(entry)}',color='#8fb1ff',fontsize=8,fontweight='bold',va='center')
     ax.text(x1+.2,sl,f'SL {fmt_price(sl)}',color=DOWN,fontsize=8,fontweight='bold',va='center')
+    for key, color in (('tp1','#39c98a'),('tp2','#21a879'),('tp3','#14845f')):
+        level=float(sig[key])
+        ax.plot([x0,x1],[level,level],color=color,linewidth=1.0,linestyle='--',zorder=6)
+        ax.text(x1+.2,level,f'{key.upper()} {fmt_price(level)}',color=color,fontsize=7.5,fontweight='bold',va='center')
     dcolor=UP if direction=='LONG' else DOWN
     ax.text(.018,1.07,f"{sig.get('symbol','')} · {sig.get('timeframe','15m').upper()}",transform=ax.transAxes,fontsize=15,color=TEXT,fontweight='bold',va='top')
     ax.text(.018,1.025,'Liquidity Sweep · Breaker Block · FVG',transform=ax.transAxes,fontsize=9,color='#b2bac8',fontweight='bold',va='top')
@@ -1261,7 +1266,7 @@ def make_analysis_chart(symbol, timeframe, rows, block=None):
 
     ax.text(.018,1.065,f"{symbol} · {timeframe.upper()}",transform=ax.transAxes,
             fontsize=16,color=TEXT,fontweight="bold",va="top")
-    ax.text(.018,1.025,"LUXALGO · TRENDLINES WITH BREAKS",transform=ax.transAxes,
+    ax.text(.018,1.025,"LIQUIDITY SWEEP · BREAKER BLOCK · FVG",transform=ax.transAxes,
             fontsize=8.8,color=MUTED,fontweight="bold",va="top")
     ax.text(.985,1.055,bias,transform=ax.transAxes,fontsize=12,color=bias_color,
             fontweight="bold",ha="right",va="top",
@@ -1335,7 +1340,7 @@ def _inline_button(text, callback_data):
 def main_menu_markup():
     return {
         "inline_keyboard": [
-            [_inline_button("🔥 SCAN MARKET", "menu_scan"), _inline_button("🎯 TOP LUXALGO", "scan_top")],
+            [_inline_button("🔥 SCAN MARKET", "menu_scan"), _inline_button("🎯 TOP SETUPS", "scan_top")],
             [_inline_button("📈 MOVERS", "movers"), _inline_button("🔎 ANALYSIS", "menu_analysis")],
             [_inline_button("👁 WATCHLIST", "watchlist"), _inline_button("🔔 ALERTS", "alerts")],
             [_inline_button("📜 HISTORY", "history"), _inline_button("📊 STATS", "stats")],
@@ -1379,10 +1384,10 @@ def welcome_text():
     return (
         "🚀 SAIWAN CRYPTO SIGNALS\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "📐 LUXALGO TRENDLINES WITH BREAKS\n"
+        "📐 LIQUIDITY SWEEP + BREAKER BLOCK + FVG\n"
         "📊 15M • BITGET FUTURES\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        "🎯 Anchored VWAP • Retest • ATR • Break-even\n"
+        "🎯 Sweep • MSS • Breaker/FVG Retest • Structural SL/TP\n"
         "🔔 Signal + TP/SL monitoring: ACTIVE\n\n"
         "Choose an action from the buttons below."
     )
@@ -1466,8 +1471,8 @@ def _handle_callback_query(query):
             edit_message(
                 chat_id, message_id,
                 f"🚀 {label} SCANNER STARTED\n\n"
-                f"The LuxAlgo Trendlines is now scanning {label} closed candles.\n\n"
-                "📐 Anchored VWAP + Retest + ATR + BE\n"
+                f"SAIWAN is scanning {label} closed candles with the new strategy.\n\n"
+                "📐 Liquidity Sweep + MSS + Breaker Block + FVG Retest\n"
                 "🔒 Anti-chase filter: ON\n"
                 "🎯 TP/SL monitoring: ON",
                 main_menu_markup(),
@@ -2039,7 +2044,7 @@ def _backtest_text(parts):
     if not profiles:
         return f"🧪 BACKTEST — {symbol} · {tf.upper()}\n\n🟡 هیچ trade ـێک نەدۆزرایەوە لە {len(rows)} candle ـدا."
     best=profiles[0]
-    lines=[f"🧪 SAIWAN LUXALGO BACKTEST",f"⭐ {symbol} · {tf.upper()} · {days} days",f"Candles: {len(rows)}","",
+    lines=[f"🧪 SAIWAN STRATEGY BACKTEST",f"⭐ {symbol} · {tf.upper()} · {days} days",f"Candles: {len(rows)}","",
            "📌 TP/SL sweep (historical, closed candles only)",
            f"Best gross R: {best['gross_r']:+.2f}R",
            f"SL buffer: {best['sl']:.2f}× ATR",
@@ -2318,7 +2323,7 @@ def scan_once(timeframe=None):
 
     total_errors = sum(error_buckets.values())
     summary = ", ".join(f"{name}={count}" for name, count in sorted(error_buckets.items(), key=lambda kv: kv[1], reverse=True)[:4])
-    print(f"Bitget LuxAlgo scan: timeframe={timeframe}, universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
+    print(f"SAIWAN Sweep/Breaker/FVG scan: timeframe={timeframe}, universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
     if not contracts:
         print("Bitget warning: no contracts returned from /api/v2/mix/market/contracts")
     elif not tickers:
@@ -2331,11 +2336,11 @@ def signal_caption(sig):
     d = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
     m = _setup_metrics(sig)
     return (
-        f"🚀 SAIWAN LUXALGO TRENDLINE SIGNAL\n\n{d}\n"
+        f"🚀 SAIWAN SWEEP + BREAKER/FVG SIGNAL\n\n{d}\n"
         f"⭐ {sig['symbol']} · Bitget Futures\n"
         f"⏱ {sig.get('timeframe', SIGNAL_TIMEFRAME).upper()} · CLOSED CANDLES\n\n"
-        f"Pattern: {sig.get('pattern','LUXALGO TRENDLINE BREAK')}\n"
-        + "Trendline break confirmed on closed candle\n"
+        f"Pattern: {sig.get('pattern','SWEEP + BREAKER/FVG RETEST')}\n"
+        + "Liquidity sweep + structure shift + closed-candle retest confirmed\n"
         + f"Volume: {sig.get('volume_mult',0):.2f}× avg · Extension: {sig.get('extension_atr',0):.2f}× ATR\n\n"
         f"Entry: {fmt_price(sig['entry'])}\n"
         f"SL: {fmt_price(sig['sl'])}\n"
@@ -2343,7 +2348,7 @@ def signal_caption(sig):
         f"TP2: {fmt_price(sig['tp2'])}\n"
         f"TP3: {fmt_price(sig['tp3'])}\n"
         f"⭐ Quality: {m['quality']}/10 · R:R {m['rr1']:.2f} / {m['rr2']:.2f} / {m['rr3']:.2f}\n\n"
-        + "📐 LuxAlgo Trendlines with Breaks\n"
+        + "📐 Liquidity Sweep • Breaker Block • FVG\n"
         + "⚠️ Signal only — no automatic trading."
     )
 
@@ -2545,7 +2550,7 @@ def poll_updates():
                     elif cmd == "/scan":
                         if len(parts) == 1:
                             start_scanner(active_chat_id, TF_15M)
-                            send_message(active_chat_id, "🚀 SAIWAN LUXALGO SCANNER STARTED\n\nClosed candles · Trendlines with Breaks. TP/SL monitoring is enabled.")
+                            send_message(active_chat_id, "🚀 SAIWAN SWEEP + BREAKER/FVG SCANNER STARTED\n\nClosed candles · Liquidity Sweep + Breaker Block + FVG. TP/SL monitoring is enabled.")
                         elif parts[1].lower() in ("top", "smart", "smartscan"):
                             send_message(active_chat_id, "📊 Smart Scan خەریکە بازارەکە پشکنین دەکات...")
                             send_message(active_chat_id, _smart_scan_report())
