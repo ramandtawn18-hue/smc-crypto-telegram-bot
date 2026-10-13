@@ -37,11 +37,6 @@ CHART_CANDLES = 80
 HTTP_TIMEOUT = 15
 MIN_SCORE = 5
 
-# ADX/DI confirmation filter: suppress weak or directionally conflicting breakouts.
-ENABLE_ADX_FILTER = True
-ADX_LENGTH = 14
-ADX_MIN = 20.0
-
 # SAIWAN AI Market Radar / risk-aware leverage (informational only)
 RADAR_MIN_SCORE = 72
 MAX_SUGGESTED_LEVERAGE = 5
@@ -1037,111 +1032,76 @@ def _luxalgo_trendline_series(rows, length=14, mult=1.0, method="Atr"):
     return {'upper':upper,'lower':lower,'upper_line':upper_line,'lower_line':lower_line,'upos':upos,'dnos':dnos,'ph':phs,'pl':pls,'atr':atrs}
 
 
-def _adx_di_last(rows, length=14):
-    """Return (plus_di, minus_di, adx) from OHLC candles using Wilder smoothing."""
-    if not rows or len(rows) < length * 2 + 2:
+def _breaker_fvg_sweep_setup(rows, direction):
+    """Liquidity sweep + breaker block + FVG; signal only from the latest closed candle."""
+    if not rows or len(rows) < 40:
         return None
-    tr_values, plus_dm, minus_dm = [], [], []
-    for i in range(1, len(rows)):
-        cur, prev = rows[i], rows[i - 1]
-        up_move = float(cur["high"]) - float(prev["high"])
-        down_move = float(prev["low"]) - float(cur["low"])
-        plus_dm.append(up_move if up_move > down_move and up_move > 0 else 0.0)
-        minus_dm.append(down_move if down_move > up_move and down_move > 0 else 0.0)
-        tr_values.append(max(float(cur["high"]) - float(cur["low"]),
-                             abs(float(cur["high"]) - float(prev["close"])),
-                             abs(float(cur["low"]) - float(prev["close"]))))
-    # Wilder's initial sums and recursive smoothing.
-    tr_s = sum(tr_values[:length])
-    plus_s = sum(plus_dm[:length])
-    minus_s = sum(minus_dm[:length])
-    dx_values = []
-    plus_di = minus_di = 0.0
-    for i in range(length, len(tr_values)):
-        tr_s = tr_s - tr_s / length + tr_values[i]
-        plus_s = plus_s - plus_s / length + plus_dm[i]
-        minus_s = minus_s - minus_s / length + minus_dm[i]
-        if tr_s <= 0:
-            plus_di = minus_di = 0.0
-        else:
-            plus_di = 100.0 * plus_s / tr_s
-            minus_di = 100.0 * minus_s / tr_s
-        denom = plus_di + minus_di
-        dx_values.append(100.0 * abs(plus_di - minus_di) / denom if denom > 0 else 0.0)
-    if len(dx_values) < length:
+    # get_klines removes the currently-forming candle; use the latest confirmed bar.
+    i = len(rows) - 1
+    r = rows[i]
+    high = [float(x["high"]) for x in rows]
+    low = [float(x["low"]) for x in rows]
+    close = [float(x["close"]) for x in rows]
+    opn = [float(x["open"]) for x in rows]
+    atr = _atr_at(rows, i, 14)
+    if not atr or atr <= 0:
         return None
-    adx = sum(dx_values[:length]) / length
-    for dx in dx_values[length:]:
-        adx = ((adx * (length - 1)) + dx) / length
-    return plus_di, minus_di, adx
-
-
-def _adx_filter_passes(rows, direction):
-    if not ENABLE_ADX_FILTER:
-        return True
-    values = _adx_di_last(rows, ADX_LENGTH)
-    if values is None:
-        return False
-    plus_di, minus_di, adx_value = values
-    if adx_value < ADX_MIN:
-        return False
-    return plus_di > minus_di if direction == "LONG" else minus_di > plus_di
-
-
-def _luxalgo_setup(rows, direction):
-    """Signal only on a fresh LuxAlgo breakout transition on the newest closed candle."""
-    if not rows or len(rows)<45: return None
-    data=_luxalgo_trendline_series(rows)
-    if not data: return None
-    i=len(rows)-1
-    if direction=='LONG':
-        if not (data['upos'][i]==1 and data['upos'][i-1]==0): return None
-    else:
-        if not (data['dnos'][i]==1 and data['dnos'][i-1]==0): return None
-    # Confirm the closed-candle LuxAlgo breakout with ADX strength and aligned DI.
-    if not _adx_filter_passes(rows, direction): return None
-    entry=float(rows[i]['close']); a=data['atr'][i]
-    if not a or a<=0: return None
-    # Wider protective stop: enforce a minimum volatility/price-distance floor,
-    # and keep the stop beyond the recent 7-candle swing when that is farther away.
-    # This changes only the risk levels; the LuxAlgo breakout signal remains untouched.
-    recent = rows[max(0, i-6):i+1]
-    min_risk = max(2.0 * float(a), entry * 0.01)
-    if direction == 'LONG':
-        swing_low = min(float(r['low']) for r in recent)
-        stop = min(swing_low, entry - min_risk)
-        risk = entry - stop
+    # Prior liquidity pool excludes the signal candle.
+    lookback = 12
+    pool_hi = max(high[i-lookback:i])
+    pool_lo = min(low[i-lookback:i])
+    if direction == "LONG":
+        sweep = low[i] < pool_lo and close[i] > pool_lo and close[i] > opn[i]
+        fvg = any(low[j] > high[j-2] for j in range(max(2, i-5), i+1))
+        # Bullish breaker: recent bearish candle's high is reclaimed after the sweep.
+        breaker = any(opn[j] > close[j] and close[i] > high[j] for j in range(max(1, i-6), i))
+        if not (sweep and fvg and breaker):
+            return None
+        entry = close[i]
+        sl = min(low[max(0, i-6):i+1]) - 0.15*atr
+        risk = entry-sl
         if risk <= 0: return None
-        tps = [entry + risk*x for x in (1.5, 2.5, 4.0)]
+        tps = [entry+risk*x for x in (1.5, 2.5, 4.0)]
     else:
-        swing_high = max(float(r['high']) for r in recent)
-        stop = max(swing_high, entry + min_risk)
-        risk = stop - entry
+        sweep = high[i] > pool_hi and close[i] < pool_hi and close[i] < opn[i]
+        fvg = any(high[j] < low[j-2] for j in range(max(2, i-5), i+1))
+        # Bearish breaker: recent bullish candle's low is broken after the sweep.
+        breaker = any(close[j] > opn[j] and close[i] < low[j] for j in range(max(1, i-6), i))
+        if not (sweep and fvg and breaker):
+            return None
+        entry = close[i]
+        sl = max(high[max(0, i-6):i+1]) + 0.15*atr
+        risk = sl-entry
         if risk <= 0: return None
-        tps = [entry - risk*x for x in (1.5, 2.5, 4.0)]
-    return {'symbol':rows[i].get('symbol',''),'direction':direction,'pattern':'LUXALGO TRENDLINE BREAK','entry':entry,'sl':stop,'tp1':tps[0],'tp2':tps[1],'tp3':tps[2],
-      'score':5,'max_score':5,'confidence':75,'strength':75,'time':rows[i]['time'],'candle_time':rows[i]['time'],'atr':a,'volume_mult':1.0,'breakout_index':i,'pullback_index':None,'range_high':None,'range_low':None,'risk_distance':risk,'risk_atr':risk/a,'risk_pct':risk/max(entry,1e-12)*100,
-      'checks':{'Trendline Break':True,'Closed Candle':True},'rows':rows,'full_len':len(rows),'luxalgo':data,'extension_atr':0.0,'retest_ok':True,'rejection_ok':True,'early_entry':True,'fvg':None,'ob':None,'entry_zone_low':entry,'entry_zone_high':entry}
+        tps = [entry-risk*x for x in (1.5, 2.5, 4.0)]
+    return {"symbol":r.get("symbol", ""), "direction":direction,
+        "pattern":"LIQUIDITY SWEEP + BREAKER BLOCK + FVG", "entry":entry, "sl":sl,
+        "tp1":tps[0], "tp2":tps[1], "tp3":tps[2], "score":3, "max_score":3,
+        "confidence":75, "strength":75, "time":r["time"], "candle_time":r["time"],
+        "atr":atr, "volume_mult":1.0, "breakout_index":i, "pullback_index":None,
+        "range_high":pool_hi, "range_low":pool_lo, "risk_distance":risk,
+        "risk_atr":risk/atr, "risk_pct":risk/max(entry,1e-12)*100,
+        "checks":{"Liquidity Sweep":True,"Breaker Block":True,"FVG":True,"Closed Candle":True},
+        "rows":rows,"full_len":len(rows),"luxalgo":None,"extension_atr":0.0,
+        "retest_ok":True,"rejection_ok":True,"early_entry":False,"fvg":True,"ob":None,
+        "entry_zone_low":entry-0.2*atr,"entry_zone_high":entry+0.2*atr}
 
 def _move_setup(rows, direction):
-    """Use LuxAlgo Trendlines with Breaks as the sole signal strategy."""
-    return _luxalgo_setup(rows, direction)
-
+    return _breaker_fvg_sweep_setup(rows, direction)
 
 def analyze(symbol, rows5=None, rows15=None, timeframe=SIGNAL_TIMEFRAME):
-    """Analyze the selected timeframe using confirmed LuxAlgo breakout transitions."""
-    rows = rows15 if rows15 and len(rows15) >= 45 else rows5
-    if not rows or len(rows) < 45:
+    """New SAIWAN strategy: sweep + breaker block + FVG on confirmed candles."""
+    rows = rows15 if rows15 and len(rows15) >= 40 else rows5
+    if not rows or len(rows) < 40:
         return None
     for r in rows: r["symbol"] = symbol
-    candidates=[]
-    for direction in ("LONG","SHORT"):
-        sig=_move_setup(rows,direction)
+    for direction in ("LONG", "SHORT"):
+        sig = _move_setup(rows, direction)
         if sig:
-            sig["symbol"]=symbol; sig["timeframe"]=timeframe
-            sig["time"]=rows[-1]["time"]; sig["candle_time"]=rows[-1]["time"]
-            candidates.append(sig)
-    return candidates[0] if candidates else None
+            sig["symbol"] = symbol
+            sig["timeframe"] = timeframe
+            return sig
+    return None
 
 def _draw_luxalgo_chart(ax, rows, line_data, offset=0):
     """Draw candles, teal upper and red lower projected trendlines, plus B break labels."""
@@ -1161,7 +1121,6 @@ def make_chart(sig):
     all_rows=sig.get('rows') or []
     rows=all_rows[-CHART_CANDLES:]; n=len(rows); direction=sig['direction']
     data=_luxalgo_trendline_series(all_rows)
-    if not data: raise RuntimeError('not enough candles to draw LuxAlgo trendlines')
     start=len(all_rows)-n
     BG='#11151f'; GRID='#252b37'; TEXT='#f0f2f5'; UP='#078f7c'; DOWN='#ef4c58'; TEAL='#159b91'
     fig,ax=plt.subplots(figsize=(14.4,7.4),dpi=160,facecolor=BG); ax.set_facecolor(BG)
@@ -1171,8 +1130,9 @@ def make_chart(sig):
         ax.vlines(i,r['low'],r['high'],color=c,linewidth=1.05,zorder=4)
         lo=min(r['open'],r['close']); bh=max(abs(r['close']-r['open']),abs(r['close'])*1e-5)
         ax.add_patch(Rectangle((i-width/2,lo),width,bh,facecolor=c,edgecolor=c,linewidth=.5,zorder=5))
-    local={k:(v[start:] if isinstance(v,list) else v) for k,v in data.items()}
-    _draw_luxalgo_chart(ax,rows,local,start)
+    if data:
+        local={k:(v[start:] if isinstance(v,list) else v) for k,v in data.items()}
+        _draw_luxalgo_chart(ax,rows,local,start)
     entry=float(sig['entry']); sl=float(sig['sl'])
     # finite segments near the signal, avoiding full-chart long lines
     x0=max(0,n-18); x1=n+1
@@ -1182,7 +1142,7 @@ def make_chart(sig):
     ax.text(x1+.2,sl,f'SL {fmt_price(sl)}',color=DOWN,fontsize=8,fontweight='bold',va='center')
     dcolor=UP if direction=='LONG' else DOWN
     ax.text(.018,1.07,f"{sig.get('symbol','')} · {sig.get('timeframe','15m').upper()}",transform=ax.transAxes,fontsize=15,color=TEXT,fontweight='bold',va='top')
-    ax.text(.018,1.025,'LuxAlgo · Trendlines with Breaks',transform=ax.transAxes,fontsize=9,color='#b2bac8',fontweight='bold',va='top')
+    ax.text(.018,1.025,'Liquidity Sweep · Breaker Block · FVG',transform=ax.transAxes,fontsize=9,color='#b2bac8',fontweight='bold',va='top')
     ax.text(.985,1.055,direction,transform=ax.transAxes,fontsize=12,color=dcolor,fontweight='bold',ha='right',va='top',bbox=dict(boxstyle='round,pad=.35',facecolor=BG,edgecolor=dcolor,linewidth=1))
     ax.yaxis.tick_right(); ax.tick_params(axis='y',colors='#b8c0cc',labelsize=8,length=0,pad=7); ax.tick_params(axis='x',colors='#929cab',labelsize=8,length=0,pad=8)
     ax.grid(axis='y',color=GRID,linewidth=.6,alpha=.8); ax.grid(axis='x',color=GRID,linewidth=.3,alpha=.35)
@@ -1369,7 +1329,6 @@ def welcome_text():
         "📐 LUXALGO TRENDLINES WITH BREAKS\n"
         "📊 15M • BITGET FUTURES\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        "🧭 ADX(14) + DI filter: ON • Min ADX 20\n"
         "🎯 Anchored VWAP • Retest • ATR • Break-even\n"
         "🔔 Signal + TP/SL monitoring: ACTIVE\n\n"
         "Choose an action from the buttons below."
@@ -1455,8 +1414,7 @@ def _handle_callback_query(query):
                 chat_id, message_id,
                 f"🚀 {label} SCANNER STARTED\n\n"
                 f"The LuxAlgo Trendlines is now scanning {label} closed candles.\n\n"
-                "🧭 LuxAlgo Breakout + ADX(14)/DI filter: ON\n"
-                "🎯 ATR-based SL/TP + Break-even monitoring\n"
+                "📐 Anchored VWAP + Retest + ATR + BE\n"
                 "🔒 Anti-chase filter: ON\n"
                 "🎯 TP/SL monitoring: ON",
                 main_menu_markup(),
@@ -2222,7 +2180,7 @@ def status_text():
         f"Scanner: {'RUNNING' if scanner else 'STOPPED'}\n"
         f"Smart Watch: {'ON' if watch_on else 'OFF'} ({watched}/{MAX_WATCH_ITEMS})\n"
         "Market: Bitget USDT Perpetual Futures\n"
-        "Strategy: LuxAlgo Trendlines with Breaks\n"
+        "Strategy: Liquidity Sweep + Breaker Block + FVG\n"
         f"Scan timeframe: {active_scan_timeframe.upper()}\n"
         "Analysis: 15m only\n"
         f"Pending signals: {pending}\n"
