@@ -1033,58 +1033,111 @@ def _luxalgo_trendline_series(rows, length=14, mult=1.0, method="Atr"):
 
 
 def _breaker_fvg_sweep_setup(rows, direction):
-    """Liquidity sweep + breaker block + FVG; signal only from the latest closed candle."""
-    if not rows or len(rows) < 40:
+    """Confirmed-candle setup: liquidity sweep -> structure break -> FVG/OB retest.
+
+    This intentionally waits for a retest/rejection in the confluence zone, rather
+    than signaling merely because an FVG exists somewhere in the recent candles.
+    """
+    if not rows or len(rows) < 45:
         return None
-    # get_klines removes the currently-forming candle; use the latest confirmed bar.
-    i = len(rows) - 1
+    i = len(rows) - 1  # get_klines already excludes the still-forming candle
     r = rows[i]
-    high = [float(x["high"]) for x in rows]
-    low = [float(x["low"]) for x in rows]
-    close = [float(x["close"]) for x in rows]
-    opn = [float(x["open"]) for x in rows]
-    atr = _atr_at(rows, i, 14)
-    if not atr or atr <= 0:
+    atr_now = _atr_at(rows, i, 14)
+    if not atr_now or atr_now <= 0:
         return None
-    # Prior liquidity pool excludes the signal candle.
-    lookback = 12
-    pool_hi = max(high[i-lookback:i])
-    pool_lo = min(low[i-lookback:i])
-    if direction == "LONG":
-        sweep = low[i] < pool_lo and close[i] > pool_lo and close[i] > opn[i]
-        fvg = any(low[j] > high[j-2] for j in range(max(2, i-5), i+1))
-        # Bullish breaker: recent bearish candle's high is reclaimed after the sweep.
-        breaker = any(opn[j] > close[j] and close[i] > high[j] for j in range(max(1, i-6), i))
-        if not (sweep and fvg and breaker):
+
+    # Find a recent liquidity sweep with a subsequent market-structure shift.
+    candidates = [x for x in _sweep_candidates(rows) if x[0] == direction and i - x[1] <= 18]
+    if not candidates:
+        return None
+    sweep_dir, sweep_idx, swept_level = candidates[-1]
+    if sweep_idx >= i - 2:
+        return None
+    mss = _structure_break(rows, direction, sweep_idx, i - 1)
+    if not mss:
+        return None
+
+    # Require a directional FVG created after the sweep and before the retest candle.
+    fvg = _find_fvg(rows, direction, max(sweep_idx + 1, mss["index"] - 4), i)
+    if not fvg or fvg["index"] >= i:
+        return None
+    # A breaker zone is the last opposite candle before the structure displacement.
+    ob = _find_order_block(rows, direction, mss["index"])
+    if not ob or ob["index"] <= sweep_idx:
+        return None
+    # FVG and breaker must overlap (or sit very close); distant zones are not a setup.
+    zone = _overlap(fvg, ob)
+    if not zone:
+        gap = max(ob["low"] - fvg["high"], fvg["low"] - ob["high"], 0.0)
+        if gap > atr_now * 0.20:
             return None
-        entry = close[i]
-        sl = min(low[max(0, i-6):i+1]) - 0.15*atr
-        risk = entry-sl
-        if risk <= 0: return None
-        tps = [entry+risk*x for x in (1.5, 2.5, 4.0)]
+        zone = {"low": min(fvg["low"], ob["low"]), "high": max(fvg["high"], ob["high"])}
+
+    # Current closed candle must revisit the confluence zone and reject in trade direction.
+    touched = r["low"] <= zone["high"] and r["high"] >= zone["low"]
+    body = abs(r["close"] - r["open"])
+    if direction == "SHORT":
+        rejection = r["close"] < r["open"] and r["close"] < zone["low"] and body >= atr_now * 0.08
+        if not (touched and rejection):
+            return None
+        entry = r["close"]
+        sl = max(max(x["high"] for x in rows[max(sweep_idx, i-6):i+1]), zone["high"]) + 0.15 * atr_now
+        risk = sl - entry
+        if risk <= 0:
+            return None
+        # Use visible recent swing lows as structural targets when they are below entry.
+        _, swing_lows = swing_points(rows[max(0, i-45):i], 2, 2)
+        levels = sorted({float(price) for _, price in swing_lows if price < entry - 0.5*risk}, reverse=True)
+        tps = []
+        for price in levels:
+            if not tps or price < tps[-1] - 0.15*risk:
+                tps.append(price)
+            if len(tps) == 3:
+                break
+        fallbacks = [entry-risk*1.5, entry-risk*2.5, entry-risk*4.0]
+        while len(tps) < 3:
+            candidate = fallbacks[len(tps)]
+            if tps and candidate >= tps[-1]:
+                candidate = tps[-1] - risk
+            tps.append(candidate)
+        tps = sorted(tps, reverse=True)
     else:
-        sweep = high[i] > pool_hi and close[i] < pool_hi and close[i] < opn[i]
-        fvg = any(high[j] < low[j-2] for j in range(max(2, i-5), i+1))
-        # Bearish breaker: recent bullish candle's low is broken after the sweep.
-        breaker = any(close[j] > opn[j] and close[i] < low[j] for j in range(max(1, i-6), i))
-        if not (sweep and fvg and breaker):
+        rejection = r["close"] > r["open"] and r["close"] > zone["high"] and body >= atr_now * 0.08
+        if not (touched and rejection):
             return None
-        entry = close[i]
-        sl = max(high[max(0, i-6):i+1]) + 0.15*atr
-        risk = sl-entry
-        if risk <= 0: return None
-        tps = [entry-risk*x for x in (1.5, 2.5, 4.0)]
-    return {"symbol":r.get("symbol", ""), "direction":direction,
-        "pattern":"LIQUIDITY SWEEP + BREAKER BLOCK + FVG", "entry":entry, "sl":sl,
-        "tp1":tps[0], "tp2":tps[1], "tp3":tps[2], "score":3, "max_score":3,
-        "confidence":75, "strength":75, "time":r["time"], "candle_time":r["time"],
-        "atr":atr, "volume_mult":1.0, "breakout_index":i, "pullback_index":None,
-        "range_high":pool_hi, "range_low":pool_lo, "risk_distance":risk,
-        "risk_atr":risk/atr, "risk_pct":risk/max(entry,1e-12)*100,
-        "checks":{"Liquidity Sweep":True,"Breaker Block":True,"FVG":True,"Closed Candle":True},
-        "rows":rows,"full_len":len(rows),"luxalgo":None,"extension_atr":0.0,
-        "retest_ok":True,"rejection_ok":True,"early_entry":False,"fvg":True,"ob":None,
-        "entry_zone_low":entry-0.2*atr,"entry_zone_high":entry+0.2*atr}
+        entry = r["close"]
+        sl = min(min(x["low"] for x in rows[max(sweep_idx, i-6):i+1]), zone["low"]) - 0.15 * atr_now
+        risk = entry - sl
+        if risk <= 0:
+            return None
+        swing_highs, _ = swing_points(rows[max(0, i-45):i], 2, 2)
+        levels = sorted({float(price) for _, price in swing_highs if price > entry + 0.5*risk})
+        tps = []
+        for price in levels:
+            if not tps or price > tps[-1] + 0.15*risk:
+                tps.append(price)
+            if len(tps) == 3:
+                break
+        fallbacks = [entry+risk*1.5, entry+risk*2.5, entry+risk*4.0]
+        while len(tps) < 3:
+            candidate = fallbacks[len(tps)]
+            if tps and candidate <= tps[-1]:
+                candidate = tps[-1] + risk
+            tps.append(candidate)
+
+    return {"symbol": r.get("symbol", ""), "direction": direction,
+        "pattern": "LIQUIDITY SWEEP + MSS + BREAKER/FVG RETEST", "entry": entry, "sl": sl,
+        "tp1": tps[0], "tp2": tps[1], "tp3": tps[2], "score": 3, "max_score": 3,
+        "confidence": 75, "strength": 75, "time": r["time"], "candle_time": r["time"],
+        "atr": atr_now, "volume_mult": 1.0, "breakout_index": mss["index"], "pullback_index": i,
+        "range_high": max(x["high"] for x in rows[max(0, i-12):i]),
+        "range_low": min(x["low"] for x in rows[max(0, i-12):i]), "risk_distance": risk,
+        "risk_atr": risk/atr_now, "risk_pct": risk/max(entry, 1e-12)*100,
+        "checks": {"Liquidity Sweep": True, "Market Structure Shift": True,
+                   "Breaker Block": True, "FVG Retest": True, "Closed Candle": True},
+        "rows": rows, "full_len": len(rows), "luxalgo": None, "extension_atr": 0.0,
+        "retest_ok": True, "rejection_ok": True, "early_entry": False, "fvg": True, "ob": ob,
+        "entry_zone_low": zone["low"], "entry_zone_high": zone["high"]}
 
 def _move_setup(rows, direction):
     return _breaker_fvg_sweep_setup(rows, direction)
