@@ -1032,118 +1032,104 @@ def _luxalgo_trendline_series(rows, length=14, mult=1.0, method="Atr"):
     return {'upper':upper,'lower':lower,'upper_line':upper_line,'lower_line':lower_line,'upos':upos,'dnos':dnos,'ph':phs,'pl':pls,'atr':atrs}
 
 
-def _breaker_fvg_sweep_setup(rows, direction):
-    """Confirmed-candle setup: liquidity sweep -> structure break -> FVG/OB retest.
+def _trendline_trade_setup(rows, direction):
+    """Closed-candle trend setup based on MA10/MA30, support/resistance and retest.
 
-    This intentionally waits for a retest/rejection in the confluence zone, rather
-    than signaling merely because an FVG exists somewhere in the recent candles.
+    Uses actual OHLCV candles. LONG requires bullish MA alignment and a confirmed
+    close above recent resistance or a support retest; SHORT is the inverse.
+    Entry is the last closed candle close; SL is beyond the structural level and
+    TP levels are risk multiples, never hard-coded prices.
     """
-    if not rows or len(rows) < 45:
+    if not rows or len(rows) < 40:
         return None
-    i = len(rows) - 1  # get_klines already excludes the still-forming candle
+    i = len(rows) - 1  # caller supplies closed candles only
     r = rows[i]
+    closes = [float(x['close']) for x in rows]
+    ma10 = _rolling_mean(closes, 10)
+    ma30 = _rolling_mean(closes, 30)
     atr_now = _atr_at(rows, i, 14)
     if not atr_now or atr_now <= 0:
         return None
+    recent = rows[max(0, i-20):i]
+    if len(recent) < 12:
+        return None
+    resistance = max(float(x['high']) for x in recent)
+    support = min(float(x['low']) for x in recent)
+    prev = rows[i-1]
+    entry = float(r['close'])
+    body = abs(float(r['close']) - float(r['open']))
+    # Small tolerance allows a clean retest near the level without treating any
+    # random candle in the range as a signal.
+    tol = max(atr_now * 0.18, entry * 0.0005)
 
-    # Find a recent liquidity sweep with a subsequent market-structure shift.
-    candidates = [x for x in _sweep_candidates(rows) if x[0] == direction and i - x[1] <= 18]
-    if not candidates:
-        return None
-    sweep_dir, sweep_idx, swept_level = candidates[-1]
-    if sweep_idx >= i - 2:
-        return None
-    mss = _structure_break(rows, direction, sweep_idx, i - 1)
-    if not mss:
-        return None
-
-    # Require a directional FVG created after the sweep and before the retest candle.
-    fvg = _find_fvg(rows, direction, max(sweep_idx + 1, mss["index"] - 4), i)
-    if not fvg or fvg["index"] >= i:
-        return None
-    # A breaker zone is the last opposite candle before the structure displacement.
-    ob = _find_order_block(rows, direction, mss["index"])
-    if not ob or ob["index"] <= sweep_idx:
-        return None
-    # FVG and breaker must overlap (or sit very close); distant zones are not a setup.
-    zone = _overlap(fvg, ob)
-    if not zone:
-        gap = max(ob["low"] - fvg["high"], fvg["low"] - ob["high"], 0.0)
-        if gap > atr_now * 0.20:
+    if direction == 'SHORT':
+        trend_ok = entry < ma10 and ma10 < ma30
+        breakdown = float(prev['close']) < support or entry < support
+        retest = float(r['high']) >= support - tol and entry < support and float(r['close']) < float(r['open'])
+        rejection = float(r['high']) >= resistance - tol and entry < resistance and float(r['close']) < float(r['open'])
+        if not trend_ok or not (breakdown or retest or rejection):
             return None
-        zone = {"low": min(fvg["low"], ob["low"]), "high": max(fvg["high"], ob["high"])}
-
-    # Current closed candle must revisit the confluence zone and reject in trade direction.
-    touched = r["low"] <= zone["high"] and r["high"] >= zone["low"]
-    body = abs(r["close"] - r["open"])
-    if direction == "SHORT":
-        rejection = r["close"] < r["open"] and r["close"] < zone["low"] and body >= atr_now * 0.08
-        if not (touched and rejection):
+        # A breakdown/retest short should close bearish and not be an indecision candle.
+        if entry >= float(r['open']) or body < atr_now * 0.08:
             return None
-        entry = r["close"]
-        sl = max(max(x["high"] for x in rows[max(sweep_idx, i-6):i+1]), zone["high"]) + 0.15 * atr_now
+        invalidation = max(float(x['high']) for x in rows[max(0, i-5):i+1])
+        sl = max(invalidation, resistance if rejection else support) + atr_now * 0.15
         risk = sl - entry
         if risk <= 0:
             return None
-        # Use visible recent swing lows as structural targets when they are below entry.
-        _, swing_lows = swing_points(rows[max(0, i-45):i], 2, 2)
-        levels = sorted({float(price) for _, price in swing_lows if price < entry - 0.5*risk}, reverse=True)
-        tps = []
-        for price in levels:
-            if not tps or price < tps[-1] - 0.15*risk:
-                tps.append(price)
-            if len(tps) == 3:
-                break
-        fallbacks = [entry-risk*1.5, entry-risk*2.5, entry-risk*4.0]
-        while len(tps) < 3:
-            candidate = fallbacks[len(tps)]
-            if tps and candidate >= tps[-1]:
-                candidate = tps[-1] - risk
-            tps.append(candidate)
-        tps = sorted(tps, reverse=True)
+        tps = [entry-risk*1.5, entry-risk*2.5, entry-risk*4.0]
+        pattern = 'DOWNTREND · RESISTANCE REJECTION / SUPPORT BREAKDOWN'
+        checks = {'Price below MA10 & MA30': True, 'Downtrend confirmed': True,
+                  'Resistance/support reaction': bool(rejection or breakdown or retest),
+                  'Closed candle confirmation': True}
+        reason = 'Price below MA10 and MA30; bearish close confirmed the downtrend. Wait for rejection at resistance or a support breakdown/retest.'
     else:
-        rejection = r["close"] > r["open"] and r["close"] > zone["high"] and body >= atr_now * 0.08
-        if not (touched and rejection):
+        trend_ok = entry > ma10 and ma10 > ma30
+        breakout = float(prev['close']) > resistance or entry > resistance
+        retest = float(r['low']) <= support + tol and entry > support and float(r['close']) > float(r['open'])
+        rejection = float(r['low']) <= support + tol and entry > support and float(r['close']) > float(r['open'])
+        if not trend_ok or not (breakout or retest or rejection):
             return None
-        entry = r["close"]
-        sl = min(min(x["low"] for x in rows[max(sweep_idx, i-6):i+1]), zone["low"]) - 0.15 * atr_now
+        if entry <= float(r['open']) or body < atr_now * 0.08:
+            return None
+        invalidation = min(float(x['low']) for x in rows[max(0, i-5):i+1])
+        sl = min(invalidation, support if rejection or retest else resistance) - atr_now * 0.15
         risk = entry - sl
         if risk <= 0:
             return None
-        swing_highs, _ = swing_points(rows[max(0, i-45):i], 2, 2)
-        levels = sorted({float(price) for _, price in swing_highs if price > entry + 0.5*risk})
-        tps = []
-        for price in levels:
-            if not tps or price > tps[-1] + 0.15*risk:
-                tps.append(price)
-            if len(tps) == 3:
-                break
-        fallbacks = [entry+risk*1.5, entry+risk*2.5, entry+risk*4.0]
-        while len(tps) < 3:
-            candidate = fallbacks[len(tps)]
-            if tps and candidate <= tps[-1]:
-                candidate = tps[-1] + risk
-            tps.append(candidate)
+        tps = [entry+risk*1.5, entry+risk*2.5, entry+risk*4.0]
+        pattern = 'UPTREND · SUPPORT REJECTION / RESISTANCE BREAKOUT'
+        checks = {'Price above MA10 & MA30': True, 'Uptrend confirmed': True,
+                  'Support/resistance reaction': bool(breakout or retest or rejection),
+                  'Closed candle confirmation': True}
+        reason = 'Price above MA10 and MA30; bullish close confirmed the uptrend. Wait for support rejection or a resistance breakout/retest.'
 
-    return {"symbol": r.get("symbol", ""), "direction": direction,
-        "pattern": "LIQUIDITY SWEEP + MSS + BREAKER/FVG RETEST", "entry": entry, "sl": sl,
-        "tp1": tps[0], "tp2": tps[1], "tp3": tps[2], "score": 3, "max_score": 3,
-        "confidence": 75, "strength": 75, "time": r["time"], "candle_time": r["time"],
-        "atr": atr_now, "volume_mult": 1.0, "breakout_index": mss["index"], "pullback_index": i,
-        "range_high": max(x["high"] for x in rows[max(0, i-12):i]),
-        "range_low": min(x["low"] for x in rows[max(0, i-12):i]), "risk_distance": risk,
-        "risk_atr": risk/atr_now, "risk_pct": risk/max(entry, 1e-12)*100,
-        "checks": {"Liquidity Sweep": True, "Market Structure Shift": True,
-                   "Breaker Block": True, "FVG Retest": True, "Closed Candle": True},
-        "rows": rows, "full_len": len(rows), "luxalgo": None, "extension_atr": 0.0,
-        "retest_ok": True, "rejection_ok": True, "early_entry": False, "fvg": True, "ob": ob,
-        "entry_zone_low": zone["low"], "entry_zone_high": zone["high"]}
+    # Reject invalid or non-positive targets; targets must be on the correct side.
+    if direction == 'SHORT' and not all(x < entry for x in tps):
+        return None
+    if direction == 'LONG' and not all(x > entry for x in tps):
+        return None
+    return {
+        'symbol': r.get('symbol', ''), 'direction': direction,
+        'pattern': pattern, 'entry': entry, 'sl': sl,
+        'tp1': tps[0], 'tp2': tps[1], 'tp3': tps[2],
+        'score': sum(bool(v) for v in checks.values()), 'max_score': len(checks),
+        'confidence': 65, 'strength': 65, 'time': r['time'], 'candle_time': r['time'],
+        'atr': atr_now, 'volume_mult': (float(r.get('vol', 0.0)) / max(_rolling_mean([float(x.get('vol', 0.0)) for x in rows[max(0, i-20):i]], 20), 1e-12)),
+        'breakout_index': i, 'pullback_index': i, 'range_high': resistance, 'range_low': support,
+        'risk_distance': risk, 'risk_atr': risk/atr_now, 'risk_pct': risk/max(entry, 1e-12)*100,
+        'checks': checks, 'rows': rows, 'full_len': len(rows), 'luxalgo': None,
+        'extension_atr': abs(entry - (resistance if direction == 'LONG' else support))/atr_now,
+        'retest_ok': bool(retest or rejection), 'rejection_ok': True, 'early_entry': False,
+        'fvg': None, 'ob': None, 'entry_zone_low': support, 'entry_zone_high': resistance,
+        'ma10': ma10, 'ma30': ma30, 'analysis_reason': reason,
+    }
 
 def _move_setup(rows, direction):
-    return _breaker_fvg_sweep_setup(rows, direction)
+    return _trendline_trade_setup(rows, direction)
 
 def analyze(symbol, rows5=None, rows15=None, timeframe=SIGNAL_TIMEFRAME):
-    """New SAIWAN strategy: sweep + breaker block + FVG on confirmed candles."""
+    """Analyze confirmed candles using MA10/MA30 trend and support/resistance."""
     rows = rows15 if rows15 and len(rows15) >= 40 else rows5
     if not rows or len(rows) < 40:
         return None
@@ -1186,8 +1172,15 @@ def make_chart(sig):
     zone_low = sig.get('entry_zone_low')
     zone_high = sig.get('entry_zone_high')
     if zone_low is not None and zone_high is not None:
-        ax.axhspan(float(zone_low), float(zone_high), xmin=0.55, xmax=0.98,
-                   facecolor='#9b59b6', alpha=.20, zorder=1, label='Breaker / FVG zone')
+        ax.axhline(float(zone_high), color='#ff3d57', linewidth=1.0, alpha=.85,
+                   linestyle='--', zorder=2, label='Resistance')
+        ax.axhline(float(zone_low), color='#12d6a0', linewidth=1.0, alpha=.85,
+                   linestyle='--', zorder=2, label='Support')
+    closes = [float(r['close']) for r in rows]
+    ma10 = [sum(closes[max(0,j-9):j+1])/len(closes[max(0,j-9):j+1]) for j in range(n)]
+    ma30 = [sum(closes[max(0,j-29):j+1])/len(closes[max(0,j-29):j+1]) for j in range(n)]
+    ax.plot(range(n), ma10, color='#ffd21f', linewidth=1.15, label='MA10', zorder=6)
+    ax.plot(range(n), ma30, color='#7c5cff', linewidth=1.25, label='MA30', zorder=6)
     # finite segments near the signal, avoiding full-chart long lines
     x0=max(0,n-18); x1=n+1
     ax.plot([x0,x1],[entry,entry],color='#6b9cff',linestyle='--',linewidth=1.2,zorder=7)
@@ -1200,7 +1193,7 @@ def make_chart(sig):
         ax.text(x1+.2,level,f'{key.upper()} {fmt_price(level)}',color=color,fontsize=7.5,fontweight='bold',va='center')
     dcolor=UP if direction=='LONG' else DOWN
     ax.text(.018,1.07,f"{sig.get('symbol','')} · {sig.get('timeframe','15m').upper()}",transform=ax.transAxes,fontsize=15,color=TEXT,fontweight='bold',va='top')
-    ax.text(.018,1.025,'Liquidity Sweep · Breaker Block · FVG',transform=ax.transAxes,fontsize=9,color='#b2bac8',fontweight='bold',va='top')
+    ax.text(.018,1.025,'MA10/MA30 · Trendline · Support/Resistance',transform=ax.transAxes,fontsize=9,color='#b2bac8',fontweight='bold',va='top')
     ax.text(.985,1.055,direction,transform=ax.transAxes,fontsize=12,color=dcolor,fontweight='bold',ha='right',va='top',bbox=dict(boxstyle='round,pad=.35',facecolor=BG,edgecolor=dcolor,linewidth=1))
     ax.yaxis.tick_right(); ax.tick_params(axis='y',colors='#b8c0cc',labelsize=8,length=0,pad=7); ax.tick_params(axis='x',colors='#929cab',labelsize=8,length=0,pad=8)
     ax.grid(axis='y',color=GRID,linewidth=.6,alpha=.8); ax.grid(axis='x',color=GRID,linewidth=.3,alpha=.35)
@@ -1248,6 +1241,11 @@ def make_analysis_chart(symbol, timeframe, rows, block=None):
                                edgecolor=c, linewidth=.6, zorder=5))
 
     full_rows=rows
+    closes = [float(x['close']) for x in rows]
+    ma10_series = [sum(closes[max(0, j-9):j+1]) / len(closes[max(0, j-9):j+1]) for j in range(len(closes))]
+    ma30_series = [sum(closes[max(0, j-29):j+1]) / len(closes[max(0, j-29):j+1]) for j in range(len(closes))]
+    ax.plot(range(n), ma10_series, color=GOLD, linewidth=1.35, label='MA10', zorder=6)
+    ax.plot(range(n), ma30_series, color=PURPLE, linewidth=1.45, label='MA30', zorder=6)
     line_data=_luxalgo_trendline_series(full_rows)
     if line_data:
         _draw_luxalgo_chart(ax, rows, {k:(v[-n:] if isinstance(v,list) else v) for k,v in line_data.items()}, len(full_rows)-n)
@@ -1291,7 +1289,7 @@ def make_analysis_chart(symbol, timeframe, rows, block=None):
 
     ax.text(.018,1.065,f"{symbol} · {timeframe.upper()}",transform=ax.transAxes,
             fontsize=16,color=TEXT,fontweight="bold",va="top")
-    ax.text(.018,1.025,"LIQUIDITY SWEEP · BREAKER BLOCK · FVG",transform=ax.transAxes,
+    ax.text(.018,1.025,"MA10/MA30 · SUPPORT · RESISTANCE",transform=ax.transAxes,
             fontsize=8.8,color=MUTED,fontweight="bold",va="top")
     ax.text(.985,1.055,bias,transform=ax.transAxes,fontsize=12,color=bias_color,
             fontweight="bold",ha="right",va="top",
@@ -1409,10 +1407,10 @@ def welcome_text():
     return (
         "🚀 SAIWAN CRYPTO SIGNALS\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "📐 LIQUIDITY SWEEP + BREAKER BLOCK + FVG\n"
+        "📐 MA10/MA30 TREND + SUPPORT/RESISTANCE\n"
         "📊 15M • BITGET FUTURES\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        "🎯 Sweep • MSS • Breaker/FVG Retest • Structural SL/TP\n"
+        "🎯 Trend • Resistance/Support • Candle-close confirmation • SL/TP\n"
         "🔔 Signal + TP/SL monitoring: ACTIVE\n\n"
         "Choose an action from the buttons below."
     )
@@ -1496,8 +1494,8 @@ def _handle_callback_query(query):
             edit_message(
                 chat_id, message_id,
                 f"🚀 {label} SCANNER STARTED\n\n"
-                f"SAIWAN is scanning {label} closed candles with the new strategy.\n\n"
-                "📐 Liquidity Sweep + MSS + Breaker Block + FVG Retest\n"
+                f"SAIWAN is scanning {label} closed candles using MA10/MA30 trend and support/resistance.\n\n"
+                "📐 MA10/MA30 trend + support/resistance reaction\n"
                 "🔒 Anti-chase filter: ON\n"
                 "🎯 TP/SL monitoring: ON",
                 main_menu_markup(),
@@ -2288,7 +2286,7 @@ def status_text():
         f"Scanner: {'RUNNING' if scanner else 'STOPPED'}\n"
         f"Smart Watch: {'ON' if watch_on else 'OFF'} ({watched}/{MAX_WATCH_ITEMS})\n"
         "Market: Bitget USDT Perpetual Futures\n"
-        "Strategy: Liquidity Sweep + Breaker Block + FVG\n"
+        "Strategy: MA10/MA30 trend + support/resistance\n"
         f"Scan timeframe: {active_scan_timeframe.upper()}\n"
         "Analysis: 15m only\n"
         f"Pending signals: {pending}\n"
@@ -2373,7 +2371,7 @@ def scan_once(timeframe=None):
 
     total_errors = sum(error_buckets.values())
     summary = ", ".join(f"{name}={count}" for name, count in sorted(error_buckets.items(), key=lambda kv: kv[1], reverse=True)[:4])
-    print(f"SAIWAN Sweep/Breaker/FVG scan: timeframe={timeframe}, universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
+    print(f"SAIWAN MA/Support-Resistance scan: timeframe={timeframe}, universe={len(eligible)}, scanned={len(pairs)}, confirmed={len(found)}, errors={total_errors}, workers={SCAN_WORKERS}")
     if not contracts:
         print("Bitget warning: no contracts returned from /api/v2/mix/market/contracts")
     elif not tickers:
@@ -2386,11 +2384,11 @@ def signal_caption(sig):
     d = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
     m = _setup_metrics(sig)
     return (
-        f"🚀 SAIWAN SWEEP + BREAKER/FVG SIGNAL\n\n{d}\n"
+        f"🚀 SAIWAN TRENDLINE SIGNAL\n\n{d}\n"
         f"⭐ {sig['symbol']} · Bitget Futures\n"
         f"⏱ {sig.get('timeframe', SIGNAL_TIMEFRAME).upper()} · CLOSED CANDLES\n\n"
-        f"Pattern: {sig.get('pattern','SWEEP + BREAKER/FVG RETEST')}\n"
-        + "Liquidity sweep + structure shift + closed-candle retest confirmed\n"
+        f"Pattern: {sig.get('pattern','TRENDLINE / SUPPORT-RESISTANCE SETUP')}\n"
+        + f"Reason: {sig.get('analysis_reason', 'MA trend and support/resistance reaction confirmed on a closed candle')}\n"
         + f"Volume: {sig.get('volume_mult',0):.2f}× avg · Extension: {sig.get('extension_atr',0):.2f}× ATR\n\n"
         f"Entry: {fmt_price(sig['entry'])}\n"
         f"SL: {fmt_price(sig['sl'])}\n"
@@ -2398,7 +2396,7 @@ def signal_caption(sig):
         f"TP2: {fmt_price(sig['tp2'])}\n"
         f"TP3: {fmt_price(sig['tp3'])}\n"
         f"⭐ Quality: {m['quality']}/10 · R:R {m['rr1']:.2f} / {m['rr2']:.2f} / {m['rr3']:.2f}\n\n"
-        + "📐 Liquidity Sweep • Breaker Block • FVG\n"
+        + "📐 MA10/MA30 • Trendline • Support/Resistance\n"
         + "⚠️ Signal only — no automatic trading."
     )
 
@@ -2600,7 +2598,7 @@ def poll_updates():
                     elif cmd == "/scan":
                         if len(parts) == 1:
                             start_scanner(active_chat_id, TF_15M)
-                            send_message(active_chat_id, "🚀 SAIWAN SWEEP + BREAKER/FVG SCANNER STARTED\n\nClosed candles · Liquidity Sweep + Breaker Block + FVG. TP/SL monitoring is enabled.")
+                            send_message(active_chat_id, "🚀 SAIWAN TRENDLINE SCANNER STARTED\n\nClosed candles · MA10/MA30 trend + support/resistance reaction. TP/SL monitoring is enabled.")
                         elif parts[1].lower() in ("top", "smart", "smartscan"):
                             send_message(active_chat_id, "📊 Smart Scan خەریکە بازارەکە پشکنین دەکات...")
                             send_message(active_chat_id, _smart_scan_report())
