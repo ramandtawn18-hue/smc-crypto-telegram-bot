@@ -1260,9 +1260,34 @@ def make_analysis_chart(symbol, timeframe, rows, block=None):
         ax.scatter([idx], [price], s=20, facecolors="none", edgecolors=UP, linewidth=.9, zorder=8)
 
     cur=rows[-1]["close"]
-    if line_data and line_data['upos'][-1] and not line_data['dnos'][-1]: bias,bias_color='LONG',UP
-    elif line_data and line_data['dnos'][-1] and not line_data['upos'][-1]: bias,bias_color='SHORT',DOWN
-    else: bias,bias_color='WAIT',GOLD
+    trade_setup = None
+    if block:
+        long_candidate = block.get("long_sig")
+        short_candidate = block.get("short_sig")
+        if long_candidate and not short_candidate:
+            trade_setup = long_candidate
+        elif short_candidate and not long_candidate:
+            trade_setup = short_candidate
+    if trade_setup:
+        bias = trade_setup.get("direction", "LONG" if trade_setup.get("tp1", cur) > trade_setup.get("entry", cur) else "SHORT")
+        bias_color = UP if bias == "LONG" else DOWN
+    elif line_data and line_data['upos'][-1] and not line_data['dnos'][-1]: bias,bias_color='LONG BIAS',UP
+    elif line_data and line_data['dnos'][-1] and not line_data['upos'][-1]: bias,bias_color='SHORT BIAS',DOWN
+    else: bias,bias_color='WAIT / NO TRADE',GOLD
+
+    # Plot the actual calculated setup levels, never example/hard-coded prices.
+    if trade_setup:
+        levels = [("ENTRY", trade_setup.get("entry"), BLUE),
+                  ("STOP LOSS", trade_setup.get("sl"), DOWN),
+                  ("TP1", trade_setup.get("tp1"), UP),
+                  ("TP2", trade_setup.get("tp2"), UP),
+                  ("TP3", trade_setup.get("tp3"), UP)]
+        for label, level, color in levels:
+            if level is not None and math.isfinite(float(level)):
+                ax.axhline(float(level), color=color, linewidth=.9, linestyle="--", alpha=.85, zorder=2)
+                ax.text(n + .1, float(level), f" {label} {fmt_price(float(level))}",
+                        color=color, fontsize=7.2, va="center", ha="left",
+                        bbox=dict(facecolor=BG, edgecolor=color, alpha=.92, pad=1.8), zorder=10)
 
     ax.text(.018,1.065,f"{symbol} · {timeframe.upper()}",transform=ax.transAxes,
             fontsize=16,color=TEXT,fontweight="bold",va="top")
@@ -1690,7 +1715,25 @@ def analysis_report(raw_symbol, requested_timeframes=None):
         f"Setup: {block['setup']}",
     ]
     if setup:
+        direction = "LONG" if float(setup["tp1"]) > float(setup["entry"]) else "SHORT"
+        reasons = []
+        checks = setup.get("checks") or {}
+        for key, label in (("Range", "price built a recent trading range"),
+                           ("Breakout", "closed candle confirmed the breakout/breakdown"),
+                           ("Volume", "volume supports the move"),
+                           ("Trend", "trend alignment supports the direction")):
+            if checks.get(key):
+                reasons.append(label)
+        if setup.get("retest_ok"):
+            reasons.append("price retested the breakout level")
+        if setup.get("pattern") == "SA-VWAP RETEST":
+            reasons.append("anchored VWAP retest conditions from the enabled strategy were met")
+        reasons = reasons or ["the configured closed-candle setup rules were met"]
         lines += [
+            "",
+            f"🧠 WHY {direction}?",
+            *[f"• {reason.capitalize()}." for reason in reasons],
+            "• This is a rule-based technical signal, not a guarantee; invalidate it if SL is hit.",
             "",
             f"🎯 Entry: {fmt_price(setup['entry'])}",
             f"🛑 SL: {fmt_price(setup['sl'])}",
@@ -1701,7 +1744,14 @@ def analysis_report(raw_symbol, requested_timeframes=None):
             f"⚡ {setup.get('pattern','MOMENTUM')} · volume {setup.get('volume_mult',0):.2f}× · extension {setup.get('extension_atr',0):.2f}× ATR",
         ]
     else:
-        lines += ["", "ℹ️ لە کندڵی داخراوی ئێستا هیچ breakout ـێکی نوێ نییە."]
+        if block["bias"] == "LONG":
+            why = "نرخ لەسەر هێڵی ترێندی بەرزبوونەوەیە، بەڵام مەرجەکانی چوونەژوورەوەی LONG تەواو نین."
+        elif block["bias"] == "SHORT":
+            why = "نرخ لە خوار هێڵی ترێندی دابەزینە، بەڵام مەرجەکانی چوونەژوورەوەی SHORT تەواو نین."
+        else:
+            why = "نیشانەکان هاوتا نین یان شکاندنی پشتڕاستکراو نییە؛ چوونەژوورەوە مەترسییەکی بێ‌پشتگیری هەیە."
+        lines += ["", "⛔ NO TRADE — هۆکار:", why,
+                  "ℹ️ چاوەڕێی داخستنی شمەعی پشتڕاستکەرەوە بکە؛ سیگناڵ بە زۆر دروست ناکەین."]
     return "\n".join(lines)
 
 def _setup_metrics(sig):
