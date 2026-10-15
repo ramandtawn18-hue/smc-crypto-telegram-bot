@@ -10,7 +10,7 @@ import requests
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Rectangle, FancyBboxPatch
 from flask import Flask, jsonify
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -1156,59 +1156,178 @@ def _draw_luxalgo_chart(ax, rows, line_data, offset=0):
 
 
 def make_chart(sig):
-    """TradingView-inspired LuxAlgo chart; only entry and SL levels are shown."""
-    all_rows=sig.get('rows') or []
-    rows=all_rows[-CHART_CANDLES:]; n=len(rows); direction=sig['direction']
-    start=len(all_rows)-n
-    BG='#11151f'; GRID='#252b37'; TEXT='#f0f2f5'; UP='#078f7c'; DOWN='#ef4c58'; TEAL='#159b91'
-    fig,ax=plt.subplots(figsize=(14.4,7.4),dpi=160,facecolor=BG); ax.set_facecolor(BG)
-    width=.62
-    for i,r in enumerate(rows):
-        c=UP if r['close']>=r['open'] else DOWN
-        ax.vlines(i,r['low'],r['high'],color=c,linewidth=1.05,zorder=4)
-        lo=min(r['open'],r['close']); bh=max(abs(r['close']-r['open']),abs(r['close'])*1e-5)
-        ax.add_patch(Rectangle((i-width/2,lo),width,bh,facecolor=c,edgecolor=c,linewidth=.5,zorder=5))
-    entry=float(sig['entry']); sl=float(sig['sl'])
-    zone_low = sig.get('entry_zone_low')
-    zone_high = sig.get('entry_zone_high')
-    if zone_low is not None and zone_high is not None:
-        ax.axhline(float(zone_high), color='#ff3d57', linewidth=1.0, alpha=.85,
-                   linestyle='--', zorder=2, label='Resistance')
-        ax.axhline(float(zone_low), color='#12d6a0', linewidth=1.0, alpha=.85,
-                   linestyle='--', zorder=2, label='Support')
-    closes = [float(r['close']) for r in rows]
-    ma10 = [sum(closes[max(0,j-9):j+1])/len(closes[max(0,j-9):j+1]) for j in range(n)]
-    ma30 = [sum(closes[max(0,j-29):j+1])/len(closes[max(0,j-29):j+1]) for j in range(n)]
-    ax.plot(range(n), ma10, color='#ffd21f', linewidth=1.15, label='MA10', zorder=6)
-    ax.plot(range(n), ma30, color='#7c5cff', linewidth=1.25, label='MA30', zorder=6)
-    # finite segments near the signal, avoiding full-chart long lines
-    x0=max(0,n-18); x1=n+1
-    ax.plot([x0,x1],[entry,entry],color='#6b9cff',linestyle='--',linewidth=1.2,zorder=7)
-    ax.plot([x0,x1],[sl,sl],color=DOWN,linewidth=1.15,zorder=7)
-    ax.text(x1+.2,entry,f'ENTRY {fmt_price(entry)}',color='#8fb1ff',fontsize=8,fontweight='bold',va='center')
-    ax.text(x1+.2,sl,f'SL {fmt_price(sl)}',color=DOWN,fontsize=8,fontweight='bold',va='center')
-    for key, color in (('tp1','#39c98a'),('tp2','#21a879'),('tp3','#14845f')):
-        level=float(sig[key])
-        ax.plot([x0,x1],[level,level],color=color,linewidth=1.0,linestyle='--',zorder=6)
-        ax.text(x1+.2,level,f'{key.upper()} {fmt_price(level)}',color=color,fontsize=7.5,fontweight='bold',va='center')
-    dcolor=UP if direction=='LONG' else DOWN
-    ax.text(.018,1.07,f"{sig.get('symbol','')} · {sig.get('timeframe','15m').upper()}",transform=ax.transAxes,fontsize=15,color=TEXT,fontweight='bold',va='top')
-    ax.text(.018,1.025,'MA10/MA30 · Trendline · Support/Resistance',transform=ax.transAxes,fontsize=9,color='#b2bac8',fontweight='bold',va='top')
-    ax.text(.985,1.055,direction,transform=ax.transAxes,fontsize=12,color=dcolor,fontweight='bold',ha='right',va='top',bbox=dict(boxstyle='round,pad=.35',facecolor=BG,edgecolor=dcolor,linewidth=1))
-    ax.yaxis.tick_right(); ax.tick_params(axis='y',colors='#b8c0cc',labelsize=8,length=0,pad=7); ax.tick_params(axis='x',colors='#929cab',labelsize=8,length=0,pad=8)
-    ax.grid(axis='y',color=GRID,linewidth=.6,alpha=.8); ax.grid(axis='x',color=GRID,linewidth=.3,alpha=.35)
-    for side in ('top','left','bottom'): ax.spines[side].set_visible(False)
-    ax.spines['right'].set_color('#343b48')
-    step=max(1,n//7); ticks=list(range(0,n,step))
-    if not ticks or ticks[-1]!=n-1:ticks.append(n-1)
-    ax.set_xticks(ticks); ax.set_xticklabels([datetime.fromtimestamp(rows[i]['time'],tz=timezone.utc).strftime('%d\n%H:%M') for i in ticks])
-    ymin=min(min(r['low'] for r in rows),sl,entry); ymax=max(max(r['high'] for r in rows),sl,entry); span=max(ymax-ymin,abs(entry)*.008)
-    ax.set_ylim(ymin-span*.07,ymax+span*.12); ax.set_xlim(-1,n+11)
-    ax.legend(loc='upper left',bbox_to_anchor=(.38,1.055),frameon=False,labelcolor=TEXT,fontsize=8,ncol=2)
-    fig.subplots_adjust(left=.025,right=.865,top=.86,bottom=.085)
-    safe=''.join(ch if ch.isalnum() else '_' for ch in sig.get('symbol','SIGNAL'))
-    path=f"/tmp/chart_{safe}_{sig['time']}.png"; fig.savefig(path,facecolor=BG,edgecolor='none',bbox_inches='tight',pad_inches=.08); plt.close(fig); return path
+    """Render a complete dark trade-plan infographic inspired by the user's reference."""
+    all_rows = sig.get('rows') or []
+    rows = all_rows[-CHART_CANDLES:]
+    if len(rows) < 2:
+        raise ValueError('Not enough candles to draw signal chart')
+    n = len(rows)
+    direction = str(sig.get('direction', 'WAIT')).upper()
+    symbol = str(sig.get('symbol', 'UNKNOWN'))
+    timeframe = str(sig.get('timeframe', SIGNAL_TIMEFRAME)).upper()
 
+    BG = '#03060d'
+    PANEL = '#050a13'
+    GRID = '#152033'
+    TEXT = '#eef3ff'
+    MUTED = '#aab8cf'
+    UP = '#00d6a0'
+    DOWN = '#ff4058'
+    GOLD = '#ffbd4a'
+    PURPLE = '#7867ff'
+    BLUE = '#8ca9ff'
+    GREEN_DARK = '#073b2d'
+    RED_DARK = '#3b101b'
+
+    entry = float(sig['entry'])
+    sl = float(sig['sl'])
+    tp1, tp2, tp3 = (float(sig[k]) for k in ('tp1', 'tp2', 'tp3'))
+    levels = {'ENTRY': entry, 'SL': sl, 'TP1': tp1, 'TP2': tp2, 'TP3': tp3}
+    dcolor = UP if direction == 'LONG' else DOWN
+
+    # A two-panel layout keeps the chart readable and makes the trade plan part
+    # of the image, rather than allowing off-screen labels to stretch the canvas.
+    fig = plt.figure(figsize=(14.2, 10.8), dpi=160, facecolor=BG)
+    gs = fig.add_gridspec(2, 1, height_ratios=[3.25, 1.38], hspace=0.035)
+    ax = fig.add_subplot(gs[0])
+    panel_ax = fig.add_subplot(gs[1])
+    ax.set_facecolor(BG)
+    panel_ax.set_facecolor(BG)
+
+    width = .62
+    for i, r in enumerate(rows):
+        o, h, l, c = (float(r[k]) for k in ('open', 'high', 'low', 'close'))
+        color = UP if c >= o else DOWN
+        ax.vlines(i, l, h, color=color, linewidth=1.05, zorder=4)
+        body_low = min(o, c)
+        body_h = max(abs(c-o), abs(c)*1e-5)
+        ax.add_patch(Rectangle((i-width/2, body_low), width, body_h,
+                               facecolor=color, edgecolor=color, linewidth=.45, zorder=5))
+
+    closes = [float(r['close']) for r in rows]
+    ma10 = [sum(closes[max(0, j-9):j+1]) / len(closes[max(0, j-9):j+1]) for j in range(n)]
+    ma30 = [sum(closes[max(0, j-29):j+1]) / len(closes[max(0, j-29):j+1]) for j in range(n)]
+    ax.plot(range(n), ma10, color=GOLD, linewidth=1.45, label='MA10', zorder=6)
+    ax.plot(range(n), ma30, color=PURPLE, linewidth=1.55, label='MA30', zorder=6)
+
+    # Structural support/resistance are derived from recent candles.
+    recent = rows[-min(24, n):]
+    support = min(float(r['low']) for r in recent)
+    resistance = max(float(r['high']) for r in recent)
+    ax.axhspan(resistance * .996, resistance * 1.004, color=DOWN, alpha=.15, zorder=1)
+    ax.axhline(resistance, color=DOWN, linewidth=1.15, linestyle='--', alpha=.95, label='Resistance', zorder=2)
+    ax.axhline(support, color=UP, linewidth=1.05, linestyle='--', alpha=.9, label='Support', zorder=2)
+
+    # Draw a descending/ascending trend guide using recent swing extremes.
+    lookback = min(n, 36)
+    if direction == 'SHORT':
+        highs = [(i, float(rows[i]['high'])) for i in range(n-lookback, n)]
+        if len(highs) >= 2:
+            p1 = max(highs, key=lambda z: z[1])
+            later = [z for z in highs if z[0] > p1[0]]
+            if later:
+                p2 = max(later, key=lambda z: z[1])
+                if p2[0] > p1[0]:
+                    ax.plot([p1[0], min(n+1, n+max(3, n//8))], [p1[1], p2[1]-(p2[1]-p1[1])*.35],
+                            color='#dce6f7', linewidth=1.0, alpha=.9, zorder=3)
+    else:
+        lows = [(i, float(rows[i]['low'])) for i in range(n-lookback, n)]
+        if len(lows) >= 2:
+            p1 = min(lows, key=lambda z: z[1])
+            later = [z for z in lows if z[0] > p1[0]]
+            if later:
+                p2 = min(later, key=lambda z: z[1])
+                if p2[0] > p1[0]:
+                    ax.plot([p1[0], min(n+1, n+max(3, n//8))], [p1[1], p2[1]+abs(p2[1]-p1[1])*.35],
+                            color='#dce6f7', linewidth=1.0, alpha=.9, zorder=3)
+
+    # All trade levels are calculated by the strategy and shown consistently.
+    x0, x1 = max(0, n-18), n+1
+    level_colors = {'ENTRY': BLUE, 'SL': DOWN, 'TP1': UP, 'TP2': UP, 'TP3': UP}
+    for label, price in levels.items():
+        color = level_colors[label]
+        ax.plot([x0, x1], [price, price], color=color,
+                linestyle='--' if label != 'SL' else '-', linewidth=1.1, alpha=.98, zorder=7)
+        ax.text(x1 + .25, price, f'{label}: {fmt_price(price)}', color=color,
+                fontsize=7.8, fontweight='bold', va='center', ha='left', clip_on=False,
+                bbox=dict(boxstyle='round,pad=.22', facecolor=BG, edgecolor=color,
+                          linewidth=.65, alpha=.98), zorder=10)
+
+    ax.text(.018, 1.065, f'{symbol} · {timeframe}', transform=ax.transAxes,
+            fontsize=16, color=TEXT, fontweight='bold', va='top')
+    ax.text(.018, 1.025, 'MA10 / MA30 · TRENDLINE · SUPPORT / RESISTANCE',
+            transform=ax.transAxes, fontsize=8.7, color=MUTED, fontweight='bold', va='top')
+    ax.text(.985, 1.055, direction, transform=ax.transAxes, fontsize=12,
+            color=dcolor, fontweight='bold', ha='right', va='top',
+            bbox=dict(boxstyle='round,pad=.38', facecolor=BG, edgecolor=dcolor, linewidth=1.4))
+
+    # Use a bounded, shared scale containing all candles and levels, preventing
+    # the large empty canvas previously caused by off-axis TP labels.
+    candle_lows = [float(r['low']) for r in rows]
+    candle_highs = [float(r['high']) for r in rows]
+    yvals = candle_lows + candle_highs + list(levels.values()) + [support, resistance]
+    ymin, ymax = min(yvals), max(yvals)
+    span = max(ymax-ymin, abs(entry)*.02, 1e-12)
+    ax.set_ylim(ymin-span*.07, ymax+span*.09)
+    ax.set_xlim(-1, n+12)
+    ax.yaxis.tick_right()
+    ax.tick_params(axis='y', colors='#aebdd1', labelsize=8, length=0, pad=7)
+    ax.tick_params(axis='x', colors='#8d9db5', labelsize=7.6, length=0, pad=7)
+    ax.grid(axis='y', color=GRID, linewidth=.65, alpha=.85)
+    ax.grid(axis='x', color=GRID, linewidth=.35, alpha=.45)
+    for side in ('top', 'left', 'bottom'):
+        ax.spines[side].set_visible(False)
+    ax.spines['right'].set_color('#26364c')
+    step = max(1, n//7)
+    ticks = list(range(0, n, step))
+    if not ticks or ticks[-1] != n-1:
+        ticks.append(n-1)
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([datetime.fromtimestamp(rows[i]['time'], tz=timezone.utc).strftime('%m-%d\n%H:%M') for i in ticks])
+    ax.legend(loc='upper left', bbox_to_anchor=(.30, 1.055), frameon=False,
+              labelcolor=TEXT, fontsize=8.2, ncol=4)
+
+    # Reference-style trade-plan panel under the chart.
+    panel_ax.set_xlim(0, 1); panel_ax.set_ylim(0, 1)
+    panel_ax.set_xticks([]); panel_ax.set_yticks([])
+    for sp in panel_ax.spines.values():
+        sp.set_visible(False)
+    panel_ax.add_patch(FancyBboxPatch((.012, .045), .976, .91,
+        boxstyle='round,pad=0.008,rounding_size=0.02', transform=panel_ax.transAxes,
+        facecolor=PANEL, edgecolor='#24354d', linewidth=1.15))
+    panel_ax.text(.035, .88, f'TRADE PLAN ({direction})', color=UP if direction == 'LONG' else DOWN,
+                  fontsize=12.5, fontweight='bold', va='top', transform=panel_ax.transAxes)
+    left_lines = [
+        ('Entry', entry, BLUE), ('Stop Loss (SL)', sl, DOWN),
+        ('Take Profit 1 (TP1)', tp1, UP), ('Take Profit 2 (TP2)', tp2, UP),
+        ('Take Profit 3 (TP3)', tp3, UP),
+    ]
+    for j, (label, price, color) in enumerate(left_lines):
+        y = .72 - j*.125
+        panel_ax.text(.04, y, label, color=TEXT, fontsize=10.1, va='center', transform=panel_ax.transAxes)
+        panel_ax.text(.31, y, ':', color=MUTED, fontsize=10.1, va='center', transform=panel_ax.transAxes)
+        panel_ax.text(.34, y, fmt_price(price), color=color, fontsize=10.1, fontweight='bold', va='center', transform=panel_ax.transAxes)
+
+    panel_ax.plot([.51, .51], [.17, .82], color='#27364a', linewidth=1.0, transform=panel_ax.transAxes)
+    checks = sig.get('checks') or {}
+    reason_lines = list(checks.keys())[:5]
+    if not reason_lines:
+        reason_lines = ['Closed-candle setup confirmed', 'Trend direction checked', 'Support/resistance evaluated']
+    for j, line in enumerate(reason_lines[:5]):
+        y = .76 - j*.13
+        panel_ax.text(.545, y, '✓', color=UP, fontsize=12, fontweight='bold', va='center', transform=panel_ax.transAxes)
+        panel_ax.text(.58, y, line, color=TEXT, fontsize=9.1, va='center', transform=panel_ax.transAxes)
+
+    reason = str(sig.get('analysis_reason') or sig.get('pattern') or 'Trend and support/resistance setup')
+    panel_ax.text(.04, .105, 'STRATEGY:', color=GOLD, fontsize=9.5, fontweight='bold', va='center', transform=panel_ax.transAxes)
+    panel_ax.text(.145, .105, reason[:150], color=TEXT, fontsize=8.7, va='center', transform=panel_ax.transAxes)
+
+    fig.subplots_adjust(left=.025, right=.91, top=.89, bottom=.035)
+    safe = ''.join(ch if ch.isalnum() else '_' for ch in symbol)
+    path = f"/tmp/chart_{safe}_{sig.get('time', int(time.time()))}.png"
+    fig.savefig(path, facecolor=BG, edgecolor='none', dpi=160)
+    plt.close(fig)
+    return path
 
 def make_analysis_chart(symbol, timeframe, rows, block=None):
     """Render an on-demand analysis chart, even when no complete trade setup exists."""
